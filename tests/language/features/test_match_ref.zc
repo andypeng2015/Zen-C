@@ -1,0 +1,64 @@
+
+enum MyOption<T> {
+    Some(T),
+    None
+}
+
+test "match_ref_int" {
+    let r = MyOption<int>::Some(42);
+    match r {
+        MyOption::Some(ref i) => {
+            // i is int*
+            assert(*i == 42, "int ref check failed");
+            *i = 100;
+        },
+        MyOption::None => assert(false, "fail")
+    }
+}
+// Mover struct to test move semantics vs ref
+struct Mover {
+    val: int;
+}
+
+test "match_ref_mover" {
+    let m = Mover { val: 100 };
+    // MyOption<Mover> instantiation
+    let opt = MyOption<Mover>::Some(m);
+    
+    match opt {
+        MyOption::Some(ref x) => {
+            // x should be Mover*
+            assert(x.val == 100, "Mover ref access failed");
+            x.val = 200;
+        },
+        MyOption::None => assert(false, "Should be Some")
+    }
+    
+    // Check if modification persisted
+    match opt {
+        MyOption::Some(v) => assert(v.val == 200, "Mutation via ref failed"),
+        MyOption::None => {}
+    }
+}
+
+struct Hello {
+    world: int;
+}
+
+enum Test {
+  ONE(Hello)
+}
+
+test "match ref binding concrete" {
+    let t = Test::ONE(Hello{ world: 123 });
+
+    let val = 0;
+    match t {
+        Test::ONE(ref o) => { 
+            // o should be Hello*
+            val = o.world;
+        }
+    }
+    
+    assert(val == 123, "Ref binding validation failed");
+}

@@ -1,0 +1,27 @@
+obj/
+zc
+result
+out.c
+a.out
+*.o
+*.so
+*.dll
+*.dylib
+*.a
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+compile_commands.json
+vgcore.*
+tests/**/*.o
+plugins/*.so
+.cache
+out/
+# Doxygen documentation
+docs/html/
+docs/latex/
+*.db
+build_dir_env.txt 
+build_dir_linux.txt

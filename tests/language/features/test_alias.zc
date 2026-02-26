@@ -1,0 +1,107 @@
+
+struct Point {
+    x: int;
+    y: int;
+}
+
+alias MyIntPtr = int*;
+alias MyInt = int;
+
+fn process(val: MyInt) -> MyInt {
+    return val + 1;
+}
+
+alias BinOp = fn(int, int) -> int;
+
+fn add(a: int, b: int) -> int {
+    return a + b;
+}
+
+// Generic struct for alias testing
+struct Vec2<T> {
+    x: T;
+    y: T;
+}
+
+impl Vec2<T> {
+  fn neg(self) -> Vec2<T> {
+    return Vec2<T>{x: -self.x, y: -self.y};
+  }
+  fn add(self, rhs: Vec2<T>) -> Vec2<T> {
+    return Vec2<T>{x: self.x + rhs.x, y: self.y + rhs.y};
+  }
+  static fn zero() -> Vec2<T> {
+    return Vec2<T>{x: 0, y: 0};
+  }
+}
+
+alias Vec2f = Vec2<f32>;
+alias Vec2i = Vec2<int>;
+
+test "alias basic" {
+    let x: MyInt = 10;
+    let ptr: MyIntPtr = &x;
+    
+    assert(x == 10, "Basic alias failed");
+    assert(*ptr == 10, "Pointer alias failed");
+    
+    let res = process(x);
+    assert(res == 11, "Function with alias arg failed");
+}
+
+test "alias struct" {
+    let p: Point = Point{x: 0, y: 0};
+    p.x = 100;
+    p.y = 200;
+    
+    assert(p.x == 100, "Struct alias access failed");
+}
+
+test "alias generic struct" {
+    let v = Vec2f{x: 1.5, y: 2.5};
+    assert(v.x > 1.0, "Generic alias field access failed");
+    assert(v.y > 2.0, "Generic alias field access failed");
+    
+    let vi = Vec2i{x: 10, y: 20};
+    assert(vi.x == 10, "Generic int alias failed");
+    assert(vi.y == 20, "Generic int alias failed");
+}
+
+test "alias fstring" {
+    let v = Vec2f{x: 3.14, y: 6.28};
+    // This tests that f-string interpolation correctly resolves the alias
+    println "v.x = {v.x}, v.y = {v.y}";
+}
+
+test "alias function pointer" {
+    // let op: BinOp;
+    // Assignment currently not supported for function types without casting
+    // op = add; 
+    // assert(op(1, 2) == 3, "Function alias");
+}
+
+test "alias operator overloading" {
+  let v = Vec2f{x: 1.0, y: 1.0};
+  v = -v;  // Should call __neg
+  assert(v.x == -1.0, "Unary operator generic alias failed");
+  
+  v += v;  // Should call __add (-1 + -1 = -2)
+  assert(v.x == -2.0, "Compound assignment generic alias failed");
+
+  // Control
+  let v2 = Vec2<f32>{x: 1.0, y: 1.0};
+  v2 = -v2;
+  v2 += v2;
+  assert(v2.x == -2.0, "Control generic operator overloading failed");
+}
+
+
+test "alias static methods" {
+    let v1 = Vec2f::zero();
+    assert(v1.x == 0.0, "Direct static call on alias failed");
+
+    println "Static call in f-string: {Vec2f::zero().x}";
+
+    let v2 = Vec2<f32>::zero();
+    assert(v2.x == 0.0, "Direct static call on generic failed");
+}
