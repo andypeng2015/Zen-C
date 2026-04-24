@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include "../constants.h"
 #include "cmd.h"
 #include "colors.h"
 #include "../zprep.h"
@@ -9,13 +10,17 @@
 
 void print_search_paths()
 {
-    char exe_path[8192] = {0};
-    z_get_executable_path(exe_path, sizeof(exe_path));
-
     printf("Search paths:\n");
+    for (int i = 0; i < g_config.include_path_count; i++)
+    {
+        printf("  %s\n", g_config.include_paths[i]);
+    }
     printf("  ./\n");
-    printf("  %s/std\n", exe_path);
-    printf("  %s/../share/zenc/std\n", exe_path);
+    if (g_config.root_path)
+    {
+        printf("  %s\n", g_config.root_path);
+        printf("  %s/std\n", g_config.root_path);
+    }
 }
 
 void print_version()
@@ -23,42 +28,150 @@ void print_version()
     printf(COLOR_BOLD "zc" COLOR_RESET " %s\n", ZEN_VERSION);
 }
 
+static int get_visible_length(const char *str)
+{
+    int len = 0;
+    const char *p = str;
+    while (*p)
+    {
+        if (*p == '\033' && *(p + 1) == '[')
+        {
+            p += 2;
+            while (*p && *p != 'm')
+            {
+                p++;
+            }
+            if (*p == 'm')
+            {
+                p++;
+            }
+        }
+        else
+        {
+            len++;
+            p++;
+        }
+    }
+    return len;
+}
+
+static void print_help_item(const char *option, const char *description)
+{
+    printf("  %s", option);
+    int visible_len = get_visible_length(option) + 2; // +2 for the leading spaces
+    int target_col = 22;                              // Reduced from 30
+
+    if (visible_len >= target_col - 1)
+    {
+        printf("\n%-*s", target_col, "");
+    }
+    else
+    {
+        for (int i = 0; i < target_col - visible_len; i++)
+        {
+            putchar(' ');
+        }
+    }
+    printf("%s\n", description);
+}
+
 void print_usage()
 {
-    printf(COLOR_BOLD "Zen C" COLOR_RESET " - The language of monks\n\n");
-    printf(COLOR_BOLD "Usage:" COLOR_RESET
-                      " zc [command] [options] <file.zc> [extra files...]\n\n");
-    printf(COLOR_BOLD COLOR_YELLOW "Commands:" COLOR_RESET "\n");
-    printf("  " COLOR_GREEN "run" COLOR_RESET "          Compile and run the program\n");
-    printf("  " COLOR_GREEN "build" COLOR_RESET "        Compile to executable\n");
-    printf("  " COLOR_GREEN "check" COLOR_RESET "        Check for errors only\n");
-    printf("  " COLOR_GREEN "repl" COLOR_RESET "         Start Interactive REPL\n");
-    printf("  " COLOR_GREEN "transpile" COLOR_RESET
-           "    Transpile to C code only (no compilation)\n");
-    printf("  " COLOR_GREEN "lsp" COLOR_RESET "          Start Language Server\n");
-    printf("\n" COLOR_BOLD COLOR_YELLOW "Options:" COLOR_RESET "\n");
-    printf("  " COLOR_CYAN "-o" COLOR_RESET " <file>       Output executable name\n");
-    printf("  " COLOR_CYAN "-O" COLOR_RESET "<level>       Optimization level\n");
-    printf("  " COLOR_CYAN "-g" COLOR_RESET "              Debug info\n");
-    printf("  " COLOR_CYAN "-c" COLOR_RESET "              Compile only (produce .o)\n");
-    printf("  " COLOR_CYAN "-v" COLOR_RESET ", " COLOR_CYAN "--verbose" COLOR_RESET
-           "   Verbose output\n");
-    printf("  " COLOR_CYAN "-q" COLOR_RESET ", " COLOR_CYAN "--quiet" COLOR_RESET
-           "     Quiet output\n");
-    printf("  " COLOR_CYAN "--emit-c" COLOR_RESET "        Keep generated C file (out.c)\n");
-    printf("  " COLOR_CYAN "--keep-comments" COLOR_RESET " Preserve comments in output C\n");
-    printf("  " COLOR_CYAN "--freestanding" COLOR_RESET "  Freestanding mode (no stdlib)\n");
-    printf("  " COLOR_CYAN "--cc" COLOR_RESET
-           " <compiler> C compiler to use (gcc, clang, tcc, zig)\n");
-    printf("  " COLOR_CYAN "--typecheck" COLOR_RESET "     Enable semantic analysis\n");
-    printf("  " COLOR_CYAN "--json" COLOR_RESET "          Emit diagnostics as JSON\n");
-    printf("  " COLOR_CYAN "--no-zen" COLOR_RESET "        Disable Zen facts\n");
-    printf("  " COLOR_CYAN "--cpp" COLOR_RESET "           Use C++ mode\n");
-    printf("  " COLOR_CYAN "--objective-c" COLOR_RESET "   Use Objective-C mode\n");
-    printf("  " COLOR_CYAN "--cuda" COLOR_RESET "          Use CUDA mode (requires nvcc)\n");
-    printf("  " COLOR_CYAN "--help" COLOR_RESET "          Print this help message\n");
-    printf("  " COLOR_CYAN "--paths" COLOR_RESET "         Print library search paths\n");
-    printf("  " COLOR_CYAN "--version" COLOR_RESET "       Print version information\n");
+    printf(
+        "usage: zc [-v | -h | -q | -V] [-I | -L | -l | -D <path/macro>] [--cc <c>] [-O<l>] [-g]\n");
+    printf("          [--release] [--json] [--paths] [--zen] <command> [<args>]\n\n");
+
+    printf("common commands:\n");
+    print_help_item(COLOR_GREEN "build, run" COLOR_RESET,
+                    "Compile program (default / run immediately)");
+    print_help_item(COLOR_GREEN "check, transpile" COLOR_RESET,
+                    "Type check only / generate C code");
+    print_help_item(COLOR_GREEN "repl, lsp" COLOR_RESET, "Start REPL / Language Server");
+
+    printf("\ncommon options:\n");
+    print_help_item(COLOR_CYAN "-o <f>, --cc <c>" COLOR_RESET,
+                    "Set output name / backend compiler");
+    print_help_item(COLOR_CYAN "-I, -L, -l <p>" COLOR_RESET, "Include/Library paths and linking");
+    print_help_item(COLOR_CYAN "-D <n>, -O<l>" COLOR_RESET,
+                    "Define macro / Set optimization level");
+    print_help_item(COLOR_CYAN "-g, -g0, --release" COLOR_RESET,
+                    "Debug info (on/off) or Release mode");
+    print_help_item(COLOR_CYAN "-v, --verbose" COLOR_RESET, "Show granular compiler phases");
+    print_help_item(COLOR_CYAN "-q, --quiet" COLOR_RESET, "Suppress all non-error output");
+    print_help_item(COLOR_CYAN "--json" COLOR_RESET, "Emit structured JSON diagnostics");
+
+    printf("\nlanguage & advanced:\n");
+    print_help_item(COLOR_CYAN "--check, --free" COLOR_RESET,
+                    "Borrow checker / No standard library");
+    print_help_item(COLOR_CYAN "--misra" COLOR_RESET, "Generate strictly MISRA C compliant code");
+    print_help_item(COLOR_CYAN "-Wpedantic" COLOR_RESET, "Enable pedantic warnings");
+    print_help_item(COLOR_CYAN "--cpp, --cuda" COLOR_RESET, "C++ or CUDA compatibility modes");
+    print_help_item(COLOR_CYAN "-c, -S, -E, -shared" COLOR_RESET,
+                    "Compile/Asm/Preprocess only / DLL");
+
+    printf("\n'zc -h' for help, 'zc --version' for version. See 'zc help <command>' for info.\n");
+}
+
+void print_command_help(const char *command)
+{
+    if (strcmp(command, "build") == 0)
+    {
+        printf("usage: zc build [options] <file>\n\n");
+        printf("Compile Zen C source into a standalone executable.\n\n");
+        printf("options:\n");
+        print_help_item("-o <file>", "Set the name of the output binary");
+        print_help_item("-O<level>", "Optimization level (0-3, default 1)");
+        print_help_item("-g, -g0", "Enable/disable debug information");
+        print_help_item("--release", "Release mode (equivalent to -O3 -g0)");
+        print_help_item("-shared", "Build a shared library (.so, .dll)");
+        print_help_item("-v, --verbose", "Show all granular compilation phases");
+        print_help_item("-q, --quiet", "Suppress non-essential status messages");
+    }
+    else if (strcmp(command, "run") == 0)
+    {
+        printf("usage: zc run [options] <file> [<args>]\n\n");
+        printf("Compile and execute a Zen C program immediately.\n\n");
+        printf("options:\n");
+        print_help_item("-o <file>", "Temp binary name (default: a.out)");
+        print_help_item("-O<level>", "Backend optimization level");
+        print_help_item("-q, --quiet", "Run without compiler status markers");
+    }
+    else if (strcmp(command, "check") == 0)
+    {
+        printf("usage: zc check [options] <file>\n\n");
+        printf("Verify syntax and type safety without generating code.\n\n");
+        printf("options:\n");
+        print_help_item("--json", "Output diagnostics in structured JSON");
+        print_help_item("--check", "Enable advanced borrow/move checking");
+    }
+    else if (strcmp(command, "transpile") == 0)
+    {
+        printf("usage: zc transpile [options] <file>\n\n");
+        printf("Convert Zen C source code into human-readable C.\n\n");
+        printf("options:\n");
+        print_help_item("-o <file>", "Output C file name");
+        print_help_item("--emit-c", "Keep the generated C file (implied)");
+    }
+    else if (strcmp(command, "debug") == 0)
+    {
+        printf("usage: zc debug <file> [<args>]\n\n");
+        printf("Compile and run with full debug information and GDB/LLDB support.\n");
+    }
+    else if (strcmp(command, "repl") == 0)
+    {
+        printf("usage: zc repl\n\n");
+        printf("Start an interactive Read-Eval-Print Loop session.\n");
+    }
+    else if (strcmp(command, "lsp") == 0)
+    {
+        printf("usage: zc lsp\n\n");
+        printf("Start the Language Server for IDE integration.\n");
+    }
+    else
+    {
+        printf("Unknown command '%s'.\n", command);
+        print_usage();
+    }
 }
 
 void build_compile_arg_list(ArgList *list, const char *outfile, const char *temp_source_file)
@@ -70,6 +183,19 @@ void build_compile_arg_list(ArgList *list, const char *outfile, const char *temp
     arg_list_add_from_string(list, g_config.gcc_flags);
     arg_list_add_from_string(list, g_cflags);
 
+    // Suppress warnings triggered by transpiled code
+    if (!g_config.no_suppress_warnings)
+    {
+        arg_list_add(list, "-Wno-parentheses");
+        arg_list_add(list, "-Wno-unused-value");
+        arg_list_add(list, "-Wno-unused-variable");
+        arg_list_add(list, "-Wno-unused-parameter");
+        arg_list_add(list, "-Wno-unused-function");
+        arg_list_add(list, "-Wno-unused-but-set-variable");
+        arg_list_add(list, "-Wno-sign-compare");
+        arg_list_add(list, "-Wno-missing-field-initializers");
+    }
+
     // Freestanding
     if (g_config.is_freestanding)
     {
@@ -80,6 +206,13 @@ void build_compile_arg_list(ArgList *list, const char *outfile, const char *temp
     if (g_config.quiet)
     {
         arg_list_add(list, "-w");
+    }
+
+    // C++ compatibility flags
+    if (g_config.use_cpp)
+    {
+        arg_list_add(list, "-fpermissive");
+        arg_list_add(list, "-Wno-write-strings");
     }
 
     // Output file
@@ -111,40 +244,38 @@ void build_compile_arg_list(ArgList *list, const char *outfile, const char *temp
     }
 
     // Include paths
-    char exe_path[8192] = {0};
-    z_get_executable_path(exe_path, sizeof(exe_path));
-
-    char dev_std[9000];
-    snprintf(dev_std, sizeof(dev_std), "%s/std", exe_path);
-
-    if (access(dev_std, F_OK) == 0)
+    if (g_config.root_path && g_config.root_path[0])
     {
-        arg_list_add_fmt(list, "-I%s", exe_path);
-        if (!g_config.is_freestanding)
+        arg_list_add_fmt(list, "-I%s", g_config.root_path);
+
+        char tre_path[MAX_PATH_LEN];
+        snprintf(tre_path, sizeof(tre_path), "%s/std/third-party/tre/include", g_config.root_path);
+
+        if (!g_config.is_freestanding && access(tre_path, F_OK) == 0)
         {
-            arg_list_add_fmt(list, "-I%s/std/third-party/tre/include", exe_path);
+            arg_list_add_fmt(list, "-I%s", tre_path);
         }
     }
-    else
-    {
-        char install_std[9000];
-        snprintf(install_std, sizeof(install_std), "%s/../share/zenc/std", exe_path);
 
-        if (access(install_std, F_OK) == 0)
+    // User-defined include paths
+    for (int i = 0; i < g_config.include_path_count; i++)
+    {
+        arg_list_add_fmt(list, "-I%s", g_config.include_paths[i]);
+    }
+
+    // Input directory (to resolve relative includes in raw blocks)
+    if (g_config.input_dir)
+    {
+        arg_list_add_fmt(list, "-I%s", g_config.input_dir);
+
+        // Only use -iquote for GCC, Clang, and Emscripten (TCC does not support it)
+        if (z_path_match_compiler(g_config.cc, "gcc") ||
+            z_path_match_compiler(g_config.cc, "g++") ||
+            z_path_match_compiler(g_config.cc, "clang") ||
+            z_path_match_compiler(g_config.cc, "emcc"))
         {
-            arg_list_add_fmt(list, "-I%s/../share/zenc", exe_path);
-            if (!g_config.is_freestanding)
-            {
-                arg_list_add_fmt(list, "-I%s/../share/zenc/std/third-party/tre/include", exe_path);
-            }
-        }
-        else
-        {
-            arg_list_add(list, "-I.");
-            if (!g_config.is_freestanding)
-            {
-                arg_list_add(list, "-I./std/third-party/tre/include");
-            }
+            arg_list_add(list, "-iquote");
+            arg_list_add(list, g_config.input_dir);
         }
     }
 }
@@ -304,7 +435,7 @@ void arg_list_add_from_string(ArgList *list, const char *str)
     const char *p = str;
     while (*p)
     {
-        while (*p && isspace(*p))
+        while (*p && isspace((unsigned char)*p))
         {
             p++;
         }
@@ -313,13 +444,21 @@ void arg_list_add_from_string(ArgList *list, const char *str)
             break;
         }
 
-        char arg[4096];
+        char arg[MAX_PATH_LEN];
         char *d = arg;
         int in_quote = 0;
 
-        while (*p && (in_quote || !isspace(*p)))
+        while (*p && (in_quote || (!isspace((unsigned char)*p) && *p != '\r')))
         {
-            if (*p == '\"')
+            if (*p == '\\' && *(p + 1) == '\"')
+            {
+                if (d - arg < 4095)
+                {
+                    *d++ = '\"';
+                }
+                p += 2;
+            }
+            else if (*p == '\"')
             {
                 in_quote = !in_quote;
                 p++;

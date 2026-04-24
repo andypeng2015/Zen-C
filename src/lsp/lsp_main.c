@@ -1,5 +1,6 @@
 
 #include "json_rpc.h"
+#include "../constants.h"
 #include "zprep.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,12 +14,22 @@ int lsp_main(int argc, char **argv)
     (void)argv;
     fprintf(stderr, "zls: Zen Language Server starting...\n");
     g_config.mode_lsp = 1;
+    g_config.json_output = 1;
+
+    // Initialize root path from executable to find std/
+    char self_path[MAX_PATH_LEN];
+    void z_get_executable_path(char *buf, size_t size);
+    z_get_executable_path(self_path, sizeof(self_path));
+    if (self_path[0])
+    {
+        g_config.root_path = xstrdup(self_path);
+    }
 
     while (1)
     {
         // Read headers
         int content_len = 0;
-        char line[512];
+        char line[MAX_MANGLED_NAME_LEN];
         while (fgets(line, sizeof(line), stdin))
         {
             if (0 == strcmp(line, "\r\n"))

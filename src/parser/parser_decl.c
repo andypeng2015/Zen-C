@@ -1,5 +1,6 @@
 
 #include "parser.h"
+#include "../constants.h"
 #include <ctype.h>
 #include "analysis/const_fold.h"
 #include <stdio.h>
@@ -14,10 +15,12 @@
 #include "../codegen/codegen.h"
 #include "analysis/move_check.h"
 
-ASTNode *parse_function(ParserContext *ctx, Lexer *l, int is_async)
+ASTNode *parse_function(ParserContext *ctx, Lexer *l, int is_async, int is_extern,
+                        const char *link_name, int is_export)
 {
-    lexer_next(l); // eat 'fn'
+    lexer_next(l);
     Token name_tok = lexer_next(l);
+    check_identifier(ctx, name_tok);
     char *name = token_strdup(name_tok);
 
     if (is_async)
@@ -34,9 +37,10 @@ ASTNode *parse_function(ParserContext *ctx, Lexer *l, int is_async)
     char *gen_param = NULL;
     if (lexer_peek(l).type == TOK_LANGLE)
     {
-        lexer_next(l); // eat <
+        lexer_next(l);
 
-        char buf[1024];
+        size_t buf_size = 1024;
+        char *buf = xmalloc(buf_size);
         buf[0] = 0;
 
         while (1)
@@ -48,9 +52,10 @@ ASTNode *parse_function(ParserContext *ctx, Lexer *l, int is_async)
             }
             char *s = token_strdup(gt);
 
-            if (strlen(buf) + strlen(s) + 2 >= sizeof(buf))
+            if (strlen(buf) + strlen(s) + 2 >= buf_size)
             {
-                zpanic_at(gt, "Too many generic parameters");
+                buf_size *= 2;
+                buf = xrealloc(buf, buf_size);
             }
 
             if (buf[0])
@@ -80,6 +85,7 @@ ASTNode *parse_function(ParserContext *ctx, Lexer *l, int is_async)
             zpanic_at(lexer_peek(l), "Expected >");
         }
         gen_param = xstrdup(buf);
+        free(buf);
     }
 
     // Register generic parameters so type parsing recognizes them
@@ -123,6 +129,10 @@ ASTNode *parse_function(ParserContext *ctx, Lexer *l, int is_async)
         ret_type_obj = parse_type_formal(ctx, l);
         ret = type_to_string(ret_type_obj);
     }
+    else if (lexer_peek(l).type == TOK_COLON)
+    {
+        zpanic_at(lexer_peek(l), "Functions use '->' for the return type, not ':'");
+    }
 
     extern char *curr_func_ret;
     curr_func_ret = ret;
@@ -130,10 +140,11 @@ ASTNode *parse_function(ParserContext *ctx, Lexer *l, int is_async)
     // Auto-prefix function name if in module context
     // Don't prefix generic templates or functions inside impl blocks (already
     // mangled)
-    if (ctx->current_module_prefix && !gen_param && !ctx->current_impl_struct)
+    if (ctx->current_module_prefix && !gen_param && !ctx->current_impl_struct && !is_extern &&
+        !is_extern_symbol(ctx, name))
     {
-        char *prefixed_name = xmalloc(strlen(ctx->current_module_prefix) + strlen(name) + 2);
-        sprintf(prefixed_name, "%s_%s", ctx->current_module_prefix, name);
+        char *prefixed_name = xmalloc(strlen(ctx->current_module_prefix) + strlen(name) + 3);
+        sprintf(prefixed_name, "%s__%s", ctx->current_module_prefix, name);
         free(name);
         name = prefixed_name;
     }
@@ -141,17 +152,18 @@ ASTNode *parse_function(ParserContext *ctx, Lexer *l, int is_async)
     // Register if concrete (Global functions only)
     if (!gen_param && !ctx->current_impl_struct)
     {
-        register_func(ctx, name, count, defaults, arg_types, ret_type_obj, is_varargs, is_async,
-                      name_tok);
-        // Note: must_use is set after return by caller (parser_core.c)
+        register_func(ctx, ctx->current_scope->parent, name, count, defaults, arg_types,
+                      ret_type_obj, is_varargs, is_async, 0, link_name, name_tok, is_export);
+        // Note: required is set after return by caller (parser_core.c)
     }
 
     ASTNode *body = NULL;
-    if (lexer_peek(l).type == TOK_SEMICOLON)
+    Token next_tok = lexer_peek(l);
+    if (next_tok.type == TOK_SEMICOLON)
     {
         lexer_next(l); // consume ;
     }
-    else
+    else if (next_tok.type == TOK_LBRACE)
     {
         // Set self context flags for .member shorthand in methods with self
         int prev_in_method = ctx->in_method_with_self;
@@ -168,6 +180,10 @@ ASTNode *parse_function(ParserContext *ctx, Lexer *l, int is_async)
         ctx->in_method_with_self = prev_in_method;
         ctx->self_is_pointer = prev_self_ptr;
     }
+    else
+    {
+        zpanic_at(next_tok, "Expected '{' or ';' after function signature");
+    }
 
     // Check for unused parameters
     // The current scope contains arguments (since parse_block creates a new child
@@ -179,8 +195,8 @@ ASTNode *parse_function(ParserContext *ctx, Lexer *l, int is_async)
         {
             // Check if unused and not prefixed with '_' (conventional ignore)
             // also ignore 'self' as it is often mandated by traits
-            if (!sym->is_used && sym->name[0] != '_' && strcmp(sym->name, "self") != 0 &&
-                strcmp(name, "main") != 0)
+            if (!sym->is_used && !g_config.misra_mode && sym->name[0] != '_' &&
+                strcmp(sym->name, "self") != 0 && strcmp(name, "main") != 0)
             {
                 warn_unused_parameter(sym->decl_token, sym->name, name);
             }
@@ -211,6 +227,7 @@ ASTNode *parse_function(ParserContext *ctx, Lexer *l, int is_async)
     node->func.is_varargs = is_varargs;
     node->func.is_async = is_async;
     node->func.c_type_overrides = ctype_overrides;
+    node->link_name = link_name ? xstrdup(link_name) : NULL;
 
     if (gen_param)
     {
@@ -259,10 +276,14 @@ char *patch_self_args(const char *args, const char *struct_name)
     }
     safe_name[j] = 0;
 
-    char *new_args = xmalloc(strlen(args) + strlen(safe_name) + 10);
+    char *new_args = xmalloc(strlen(args) + strlen(safe_name) + 20);
 
-    // Check if it starts with "void* self"
-    if (strncmp(args, "void* self", 10) == 0)
+    // Check if it starts with "const void* self" or "void* self"
+    if (strncmp(args, "const void* self", 16) == 0)
+    {
+        sprintf(new_args, "const %s* self%s", safe_name, args + 16);
+    }
+    else if (strncmp(args, "void* self", 10) == 0)
     {
         sprintf(new_args, "%s* self%s", safe_name, args + 10);
     }
@@ -322,9 +343,27 @@ static void replace_it_with_var(ASTNode *node, char *var_name)
     }
 }
 
-ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
+ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l, int is_export)
 {
-    lexer_next(l); // eat 'var'
+    Token tk = lexer_next(l); // eat 'var', 'let' or 'const'
+
+    int is_decl_let = (tk.len == 3 && strncmp(tk.start, "let", 3) == 0);
+
+    if (!is_decl_let)
+    {
+        if (tk.len == 3 && strncmp(tk.start, "var", 3) == 0)
+        {
+            zpanic_at(tk, "MISRA Rule Zen 1.5: The 'var' keyword is fully deprecated.\n"
+                          "| Hint: Use 'let' for variable declarations (e.g., 'let x = 10;').");
+        }
+        else if (tk.len == 5 && strncmp(tk.start, "const", 5) == 0)
+        {
+            zpanic_at(tk,
+                      "MISRA Rule Zen 1.5: The 'const' keyword is deprecated for declarations.\n"
+                      "| Hint: Use 'def' for manifest constants (e.g., 'def MAX = 100;')\n"
+                      "| Note: 'const' remains valid as a type qualifier for C-interop.");
+        }
+    }
 
     // Destructuring: var {x, y} = ... OR var (a: type, b: type) = ...
     if (lexer_peek(l).type == TOK_LBRACE || lexer_peek(l).type == TOK_LPAREN)
@@ -338,6 +377,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
         while (1)
         {
             Token t = lexer_next(l);
+            check_identifier(ctx, t);
             char *nm = token_strdup(t);
             names[count] = nm;
             types[count] = NULL;
@@ -350,11 +390,11 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
                 Type *type_obj = parse_type_formal(ctx, l);
                 types[count] = type_to_string(type_obj);
                 type_infos[count] = type_obj;
-                add_symbol(ctx, nm, types[count], type_obj);
+                add_symbol(ctx, nm, types[count], type_obj, is_export);
             }
             else
             {
-                add_symbol(ctx, nm, "unknown", NULL);
+                add_symbol(ctx, nm, "unknown", NULL, is_export);
             }
             count++;
 
@@ -365,7 +405,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
             }
             if (next.type != TOK_COMMA)
             {
-                zpanic_at(next, "Expected comma");
+                zpanic_at(next, "Expected comma in destructuring list");
             }
         }
         if (lexer_next(l).type != TOK_OP)
@@ -378,6 +418,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
             lexer_next(l);
         }
         ASTNode *n = ast_create(NODE_DESTRUCT_VAR);
+        n->token = tk;
         n->destruct.names = names;
         n->destruct.types = types;
         n->destruct.type_infos = type_infos;
@@ -389,6 +430,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
 
     // Normal Declaration OR Named Struct Destructuring
     Token name_tok = lexer_next(l);
+    check_identifier(ctx, name_tok);
     char *name = token_strdup(name_tok);
 
     // Check for Struct Destructuring: var Point { x, y }
@@ -403,6 +445,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
         {
             // Parse field:name or just name
             Token t = lexer_next(l);
+            check_identifier(ctx, t);
             char *ident = token_strdup(t);
 
             if (lexer_peek(l).type == TOK_COLON)
@@ -410,6 +453,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
                 // field: var_name
                 lexer_next(l); // eat :
                 Token v = lexer_next(l);
+                check_identifier(ctx, v);
                 fields[count] = ident;
                 names[count] = token_strdup(v);
             }
@@ -420,7 +464,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
                 names[count] = ident; // Share pointer or duplicate? duplicate safer if we free
             }
             // Register symbol for variable
-            add_symbol(ctx, names[count], "unknown", NULL);
+            add_symbol(ctx, names[count], "unknown", NULL, is_export);
 
             count++;
 
@@ -446,6 +490,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
         }
 
         ASTNode *n = ast_create(NODE_DESTRUCT_VAR);
+        n->token = name_tok;
         n->destruct.names = names;
         n->destruct.field_names = fields;
         n->destruct.count = count;
@@ -460,6 +505,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
     {
         lexer_next(l); // eat (
         Token val_tok = lexer_next(l);
+        check_identifier(ctx, val_tok);
         char *val_name = token_strdup(val_tok);
 
         if (lexer_next(l).type != TOK_RPAREN)
@@ -497,6 +543,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
         }
 
         ASTNode *n = ast_create(NODE_DESTRUCT_VAR);
+        n->token = t;
         n->destruct.names = xmalloc(sizeof(char *));
         n->destruct.names[0] = val_name;
         n->destruct.count = 1;
@@ -505,7 +552,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
         n->destruct.guard_variant = name;
         n->destruct.else_block = else_blk;
 
-        add_symbol(ctx, val_name, "unknown", NULL);
+        add_symbol(ctx, val_name, "unknown", NULL, is_export);
 
         return n;
     }
@@ -532,6 +579,19 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
         {
             init = parse_embed(ctx, l);
 
+            // In fault-tolerant mode (LSP), parse_embed may return NULL
+            // if the embedded file cannot be found. Create a placeholder.
+            if (!init)
+            {
+                init = ast_create(NODE_RAW_STMT);
+                init->token = next;
+                init->raw_stmt.content = xstrdup("((Slice__char){0})");
+                register_slice(ctx, "char");
+                Type *fallback_t = type_new(TYPE_STRUCT);
+                fallback_t->name = xstrdup("Slice__char");
+                init->type_info = fallback_t;
+            }
+
             if (!type && init->type_info)
             {
                 type = type_to_string(init->type_info);
@@ -539,27 +599,29 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
             if (!type)
             {
                 register_slice(ctx, "char");
-                type = xstrdup("Slice_char");
+                type = xstrdup("Slice__char");
             }
             if (lexer_peek(l).type == TOK_SEMICOLON)
             {
                 lexer_next(l);
             }
         }
-        else if (next.type == TOK_LBRACKET && type && strncmp(type, "Slice_", 6) == 0)
+        else if (next.type == TOK_LBRACKET && type && strncmp(type, "Slice__", 7) == 0)
         {
             char *code = parse_array_literal(ctx, l, type);
             init = ast_create(NODE_RAW_STMT);
+            init->token = next;
             init->raw_stmt.content = code;
             if (lexer_peek(l).type == TOK_SEMICOLON)
             {
                 lexer_next(l);
             }
         }
-        else if (next.type == TOK_LPAREN && type && strncmp(type, "Tuple_", 6) == 0)
+        else if (next.type == TOK_LPAREN && type && strncmp(type, "Tuple__", 7) == 0)
         {
             char *code = parse_tuple_literal(ctx, l, type);
             init = ast_create(NODE_RAW_STMT);
+            init->token = next;
             init->raw_stmt.content = code;
             if (lexer_peek(l).type == TOK_SEMICOLON)
             {
@@ -582,10 +644,10 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
             if (rhs_type && strchr(type, '*') && strchr(rhs_type, '*'))
             {
                 // Strip stars to get struct names
-                char target_struct[256];
+                char target_struct[MAX_TYPE_NAME_LEN];
                 strcpy(target_struct, type);
                 target_struct[strlen(target_struct) - 1] = 0;
-                char source_struct[256];
+                char source_struct[MAX_TYPE_NAME_LEN];
                 strcpy(source_struct, rhs_type);
                 source_struct[strlen(source_struct) - 1] = 0;
 
@@ -673,7 +735,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
     }
 
     // Register in symbol table with actual token
-    add_symbol_with_token(ctx, name, type, type_obj, name_tok);
+    add_symbol_with_token(ctx, name, type, type_obj, name_tok, is_export);
 
     if (init && type_obj)
     {
@@ -748,23 +810,14 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
     n->token = name_tok; // Save location
     n->var_decl.name = name;
     n->var_decl.type_str = type;
+    n->var_decl.is_let = is_decl_let;
+    n->var_decl.type_info = type_obj;
     n->type_info = type_obj;
 
     // Auto-construct Trait Object
-    if (type && is_trait(type) && init && init->type == NODE_EXPR_UNARY &&
-        strcmp(init->unary.op, "&") == 0 && init->unary.operand->type == NODE_EXPR_VAR)
+    if (type && is_trait(type))
     {
-        char *var_ref_name = init->unary.operand->var_ref.name;
-        char *struct_type = find_symbol_type(ctx, var_ref_name);
-        if (struct_type)
-        {
-            char *code = xmalloc(512);
-            sprintf(code, "(%s){.self=&%s, .vtable=&%s_%s_VTable}", type, var_ref_name, struct_type,
-                    type);
-            ASTNode *wrapper = ast_create(NODE_RAW_STMT);
-            wrapper->raw_stmt.content = code;
-            init = wrapper;
-        }
+        init = transform_to_trait_object(ctx, type, init);
     }
 
     n->var_decl.init_expr = init;
@@ -791,7 +844,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
         if (lexer_peek(&lookahead).type != TOK_LBRACE)
         {
             // Proceed to consume
-            lexer_next(l); // eat defer (real)
+            tk = lexer_next(l); // eat defer (real)
 
             // Parse the defer expression/statement
             // Usually defer close(it);
@@ -807,6 +860,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
             }
 
             ASTNode *d = ast_create(NODE_DEFER);
+            d->token = tk;
             d->defer_stmt.stmt = expr;
 
             // Chain it: var_decl -> defer
@@ -817,7 +871,7 @@ ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l)
     return n;
 }
 
-ASTNode *parse_def(ParserContext *ctx, Lexer *l)
+ASTNode *parse_def(ParserContext *ctx, Lexer *l, int is_export)
 {
     lexer_next(l); // eat def
     Token n = lexer_next(l);
@@ -841,10 +895,11 @@ ASTNode *parse_def(ParserContext *ctx, Lexer *l)
     type_obj->is_const = 1;
 
     // Use is_def flag for manifest constants
-    add_symbol(ctx, ns, type_str ? type_str : "unknown", type_obj);
+    add_symbol_with_token(ctx, ns, type_str ? type_str : "unknown", type_obj, n, is_export);
     ZenSymbol *sym_entry = find_symbol_entry(ctx, ns);
     if (sym_entry)
     {
+        sym_entry->kind = SYM_CONSTANT;
         sym_entry->is_def = 1;
         // is_const_value set only if literal
     }
@@ -854,10 +909,12 @@ ASTNode *parse_def(ParserContext *ctx, Lexer *l)
     {
         lexer_next(l);
 
-        if (lexer_peek(l).type == TOK_LPAREN && type_str && strncmp(type_str, "Tuple_", 6) == 0)
+        Token tk = lexer_peek(l);
+        if (tk.type == TOK_LPAREN && type_str && strncmp(type_str, "Tuple__", 7) == 0)
         {
             char *code = parse_tuple_literal(ctx, l, type_str);
             i = ast_create(NODE_RAW_STMT);
+            i->token = tk;
             i->raw_stmt.content = code;
         }
         else
@@ -906,6 +963,7 @@ ASTNode *parse_def(ParserContext *ctx, Lexer *l)
     }
 
     ASTNode *o = ast_create(NODE_CONST);
+    o->token = n;
     o->var_decl.name = ns;
     o->var_decl.type_str = type_str;
     o->var_decl.init_expr = i;
@@ -919,7 +977,7 @@ ASTNode *parse_def(ParserContext *ctx, Lexer *l)
     return o;
 }
 
-ASTNode *parse_type_alias(ParserContext *ctx, Lexer *l, int is_opaque)
+ASTNode *parse_type_alias(ParserContext *ctx, Lexer *l, int is_opaque, int is_export)
 {
     lexer_next(l); // consume 'type' or 'alias'
     Token n = lexer_next(l);
@@ -930,20 +988,25 @@ ASTNode *parse_type_alias(ParserContext *ctx, Lexer *l, int is_opaque)
 
     lexer_next(l); // consume '='
 
-    char *o = parse_type(ctx, l);
+    Type *t = parse_type_formal(ctx, l);
+    char *o = type_to_string(t);
 
-    lexer_next(l);
+    if (lexer_peek(l).type == TOK_SEMICOLON)
+    {
+        lexer_next(l);
+    }
 
     ASTNode *node = ast_create(NODE_TYPE_ALIAS);
     node->type_alias.alias = xmalloc(n.len + 1);
     strncpy(node->type_alias.alias, n.start, n.len);
     node->type_alias.alias[n.len] = 0;
     node->type_alias.original_type = o;
+    node->type_info = t;
     node->type_alias.is_opaque = is_opaque;
     node->type_alias.defined_in_file = g_current_filename ? xstrdup(g_current_filename) : NULL;
 
-    register_type_alias(ctx, node->type_alias.alias, o, is_opaque,
-                        node->type_alias.defined_in_file);
+    register_type_alias(ctx, node->type_alias.alias, o, t, is_opaque,
+                        node->type_alias.defined_in_file, n, is_export);
 
     return node;
 }

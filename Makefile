@@ -21,7 +21,7 @@ endif
 # To build with zig:   make CC="zig cc"
 # Version synchronization
 GIT_VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "0.1.0")
-CFLAGS = -Wall -Wextra -g -I./src -I./src/ast -I./src/parser -I./src/codegen -I./plugins -I./src/zen -I./src/utils -I./src/lexer -I./src/analysis -I./src/lsp -I./src/diagnostics -I./std/third-party/tre/include -DZEN_VERSION=\"$(GIT_VERSION)\" -DZEN_SHARE_DIR=\"$(SHAREDIR)\"
+CFLAGS = -std=gnu11 -Wall -Wextra -Wshadow -g -I./src -I./src/ast -I./src/parser -I./src/codegen -I./plugins -I./src/zen -I./src/utils -I./src/lexer -I./src/analysis -I./src/lsp -I./src/diagnostics -I./std/third-party/tre/include -DZEN_VERSION=\"$(GIT_VERSION)\" -DZEN_SHARE_DIR=\"$(SHAREDIR)\"
 TARGET = zc$(EXE)
 ifeq ($(OS),Windows_NT)
     LIBS = -lws2_32
@@ -38,6 +38,8 @@ SRCS = src/main.c \
        src/parser/parser_decl.c \
        src/parser/parser_struct.c \
        src/ast/ast.c \
+       src/ast/primitives.c \
+       src/ast/symbols.c \
        src/codegen/codegen.c \
        src/codegen/codegen_stmt.c \
        src/codegen/codegen_decl.c \
@@ -49,6 +51,7 @@ SRCS = src/main.c \
        src/platform/os.c \
        src/platform/console.c \
        src/platform/dylib.c \
+       src/platform/misra.c \
        src/utils/config.c \
        src/diagnostics/diagnostics.c \
        src/lexer/token.c \
@@ -60,6 +63,7 @@ SRCS = src/main.c \
        src/lsp/lsp_analysis.c \
        src/lsp/lsp_semantic.c \
        src/lsp/lsp_index.c \
+       src/lsp/lsp_formatter.c \
        src/lsp/lsp_project.c \
        src/lsp/cJSON.c \
        src/zen/zen_facts.c \
@@ -89,7 +93,7 @@ MANDIR = $(PREFIX)/share/man
 SHAREDIR = $(PREFIX)/share/zenc
 INCLUDEDIR = $(PREFIX)/include/zenc
 
-PLUGINS = plugins/befunge.so plugins/brainfuck.so plugins/forth.so plugins/lisp.so plugins/regex.so plugins/sql.so
+PLUGINS = plugins/befunge.so plugins/brainfuck.so plugins/forth.so plugins/lisp.so plugins/sql.so
 
 # APE (Actually Portable Executable) configuration
 COSMOCC = cosmocc
@@ -109,8 +113,9 @@ all: $(TARGET) $(PLUGINS)
 ape: $(ZC_COM) $(ZC_BOOT_COM)
 
 # Build plugins
-plugins/%.so: plugins/%.c
-	$(CC) $(CFLAGS) -shared -fPIC -o $@ $<
+
+plugins/%.so: plugins/%.zc $(TARGET)
+	./zc build $< -shared -o $@
 
 # Link
 $(TARGET): $(OBJS)
@@ -167,6 +172,7 @@ install: $(TARGET)
 	
 	# Install standard library
 	$(INSTALL) -d $(SHAREDIR)
+	$(INSTALL) -m 644 std.zc $(SHAREDIR)/std.zc
 	$(CP) std $(SHAREDIR)/
 	
 	# Install facts
@@ -177,6 +183,10 @@ install: $(TARGET)
 	# Install plugin headers
 	$(INSTALL) -d $(INCLUDEDIR)
 	$(INSTALL) -m 644 plugins/zprep_plugin.h $(INCLUDEDIR)/zprep_plugin.h
+	
+	# Install compiled plugins
+	$(INSTALL) -d $(SHAREDIR)/plugins
+	$(CP) plugins/*.so $(SHAREDIR)/plugins/
 	@echo "=> Installed to $(BINDIR)/$(TARGET)"
 	@echo "=> Man pages installed to $(MANDIR)"
 	@echo "=> Standard library installed to $(SHAREDIR)/std"
@@ -202,6 +212,7 @@ install-ape: ape
 	
 	# Install standard library (shared)
 	$(INSTALL) -d $(SHAREDIR)
+	$(INSTALL) -m 644 std.zc $(SHAREDIR)/std.zc
 	$(CP) std $(SHAREDIR)/
 	@echo "=> Installed APE binaries to $(BINDIR)"
 	@echo "=> Alias 'zc' points to zc.com"
@@ -222,15 +233,21 @@ clean:
 	@echo "=> Clean complete!"
 
 # Test
+# Supports running specific tests:
+#	make test only="tests/std/test_hash.zc examples/arena_test.zc"
 test: $(TARGET) $(PLUGINS)
-	./tests/scripts/run_tests.sh
-	./tests/scripts/run_codegen_tests.sh
-	./tests/scripts/run_example_transpile.sh
+	./tests/scripts/run_tests.sh -- $(filter %.zc,$(only))
+	./tests/scripts/run_codegen_tests.sh $(filter %.zc,$(only))
+	./tests/scripts/run_example_transpile.sh $(filter %.zc,$(only))
+	$(MAKE) test-misra
+
+test-misra: $(TARGET)
+	./tests/scripts/run_misra_tests.sh
 
 test-tcc: $(TARGET) $(PLUGINS)
 	./tests/scripts/run_tests.sh --cc tcc
 
-test-lsp: $(TARGET)
+test-lsp: $(TARGET) $(PLUGINS)
 	@echo "=> Building LSP Test Runner"
 	$(CC) $(CFLAGS) tests/compiler/lsp/lsp_test_runner.c src/lsp/cJSON.c -o tests/compiler/lsp/test_runner
 	@echo "=> Running LSP Tests"
@@ -246,4 +263,52 @@ clang:
 windows:
 	$(MAKE) CC="x86_64-w64-mingw32-gcc" TARGET="zc.exe" UI_OS="Windows" LIBS="-static -lm -lpthread"
 
-.PHONY: all clean install uninstall install-ape uninstall-ape test zig clang ape windows
+asan: CFLAGS += -fsanitize=address,undefined -O1 -fno-omit-frame-pointer
+asan: LIBS += -fsanitize=address,undefined
+asan: $(TARGET) $(PLUGINS)
+
+test-asan: clean asan
+	ASAN_OPTIONS=detect_leaks=0 ./tests/scripts/run_tests.sh
+	ASAN_OPTIONS=detect_leaks=0 ./tests/scripts/run_codegen_tests.sh
+	ASAN_OPTIONS=detect_leaks=0 ./tests/scripts/run_example_transpile.sh
+
+test-plugins: $(TARGET) $(PLUGINS)
+	./zc run tests/plugins_suite.zc
+
+# Fuzzing
+FUZZ_TARGET = zc-fuzz
+FUZZ_CMPLOG_TARGET = zc-fuzz-cmplog
+FUZZ_CC ?= afl-clang-fast
+FUZZ_DIR = fuzz
+FUZZ_OUT = $(FUZZ_DIR)/out
+FUZZ_CORPUS = $(FUZZ_DIR)/corpus
+FUZZ_DICT = $(FUZZ_DIR)/zen_c.dict
+
+# High-performance flags
+FUZZ_CFLAGS = -O3 -march=native -D__AFL_HAVE_MANUAL_CONTROL
+
+fuzz-build:
+	@$(MKDIR) $(OBJ_DIR)/fuzz
+	$(MAKE) CC=$(FUZZ_CC) CFLAGS='$(CFLAGS) $(FUZZ_CFLAGS)' OBJ_DIR=obj-fuzz TARGET=$(FUZZ_TARGET) SRCS="$(filter-out src/main.c,$(SRCS)) fuzz/harness.c"
+	@echo "=> Fuzzing target built (Persistent Mode): $(FUZZ_TARGET)"
+
+fuzz-cmplog-build:
+	@$(MKDIR) $(OBJ_DIR)/fuzz-cmplog
+	AFL_LLVM_CMPLOG=1 $(MAKE) CC=$(FUZZ_CC) CFLAGS='$(CFLAGS) $(FUZZ_CFLAGS)' OBJ_DIR=obj-fuzz-cmplog TARGET=$(FUZZ_CMPLOG_TARGET) SRCS="$(filter-out src/main.c,$(SRCS)) fuzz/harness.c"
+	@echo "=> CmpLog target built: $(FUZZ_CMPLOG_TARGET)"
+
+fuzz-run: fuzz-build
+	@if [ ! -d "$(FUZZ_CORPUS)" ]; then sh $(FUZZ_DIR)/scripts/generate_corpus.sh; fi
+	@$(MKDIR) $(FUZZ_OUT)
+	@echo "-> Starting fuzzer (Persistent Mode enabled)"
+	@echo "-> Tip: For parallel runs, use '-M main' and '-S secondaryN'"
+	AFL_SKIP_CPUFREQ=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 afl-fuzz -i $(FUZZ_CORPUS) -o $(FUZZ_OUT) -x $(FUZZ_DICT) -- ./$(FUZZ_TARGET)
+
+fuzz-clean:
+	rm -rf $(FUZZ_OUT)/*
+	rm -f $(FUZZ_TARGET) $(FUZZ_CMPLOG_TARGET)
+	rm -rf obj-fuzz obj-fuzz-cmplog
+
+.PHONY: all clean install uninstall install-ape uninstall-ape test zig clang ape windows asan test-asan test-plugins fuzz-build fuzz-run
+
+.PHONY: all clean install uninstall install-ape uninstall-ape test zig clang ape windows asan test-asan test-plugins

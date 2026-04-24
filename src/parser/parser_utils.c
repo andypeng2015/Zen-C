@@ -1,10 +1,210 @@
-
 #include "../codegen/codegen.h"
 #include "../plugins/plugin_manager.h"
 #include "parser.h"
+#include "platform/misra.h"
+#include "../constants.h"
+#include "../ast/primitives.h"
+#include <ctype.h>
 #include "analysis/const_fold.h"
 
+// Forward declaration
+static void audit_section_5(ParserContext *ctx, Scope *scope, const char *name,
+                            const char *link_name, Token tok);
+
 static int is_unmangle_primitive(const char *base);
+
+void parser_audit_preprocessor(ParserContext *ctx, Token tok)
+{
+    const char *p = tok.start;
+    while (isspace(*p) || *p == '#')
+    {
+        p++;
+    }
+
+    if (strncmp(p, "define", 6) == 0)
+    {
+        if (g_config.misra_mode)
+        {
+            zerror_at(tok,
+                      "MISRA Violation: '#' directives are prohibited (MISRA Rule Zen 1.4). Use "
+                      "'def' instead.");
+
+            // Rule 21.1: #define of standard identifiers
+            const char *id_start = p + 6;
+            while (isspace(*id_start))
+            {
+                id_start++;
+            }
+            const char *id_end = id_start;
+            while (isalnum(*id_end) || *id_end == '_')
+            {
+                id_end++;
+            }
+            int id_len = id_end - id_start;
+            if (id_len > 0)
+            {
+                char id[128];
+                if (id_len >= 128)
+                {
+                    id_len = 127;
+                }
+                strncpy(id, id_start, id_len);
+                id[id_len] = 0;
+
+                if (strcmp(id, "errno") == 0 || strcmp(id, "assert") == 0 ||
+                    strcmp(id, "NULL") == 0 || strcmp(id, "static_assert") == 0 ||
+                    strcmp(id, "bool") == 0 || strcmp(id, "restrict") == 0 ||
+                    strcmp(id, "inline") == 0)
+                {
+                    zerror_at(
+                        tok, "MISRA Rule 21.1: #define shall not be used on a reserved macro name");
+                }
+            }
+        }
+        else
+        {
+            zwarn_at_diag(0, tok,
+                          "Preprocessor directive '#define' is deprecated. Use 'def' instead.");
+        }
+        // still try to parse it for constant extraction (backward compat)
+        char *content = xmalloc(tok.len + 1);
+        strncpy(content, tok.start, tok.len);
+        content[tok.len] = 0;
+        try_parse_macro_const(ctx, content);
+        free(content);
+    }
+    else if (strncmp(p, "include", 7) == 0)
+    {
+        if (g_config.misra_mode)
+        {
+            zerror_at(
+                tok,
+                "MISRA Violation: '#include' is prohibited (Rule Zen 1.4). Use 'import' instead.");
+        }
+        else
+        {
+            zwarn_at_diag(0, tok,
+                          "Preprocessor directive '#include' is deprecated. Use 'import' instead.");
+        }
+    }
+    else if (strncmp(p, "if", 2) == 0 || strncmp(p, "elif", 4) == 0 ||
+             strncmp(p, "ifdef", 5) == 0 || strncmp(p, "ifndef", 6) == 0)
+    {
+        int is_elif = (strncmp(p, "elif", 4) == 0);
+        int is_ifdef = (strncmp(p, "ifdef", 5) == 0);
+        int is_ifndef = (strncmp(p, "ifndef", 6) == 0);
+
+        if (g_config.misra_mode)
+        {
+            zerror_at(tok, "MISRA Violation: '#' preprocessor conditions are prohibited (MISRA "
+                           "Rule Zen 1.4). Use "
+                           "'@cfg(...)' instead.");
+
+            // Perform specific expression audits (Rule 20.8, 20.9)
+            if (is_ifdef || is_ifndef)
+            {
+                // Just an identifier
+                const char *expr_start = p + (is_ifdef ? 5 : 6);
+                while (isspace(*expr_start))
+                {
+                    expr_start++;
+                }
+                // 20.9 technically only applies to #if/#elif, but we check ifdefs too if they are
+                // legacy
+            }
+            else
+            {
+                const char *expr_start = p + (is_elif ? 4 : 2);
+                while (isspace(*expr_start))
+                {
+                    expr_start++;
+                }
+
+                int expr_len = (tok.start + tok.len) - expr_start;
+                if (expr_len > 0)
+                {
+                    char *expr_buf = xmalloc(expr_len + 1);
+                    strncpy(expr_buf, expr_start, expr_len);
+                    expr_buf[expr_len] = 0;
+
+                    // Truncate at comment or newline to avoid Rule 20.9 false positives
+                    char *comment = strstr(expr_buf, "//");
+                    if (comment)
+                    {
+                        *comment = 0;
+                    }
+                    char *nl = strchr(expr_buf, '\n');
+                    if (nl)
+                    {
+                        *nl = 0;
+                    }
+                    char *cr = strchr(expr_buf, '\r');
+                    if (cr)
+                    {
+                        *cr = 0;
+                    }
+
+                    misra_check_preprocessor_expression_parser(ctx, tok, expr_buf);
+                    free(expr_buf);
+                }
+            }
+        }
+        else
+        {
+            zwarn_at_diag(0, tok,
+                          "Preprocessor directive '#' conditions are deprecated. Use "
+                          "'@cfg(...)' instead.");
+        }
+    }
+    else if (strncmp(p, "undef", 5) == 0 || strncmp(p, "error", 5) == 0 ||
+             strncmp(p, "warning", 7) == 0 || strncmp(p, "pragma", 6) == 0)
+    {
+        int is_undef = (strncmp(p, "undef", 5) == 0);
+        if (g_config.misra_mode)
+        {
+            zerror_at(tok, "MISRA Violation: '#' directives are prohibited (MISRA Rule Zen 1.4).");
+
+            if (is_undef)
+            {
+                // Rule 21.1: #undef of standard identifiers
+                const char *id_start = p + 5;
+                while (isspace(*id_start))
+                {
+                    id_start++;
+                }
+                const char *id_end = id_start;
+                while (isalnum(*id_end) || *id_end == '_')
+                {
+                    id_end++;
+                }
+                int id_len = id_end - id_start;
+                if (id_len > 0)
+                {
+                    char id[128];
+                    if (id_len >= 128)
+                    {
+                        id_len = 127;
+                    }
+                    strncpy(id, id_start, id_len);
+                    id[id_len] = 0;
+
+                    // Common standard macro names that shouldn't be undefined
+                    if (strcmp(id, "errno") == 0 || strcmp(id, "assert") == 0 ||
+                        strcmp(id, "NULL") == 0 || strcmp(id, "static_assert") == 0)
+                    {
+                        zerror_at(
+                            tok,
+                            "MISRA Rule 21.1: #undef shall not be used on a reserved macro name");
+                    }
+                }
+            }
+        }
+        else
+        {
+            zwarn_at_diag(0, tok, "Preprocessor directive '#' is deprecated.");
+        }
+    }
+}
 
 void try_parse_macro_const(ParserContext *ctx, const char *content)
 {
@@ -42,10 +242,189 @@ void try_parse_macro_const(ParserContext *ctx, const char *content)
         return;
     }
 
-    const char *after_name = name.start + name.len;
-    if (*after_name == '(')
+    const char *p_scan = name.start + name.len;
+    while (*p_scan && *p_scan != '\n')
     {
-        return; // Function-like macro definition
+        // Simple scan for # and ## without full lexing to catch them in all defines
+        if (*p_scan == '#')
+        {
+            if (*(p_scan + 1) == '#')
+            {
+                if (g_config.misra_mode)
+                {
+                    zerror_at(name, "MISRA Rule 20.10: '##' operator used in macro");
+                }
+                p_scan++;
+            }
+            else
+            {
+                if (g_config.misra_mode)
+                {
+                    zerror_at(name, "MISRA Rule 20.10: '#' operator used in macro");
+                }
+            }
+        }
+        p_scan++;
+    }
+
+    if (*(name.start + name.len) == '(')
+    {
+        if (g_config.misra_mode)
+        {
+            // Advanced audit for function-like macros (20.11, 20.12)
+            const char *pm = name.start + name.len;
+            while (isspace(*pm))
+            {
+                pm++;
+            }
+            if (*pm == '(')
+            {
+                pm++; // skip '('
+                char *params[32];
+                int param_count = 0;
+                while (*pm && *pm != ')' && param_count < 32)
+                {
+                    while (isspace(*pm) || *pm == ',')
+                    {
+                        pm++;
+                    }
+                    if (!isalpha(*pm) && *pm != '_')
+                    {
+                        break;
+                    }
+                    const char *p_start = pm;
+                    while (is_ident_char(*pm))
+                    {
+                        pm++;
+                    }
+                    int len = pm - p_start;
+                    params[param_count] = xmalloc(len + 1);
+                    strncpy(params[param_count], p_start, len);
+                    params[param_count][len] = 0;
+                    param_count++;
+                }
+                while (*pm && *pm != ')')
+                {
+                    pm++;
+                }
+                if (*pm == ')')
+                {
+                    pm++;
+                }
+
+                // Body usage tracking
+                unsigned int used_norm = 0;
+                unsigned int used_op = 0;
+
+                const char *pb = pm;
+                while (*pb && *pb != '\n')
+                {
+                    while (isspace(*pb))
+                    {
+                        pb++;
+                    }
+                    if (!*pb || *pb == '\n')
+                    {
+                        break;
+                    }
+
+                    if (*pb == '#')
+                    {
+                        int is_concat = (pb[1] == '#');
+                        pb += (is_concat ? 2 : 1);
+                        while (isspace(*pb))
+                        {
+                            pb++;
+                        }
+                        if (isalpha(*pb) || *pb == '_')
+                        {
+                            const char *id_start = pb;
+                            while (is_ident_char(*pb))
+                            {
+                                pb++;
+                            }
+                            int id_len = pb - id_start;
+                            for (int i = 0; i < param_count; i++)
+                            {
+                                if (id_len == (int)strlen(params[i]) &&
+                                    strncmp(id_start, params[i], id_len) == 0)
+                                {
+                                    used_op |= (1 << i);
+                                    if (!is_concat)
+                                    {
+                                        // Rule 20.11 check: #param followed by ##
+                                        const char *pafter = pb;
+                                        while (isspace(*pafter))
+                                        {
+                                            pafter++;
+                                        }
+                                        if (pafter[0] == '#' && pafter[1] == '#')
+                                        {
+                                            zerror_at(
+                                                name,
+                                                "MISRA Rule 20.11: # parameter followed by ##");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else if (isalpha(*pb) || *pb == '_')
+                    {
+                        const char *id_start = pb;
+                        while (is_ident_char(*pb))
+                        {
+                            pb++;
+                        }
+                        int id_len = pb - id_start;
+                        // Check if it's followed or preceded by ## (handled above for follow)
+                        // Actually, we can just check for ## around it
+                        const char *pafter = pb;
+                        while (isspace(*pafter))
+                        {
+                            pafter++;
+                        }
+                        int follows_concat = (pafter[0] == '#' && pafter[1] == '#');
+
+                        for (int i = 0; i < param_count; i++)
+                        {
+                            if (id_len == (int)strlen(params[i]) &&
+                                strncmp(id_start, params[i], id_len) == 0)
+                            {
+                                if (follows_concat)
+                                {
+                                    used_op |= (1 << i);
+                                }
+                                else
+                                {
+                                    used_norm |= (1 << i);
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        pb++;
+                    }
+                }
+
+                // Rule 20.12 check: parameter used as op AND normally
+                for (int i = 0; i < param_count; i++)
+                {
+                    if ((used_op & (1 << i)) && (used_norm & (1 << i)))
+                    {
+                        char msg[128];
+                        snprintf(msg, sizeof(msg),
+                                 "MISRA Rule 20.12: parameter '%s' used as both operand to #/## "
+                                 "and normal token",
+                                 params[i]);
+                        zerror_at(name, msg);
+                    }
+                    free(params[i]);
+                }
+            }
+        }
+        return; // Fixed-size scanner already did 20.10 above
     }
 
     // Check remaining tokens for SAFETY
@@ -71,7 +450,19 @@ void try_parse_macro_const(ParserContext *ctx, const char *content)
             return; // Unsafe or complex
         }
 
-        // Safety check for C casts/pointers that cause compiler crash in expression parser
+        // MISRA Rule 20.10: The # and ## preprocessor operators should not be used
+        if (g_config.misra_mode && ct.type == TOK_OP)
+        {
+            if (ct.len == 1 && *ct.start == '#')
+            {
+                zerror_at(ct, "MISRA Rule 20.10: '#' operator used in macro");
+            }
+            else if (ct.len == 2 && strncmp(ct.start, "##", 2) == 0)
+            {
+                zerror_at(ct, "MISRA Rule 20.10: '##' operator used in macro");
+            }
+        }
+
         if (ct.type == TOK_IDENT)
         {
             char *tok_str = token_strdup(ct);
@@ -130,7 +521,7 @@ void try_parse_macro_const(ParserContext *ctx, const char *content)
         if (!existing)
         {
             // Add to symbol table
-            add_symbol(ctx, n, "int", type_new(TYPE_INT)); // Placeholder type
+            add_symbol_with_token(ctx, n, "int", type_new(TYPE_INT), name, 0); // Placeholder type
             // find_symbol_entry to set properties
             ZenSymbol *sym = find_symbol_entry(ctx, n);
             if (sym)
@@ -159,7 +550,7 @@ Token expect(Lexer *l, ZenTokenType type, const char *msg)
     if (t.type != type)
     {
         zpanic_at(t, "Expected %s, but got '%.*s'", msg, t.len, t.start);
-        return (Token){type, t.start, 0, t.line, t.col};
+        return (Token){type, t.start, 0, t.line, t.col, t.file};
     }
     return t;
 }
@@ -167,39 +558,34 @@ Token expect(Lexer *l, ZenTokenType type, const char *msg)
 // Helper to check if a type name is a primitive type
 int is_primitive_type_name(const char *name)
 {
-    if (!name)
-    {
-        return 0;
-    }
+    return find_primitive_kind(name) != TYPE_UNKNOWN;
+}
 
-    return strcmp(name, "int") == 0 || strcmp(name, "i32") == 0 || strcmp(name, "u8") == 0 ||
-           strcmp(name, "i8") == 0 || strcmp(name, "i16") == 0 || strcmp(name, "u16") == 0 ||
-           strcmp(name, "u32") == 0 || strcmp(name, "i64") == 0 || strcmp(name, "u64") == 0 ||
-           strcmp(name, "f32") == 0 || strcmp(name, "float") == 0 || strcmp(name, "f64") == 0 ||
-           strcmp(name, "double") == 0 || strcmp(name, "void") == 0 || strcmp(name, "bool") == 0 ||
-           strcmp(name, "char") == 0 || strcmp(name, "usize") == 0 || strcmp(name, "isize") == 0 ||
-           strcmp(name, "uint") == 0 || strcmp(name, "byte") == 0 ||
-           // C-style types returned by type_to_string
-           strcmp(name, "int8_t") == 0 || strcmp(name, "uint8_t") == 0 ||
-           strcmp(name, "int16_t") == 0 || strcmp(name, "uint16_t") == 0 ||
-           strcmp(name, "int32_t") == 0 || strcmp(name, "uint32_t") == 0 ||
-           strcmp(name, "int64_t") == 0 || strcmp(name, "uint64_t") == 0 ||
-           strcmp(name, "size_t") == 0 || strcmp(name, "ptrdiff_t") == 0;
+TypeKind get_primitive_type_kind(const char *name)
+{
+    return find_primitive_kind(name);
 }
 
 // Forward declaration
-char *ast_to_string(ASTNode *node);
+char *ast_to_string_recursive(ASTNode *node, int depth);
+
+char *ast_to_string(ASTNode *node)
+{
+    return ast_to_string_recursive(node, 0);
+}
 
 // Temporary lightweight AST printer for default args
 // Comprehensive AST printer for default args and other code generation needs
-char *ast_to_string(ASTNode *node)
+char *ast_to_string_recursive(ASTNode *node, int depth)
 {
-    if (!node)
+    const int MAX_DEPTH = 32;
+    if (!node || depth > MAX_DEPTH)
     {
-        return xstrdup("");
+        return xstrdup(depth > MAX_DEPTH ? "..." : "");
     }
 
-    char *buf = xmalloc(4096);
+    size_t buf_size = MAX_PATH_LEN;
+    char *buf = xmalloc(buf_size);
     buf[0] = 0;
 
     switch (node->type)
@@ -207,71 +593,80 @@ char *ast_to_string(ASTNode *node)
     case NODE_EXPR_LITERAL:
         if (node->literal.type_kind == LITERAL_INT)
         {
-            sprintf(buf, "%llu", node->literal.int_val);
+            snprintf(buf, buf_size, "%llu", node->literal.int_val);
         }
         else if (node->literal.type_kind == LITERAL_FLOAT)
         {
-            sprintf(buf, "%f", node->literal.float_val);
+            snprintf(buf, buf_size, "%f", node->literal.float_val);
         }
         else if (node->literal.type_kind == LITERAL_STRING)
         {
-            sprintf(buf, "\"%s\"", node->literal.string_val);
+            size_t s_len = strlen(node->literal.string_val);
+            size_t required = s_len + 16;
+            if (required > buf_size)
+            {
+                char *new_buf = xrealloc(buf, required);
+                buf = new_buf;
+                buf_size = required;
+            }
+            snprintf(buf, buf_size, "\"%s\"", node->literal.string_val);
         }
         else if (node->literal.type_kind == LITERAL_CHAR)
         {
             if (node->literal.int_val == '\'')
             {
-                sprintf(buf, "'\\''");
+                snprintf(buf, buf_size, "'\\''");
             }
             else if (node->literal.int_val == '\n')
             {
-                sprintf(buf, "'\\n'");
+                snprintf(buf, buf_size, "'\\n'");
             }
             else if (node->literal.int_val == '\\')
             {
-                sprintf(buf, "'\\\\'");
+                snprintf(buf, buf_size, "'\\\\'");
             }
             else if (node->literal.int_val == '\0')
             {
-                sprintf(buf, "'\\0'");
+                snprintf(buf, buf_size, "'\\0'");
             }
             else
             {
-                sprintf(buf, "'%c'", (char)node->literal.int_val);
+                snprintf(buf, buf_size, "'%c'", (char)node->literal.int_val);
             }
         }
         break;
     case NODE_EXPR_VAR:
-        strcpy(buf, node->var_ref.name);
+        snprintf(buf, buf_size, "%s", node->var_ref.name ? node->var_ref.name : "");
         break;
     case NODE_EXPR_BINARY:
     {
-        char *l = ast_to_string(node->binary.left);
-        char *r = ast_to_string(node->binary.right);
+        char *l = ast_to_string_recursive(node->binary.left, depth + 1);
+        char *r = ast_to_string_recursive(node->binary.right, depth + 1);
         // Add parens to be safe
-        sprintf(buf, "(%s %s %s)", l, node->binary.op, r);
+        snprintf(buf, buf_size, "(%s %s %s)", l, node->binary.op ? node->binary.op : "?", r);
         free(l);
         free(r);
         break;
     }
     case NODE_EXPR_UNARY:
     {
-        char *o = ast_to_string(node->unary.operand);
-        sprintf(buf, "(%s%s)", node->unary.op, o);
+        char *o = ast_to_string_recursive(node->unary.operand, depth + 1);
+        snprintf(buf, buf_size, "(%s%s)", node->unary.op ? node->unary.op : "?", o);
         free(o);
         break;
     }
     case NODE_EXPR_CAST:
     {
-        char *e = ast_to_string(node->cast.expr);
-        sprintf(buf, "((%s)%s)", node->cast.target_type, e);
+        char *e = ast_to_string_recursive(node->cast.expr, depth + 1);
+        snprintf(buf, buf_size, "((%s)%s)", node->cast.target_type ? node->cast.target_type : "?",
+                 e);
         free(e);
         break;
     }
     case NODE_EXPR_CALL:
     {
-        char *callee = ast_to_string(node->call.callee);
-        sprintf(buf, "%s(", callee);
+        char *callee = ast_to_string_recursive(node->call.callee, depth + 1);
+        snprintf(buf, buf_size, "%s(", callee);
         free(callee);
 
         ASTNode *arg = node->call.args;
@@ -280,10 +675,13 @@ char *ast_to_string(ASTNode *node)
         {
             if (!first)
             {
-                strcat(buf, ", ");
+                if (strlen(buf) + 4 < buf_size)
+                {
+                    strcat(buf, ", ");
+                }
             }
-            char *a = ast_to_string(arg);
-            if (strlen(buf) + strlen(a) < 4090)
+            char *a = ast_to_string_recursive(arg, depth + 1);
+            if (strlen(buf) + strlen(a) + 4 < buf_size)
             {
                 strcat(buf, a);
             }
@@ -291,13 +689,16 @@ char *ast_to_string(ASTNode *node)
             first = 0;
             arg = arg->next;
         }
-        strcat(buf, ")");
+        if (strlen(buf) + 2 < buf_size)
+        {
+            strcat(buf, ")");
+        }
         break;
     }
     case NODE_EXPR_STRUCT_INIT:
     {
         char *name = node->struct_init.struct_name;
-        sprintf(buf, "%s{", name);
+        snprintf(buf, buf_size, "%s{", name ? name : "?");
 
         ASTNode *field = node->struct_init.fields;
         int first = 1;
@@ -305,42 +706,53 @@ char *ast_to_string(ASTNode *node)
         {
             if (!first)
             {
-                strcat(buf, ", ");
+                if (strlen(buf) + 4 < buf_size)
+                {
+                    strcat(buf, ", ");
+                }
             }
-
             if (field->type == NODE_VAR_DECL)
             {
-                strcat(buf, field->var_decl.name);
-                strcat(buf, ": ");
-                char *val = ast_to_string(field->var_decl.init_expr);
-                strcat(buf, val);
+                if (strlen(buf) + (field->var_decl.name ? strlen(field->var_decl.name) : 0) + 4 <
+                    buf_size)
+                {
+                    strcat(buf, field->var_decl.name ? field->var_decl.name : "?");
+                    strcat(buf, ": ");
+                }
+                char *val = ast_to_string_recursive(field->var_decl.init_expr, depth + 1);
+                if (strlen(buf) + strlen(val) + 2 < buf_size)
+                {
+                    strcat(buf, val);
+                }
                 free(val);
             }
-
             first = 0;
             field = field->next;
         }
-        strcat(buf, "}");
+        if (strlen(buf) + 2 < buf_size)
+        {
+            strcat(buf, "}");
+        }
         break;
     }
     case NODE_EXPR_MEMBER:
     {
-        char *t = ast_to_string(node->member.target);
-        sprintf(buf, "%s.%s", t, node->member.field);
+        char *t = ast_to_string_recursive(node->member.target, depth + 1);
+        snprintf(buf, buf_size, "%s.%s", t, node->member.field ? node->member.field : "?");
         free(t);
         break;
     }
     case NODE_EXPR_INDEX:
     {
-        char *arr = ast_to_string(node->index.array);
-        char *idx = ast_to_string(node->index.index);
-        sprintf(buf, "%s[%s]", arr, idx);
+        char *arr = ast_to_string_recursive(node->index.array, depth + 1);
+        char *idx = ast_to_string_recursive(node->index.index, depth + 1);
+        snprintf(buf, buf_size, "%s[%s]", arr, idx);
         free(arr);
         free(idx);
         break;
     }
     default:
-        // Minimal fallback
+        snprintf(buf, buf_size, "<expr>");
         break;
     }
     return buf;
@@ -358,6 +770,45 @@ char *token_strdup(Token t)
     strncpy(s, t.start, t.len);
     s[t.len] = 0;
     return s;
+}
+
+char *token_get_string_content(Token t)
+{
+    int is_multi = 0;
+    int is_fstring = (t.type == TOK_FSTRING);
+    int is_raw = (t.type == TOK_RAW_STRING);
+    int start_offset = 1;
+    int end_offset = 1;
+
+    if (is_fstring)
+    {
+        is_multi = (t.len >= 7 && t.start[1] == '"' && t.start[2] == '"' && t.start[3] == '"');
+        start_offset = is_multi ? 4 : 2;
+        end_offset = is_multi ? 3 : 1;
+    }
+    else if (is_raw)
+    {
+        is_multi = (t.len >= 7 && t.start[1] == '"' && t.start[2] == '"' && t.start[3] == '"');
+        start_offset = is_multi ? 4 : 2;
+        end_offset = is_multi ? 3 : 1;
+    }
+    else // TOK_STRING
+    {
+        is_multi = (t.len >= 6 && t.start[0] == '"' && t.start[1] == '"' && t.start[2] == '"');
+        start_offset = is_multi ? 3 : 1;
+        end_offset = is_multi ? 3 : 1;
+    }
+
+    int content_len = t.len - start_offset - end_offset;
+    if (content_len < 0)
+    {
+        content_len = 0;
+    }
+
+    char *content = xmalloc(content_len + 1);
+    strncpy(content, t.start + start_offset, content_len);
+    content[content_len] = '\0';
+    return content;
 }
 
 void skip_comments(Lexer *l)
@@ -435,20 +886,18 @@ char *consume_until_semicolon(Lexer *l)
 
 void enter_scope(ParserContext *ctx)
 {
-    Scope *s = xmalloc(sizeof(Scope));
-    s->symbols = 0;
-    s->parent = ctx->current_scope;
+    Scope *s = symbol_scope_create(ctx->current_scope, NULL);
     ctx->current_scope = s;
 }
 
 void exit_scope(ParserContext *ctx)
 {
-    if (!ctx->current_scope)
+    if (!ctx->current_scope || ctx->current_scope == ctx->global_scope)
     {
         return;
     }
 
-    // Check for unused variables
+    // Check for unused variables (legacy logic)
     ZenSymbol *sym = ctx->current_scope->symbols;
     while (sym)
     {
@@ -462,126 +911,130 @@ void exit_scope(ParserContext *ctx)
     ctx->current_scope = ctx->current_scope->parent;
 }
 
-void add_symbol(ParserContext *ctx, const char *n, const char *t, Type *type_info)
+// Helper to register a symbol for LSP persistent queries
+void register_symbol_to_lsp(ParserContext *ctx, ZenSymbol *s)
 {
-    add_symbol_with_token(ctx, n, t, type_info, (Token){0});
+    if (!ctx || !s)
+    {
+        return;
+    }
+
+    // Deduplicate: Don't add if same name, kind, and location already exists
+    ZenSymbol *curr = ctx->all_symbols;
+    while (curr)
+    {
+        if (curr->kind == s->kind && curr->decl_token.line == s->decl_token.line &&
+            curr->decl_token.col == s->decl_token.col && curr->name && s->name &&
+            strcmp(curr->name, s->name) == 0)
+        {
+            return;
+        }
+        curr = curr->next;
+    }
+
+    ZenSymbol *lsp_copy = xmalloc(sizeof(ZenSymbol));
+    memcpy(lsp_copy, s, sizeof(ZenSymbol));
+    lsp_copy->original = s; // Link clone back to the original symbol for global auditing
+    lsp_copy->next = ctx->all_symbols;
+    ctx->all_symbols = lsp_copy;
+    if (s->name)
+    {
+        lsp_copy->name = xstrdup(s->name);
+    }
+    if (s->cfg_condition)
+    {
+        lsp_copy->cfg_condition = xstrdup(s->cfg_condition);
+    }
+
+    lsp_copy->is_local = s->is_local;
+}
+
+void add_symbol(ParserContext *ctx, const char *n, const char *t, Type *type_info, int is_export)
+{
+    add_symbol_with_token(ctx, n, t, type_info, (Token){0}, is_export);
 }
 
 void add_symbol_with_token(ParserContext *ctx, const char *n, const char *t, Type *type_info,
-                           Token tok)
+                           Token tok, int is_export)
 {
     if (!ctx->current_scope)
     {
-        enter_scope(ctx);
+        if (!ctx->global_scope)
+        {
+            ctx->global_scope = symbol_scope_create(NULL, "Global");
+        }
+        ctx->current_scope = ctx->global_scope;
     }
 
-    if (n[0] != '_' && ctx->current_scope->parent && strcmp(n, "it") != 0 && strcmp(n, "self") != 0)
+    if (strcmp(n, "it") != 0 && strcmp(n, "self") != 0)
     {
-        Scope *p = ctx->current_scope->parent;
-        while (p)
+        audit_section_5(ctx, ctx->current_scope, n, NULL, tok);
+    }
+
+    // In LSP/MISRA mode, check for existing symbol in the current scope to avoid duplicates
+    if (g_config.mode_lsp || g_config.misra_mode)
+    {
+        ZenSymbol *existing = symbol_lookup_local(ctx->current_scope, n);
+        if (existing)
         {
-            ZenSymbol *sh = p->symbols;
-            while (sh)
-            {
-                if (strcmp(sh->name, n) == 0)
-                {
-                    warn_shadowing(tok, n);
-                    break;
-                }
-                sh = sh->next;
-            }
-            if (sh)
-            {
-                break; // found it
-            }
-            p = p->parent;
+            existing->type_name = t ? xstrdup(t) : NULL;
+            existing->type_info = type_info;
+            existing->decl_token = tok;
+            return;
         }
     }
-    ZenSymbol *s = xmalloc(sizeof(ZenSymbol));
-    s->name = xstrdup(n);
+
+    ZenSymbol *s = symbol_add(ctx->current_scope, n, SYM_VARIABLE);
+    s->is_local = (ctx->current_scope != ctx->global_scope);
     s->type_name = t ? xstrdup(t) : NULL;
     s->type_info = type_info;
-    s->is_used = 0;
     s->decl_token = tok;
-    s->is_const_value = 0;
-    s->is_moved = 0;
-    s->next = ctx->current_scope->symbols;
-    ctx->current_scope->symbols = s;
+    s->is_export = is_export;
 
-    // LSP: Also add to flat list (for persistent access after scope exit)
-    ZenSymbol *lsp_copy = xmalloc(sizeof(ZenSymbol));
-    *lsp_copy = *s;
-    lsp_copy->next = ctx->all_symbols;
-    ctx->all_symbols = lsp_copy;
+    register_symbol_to_lsp(ctx, s);
 }
 
 Type *find_symbol_type_info(ParserContext *ctx, const char *n)
 {
-    if (!ctx->current_scope)
+    ZenSymbol *sym = symbol_lookup(ctx->current_scope, n);
+    if (sym)
     {
-        return NULL;
+        return sym->type_info;
     }
-    Scope *s = ctx->current_scope;
-    while (s)
+
+    // Fallback: check for enum variants (MISRA Rule Zen 1.3)
+    EnumVariantReg *ev = find_enum_variant(ctx, n);
+    if (ev)
     {
-        ZenSymbol *sym = s->symbols;
-        while (sym)
-        {
-            if (strcmp(sym->name, n) == 0)
-            {
-                return sym->type_info;
-            }
-            sym = sym->next;
-        }
-        s = s->parent;
+        Type *t = type_new(TYPE_ENUM);
+        t->name = xstrdup(ev->enum_name);
+        return t;
     }
+
     return NULL;
 }
 
 char *find_symbol_type(ParserContext *ctx, const char *n)
 {
-    if (!ctx->current_scope)
+    ZenSymbol *sym = symbol_lookup(ctx->current_scope, n);
+    if (sym)
     {
-        return NULL;
+        return sym->type_name ? xstrdup(sym->type_name) : NULL;
     }
-    Scope *s = ctx->current_scope;
-    while (s)
+
+    // Fallback: check for enum variants (MISRA Rule Zen 1.3)
+    EnumVariantReg *ev = find_enum_variant(ctx, n);
+    if (ev)
     {
-        ZenSymbol *sym = s->symbols;
-        while (sym)
-        {
-            if (strcmp(sym->name, n) == 0)
-            {
-                return sym->type_name;
-            }
-            sym = sym->next;
-        }
-        s = s->parent;
+        return xstrdup(ev->enum_name);
     }
+
     return NULL;
 }
 
 ZenSymbol *find_symbol_entry(ParserContext *ctx, const char *n)
 {
-    if (!ctx->current_scope)
-    {
-        return NULL;
-    }
-    Scope *s = ctx->current_scope;
-    while (s)
-    {
-        ZenSymbol *sym = s->symbols;
-        while (sym)
-        {
-            if (strcmp(sym->name, n) == 0)
-            {
-                return sym;
-            }
-            sym = sym->next;
-        }
-        s = s->parent;
-    }
-    return NULL;
+    return symbol_lookup(ctx->current_scope, n);
 }
 
 // LSP: Search flat symbol list (works after scopes are destroyed).
@@ -609,11 +1062,42 @@ void init_builtins()
     init = 1;
 }
 
-void register_func(ParserContext *ctx, const char *name, int count, char **defaults,
-                   Type **arg_types, Type *ret_type, int is_varargs, int is_async, Token decl_token)
+void register_func(ParserContext *ctx, Scope *scope, const char *name, int count, char **defaults,
+                   Type **arg_types, Type *ret_type, int is_varargs, int is_async, int is_pure,
+                   const char *link_name, Token decl_token, int is_export)
 {
-    FuncSig *f = xmalloc(sizeof(FuncSig));
-    f->name = xstrdup(name);
+    // In LSP/MISRA mode, check for existing function in the registry to avoid duplicates
+    if (g_config.mode_lsp || g_config.misra_mode)
+    {
+        FuncSig *existing = find_func(ctx, name);
+        if (existing)
+        {
+            existing->decl_token = decl_token;
+            existing->total_args = count;
+            existing->defaults = defaults;
+            existing->arg_types = arg_types;
+            existing->ret_type = ret_type;
+            existing->is_varargs = is_varargs;
+            existing->is_async = is_async;
+            existing->is_pure = is_pure;
+            // Note: symbol update happens below
+        }
+    }
+
+    FuncSig *f = NULL;
+    if (g_config.mode_lsp || g_config.misra_mode)
+    {
+        f = find_func(ctx, name);
+    }
+
+    if (!f)
+    {
+        f = xmalloc(sizeof(FuncSig));
+        f->name = xstrdup(name);
+        f->next = ctx->func_registry;
+        ctx->func_registry = f;
+    }
+
     f->decl_token = decl_token;
     f->total_args = count;
     f->defaults = defaults;
@@ -621,9 +1105,42 @@ void register_func(ParserContext *ctx, const char *name, int count, char **defau
     f->ret_type = ret_type;
     f->is_varargs = is_varargs;
     f->is_async = is_async;
-    f->must_use = 0; // Default: can discard result
-    f->next = ctx->func_registry;
-    ctx->func_registry = f;
+    f->is_pure = is_pure;
+    f->required = 0;
+
+    // Unified logic: check for existing symbol to avoid duplicates
+    Scope *target_scope = scope ? scope : ctx->current_scope;
+    audit_section_5(ctx, target_scope ? target_scope : ctx->global_scope, name, link_name,
+                    decl_token);
+
+    ZenSymbol *sym = symbol_lookup_local(target_scope, name);
+    if (!sym)
+    {
+        sym = symbol_add(scope ? scope : ctx->current_scope, name, SYM_FUNCTION);
+    }
+    else
+    {
+        sym->kind = SYM_FUNCTION; // Ensure kind is correct if it was a placeholder
+    }
+    sym->data.sig = f;
+    sym->decl_token = decl_token;
+    sym->is_export = is_export;
+    if (link_name)
+    {
+        f->link_name = xstrdup(link_name);
+        sym->link_name = f->link_name;
+    }
+
+    register_symbol_to_lsp(ctx, sym);
+
+    // Create formal type for the function pointer
+    Type *ft = type_new(TYPE_FUNCTION);
+    ft->arg_count = count;
+    ft->args = arg_types;
+    ft->inner = ret_type;
+    ft->is_raw = 1;          // Static functions are raw pointers, not closures
+    ft->traits.has_drop = 0; // Static functions don't need drop
+    sym->type_info = ft;
 }
 
 void register_func_template(ParserContext *ctx, const char *name, const char *param, ASTNode *node)
@@ -682,7 +1199,7 @@ void register_generic(ParserContext *ctx, char *name)
             return;
         }
     }
-    ctx->known_generics[ctx->known_generics_count++] = strdup(name);
+    ctx->known_generics[ctx->known_generics_count++] = xstrdup(name);
 }
 
 int is_known_generic(ParserContext *ctx, char *name)
@@ -692,6 +1209,46 @@ int is_known_generic(ParserContext *ctx, char *name)
         if (strcmp(ctx->known_generics[i], name) == 0)
         {
             return 1;
+        }
+    }
+    return 0;
+}
+
+int is_generic_dependent_str(ParserContext *ctx, const char *type_str)
+{
+    if (!type_str || !ctx)
+    {
+        return 0;
+    }
+    for (int i = 0; i < ctx->known_generics_count; i++)
+    {
+        const char *g = ctx->known_generics[i];
+        const char *p = strstr(type_str, g);
+        while (p)
+        {
+            // Boundaries: Must not be preceded or followed by identifier chars (except Ptr or _)
+            int valid = 1;
+            if (p > type_str && is_ident_char(*(p - 1)) && *(p - 1) != '_')
+            {
+                valid = 0;
+            }
+            if (valid)
+            {
+                const char *next = p + strlen(g);
+                if (*next != '\0' && is_ident_char(*next) && *next != '_')
+                {
+                    // Allow Ptr suffix (mangled)
+                    if (strncmp(next, "Ptr", 3) != 0)
+                    {
+                        valid = 0;
+                    }
+                }
+            }
+            if (valid)
+            {
+                return 1;
+            }
+            p = strstr(p + 1, g);
         }
     }
     return 0;
@@ -727,20 +1284,69 @@ void add_to_struct_list(ParserContext *ctx, ASTNode *node)
     ctx->parsed_structs_list = r;
 }
 
-void register_type_alias(ParserContext *ctx, const char *alias, const char *original, int is_opaque,
-                         const char *defined_in_file)
+void register_type_alias(ParserContext *ctx, const char *alias, const char *original,
+                         Type *type_info, int is_opaque, const char *defined_in_file, Token tok,
+                         int is_export)
 {
-    TypeAlias *ta = xmalloc(sizeof(TypeAlias));
-    ta->alias = xstrdup(alias);
+    // In LSP mode, check for existing type alias to avoid duplicates
+    if (g_config.mode_lsp)
+    {
+        TypeAlias *existing = find_type_alias_node(ctx, alias);
+        if (existing)
+        {
+            existing->original_type = xstrdup(original);
+            existing->type_info = type_info;
+            existing->is_opaque = is_opaque;
+            existing->defined_in_file = defined_in_file ? xstrdup(defined_in_file) : NULL;
+            // Symbol update will happen in add_symbol (called below)
+        }
+    }
+
+    TypeAlias *ta = NULL;
+    if (g_config.mode_lsp)
+    {
+        ta = find_type_alias_node(ctx, alias);
+    }
+
+    if (!ta)
+    {
+        ta = xmalloc(sizeof(TypeAlias));
+        ta->alias = xstrdup(alias);
+        ta->next = ctx->type_aliases;
+        ctx->type_aliases = ta;
+    }
+
     ta->original_type = xstrdup(original);
+    ta->type_info = type_info;
     ta->is_opaque = is_opaque;
     ta->defined_in_file = defined_in_file ? xstrdup(defined_in_file) : NULL;
-    ta->next = ctx->type_aliases;
-    ctx->type_aliases = ta;
+
+    // Unified logic: check for existing symbol to avoid duplicates
+    audit_section_5(ctx, ctx->current_scope, alias, NULL, tok);
+    ZenSymbol *sym = symbol_lookup_local(ctx->current_scope, alias);
+    if (!sym)
+    {
+        sym = symbol_add(ctx->current_scope, alias, SYM_ALIAS);
+    }
+    else
+    {
+        sym->kind = SYM_ALIAS;
+    }
+    sym->decl_token = tok;
+    sym->is_export = is_export;
+    sym->data.alias.original_type = xstrdup(original);
+    sym->type_info = type_info;
+    register_symbol_to_lsp(ctx, sym);
 }
 
 const char *find_type_alias(ParserContext *ctx, const char *alias)
 {
+    ZenSymbol *sym = symbol_lookup_kind(ctx->current_scope, alias, SYM_ALIAS);
+    if (sym)
+    {
+        return sym->data.alias.original_type;
+    }
+
     TypeAlias *ta = find_type_alias_node(ctx, alias);
     return ta ? ta->original_type : NULL;
 }
@@ -796,49 +1402,116 @@ void register_builtins(ParserContext *ctx)
 {
     Type *t = type_new(TYPE_BOOL);
     t->is_const = 1;
-    add_symbol(ctx, "true", "bool", t);
+    add_symbol(ctx, "true", "bool", t, 0);
 
     t = type_new(TYPE_BOOL);
     t->is_const = 1;
-    add_symbol(ctx, "false", "bool", t);
+    add_symbol(ctx, "false", "bool", t, 0);
 
     // Register 'free'
     Type *void_t = type_new(TYPE_VOID);
-    add_symbol(ctx, "free", "void", void_t);
+    add_symbol(ctx, "free", "void", void_t, 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
 
     // Register common libc functions to avoid warnings
-    add_symbol(ctx, "strdup", "string", type_new(TYPE_STRING));
-    add_symbol(ctx, "malloc", "void*", type_new_ptr(void_t));
-    add_symbol(ctx, "realloc", "void*", type_new_ptr(void_t));
-    add_symbol(ctx, "calloc", "void*", type_new_ptr(void_t));
-    add_symbol(ctx, "puts", "int", type_new(TYPE_INT));
-    add_symbol(ctx, "printf", "int", type_new(TYPE_INT));
-    add_symbol(ctx, "strcmp", "int", type_new(TYPE_INT));
-    add_symbol(ctx, "strlen", "int", type_new(TYPE_INT));
-    add_symbol(ctx, "strcpy", "string", type_new(TYPE_STRING));
-    add_symbol(ctx, "strcat", "string", type_new(TYPE_STRING));
-    add_symbol(ctx, "exit", "void", void_t);
+    add_symbol(ctx, "strdup", "string", type_new(TYPE_STRING), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "malloc", "void*", type_new_ptr(void_t), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "realloc", "void*", type_new_ptr(void_t), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "calloc", "void*", type_new_ptr(void_t), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "puts", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "printf", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "strcmp", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "strlen", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "strcpy", "string", type_new(TYPE_STRING), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "strcat", "string", type_new(TYPE_STRING), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "memset", "void*", type_new_ptr(void_t), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "memcpy", "void*", type_new_ptr(void_t), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "exit", "void", void_t, 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+
+    // Stdio Globals
+    add_symbol(ctx, "stdin", "void*", type_new_ptr(void_t), 0);
+    add_symbol(ctx, "stdout", "void*", type_new_ptr(void_t), 0);
+    add_symbol(ctx, "stderr", "void*", type_new_ptr(void_t), 0);
 
     // File I/O
-    add_symbol(ctx, "fopen", "void*", type_new_ptr(void_t));
-    add_symbol(ctx, "fclose", "int", type_new(TYPE_INT));
-    add_symbol(ctx, "fread", "usize", type_new(TYPE_USIZE));
-    add_symbol(ctx, "fwrite", "usize", type_new(TYPE_USIZE));
-    add_symbol(ctx, "fseek", "int", type_new(TYPE_INT));
-    add_symbol(ctx, "ftell", "long", type_new(TYPE_I64));
-    add_symbol(ctx, "rewind", "void", void_t);
-    add_symbol(ctx, "fprintf", "int", type_new(TYPE_INT));
-    add_symbol(ctx, "sprintf", "int", type_new(TYPE_INT));
-    add_symbol(ctx, "feof", "int", type_new(TYPE_INT));
-    add_symbol(ctx, "ferror", "int", type_new(TYPE_INT));
-    add_symbol(ctx, "feof", "int", type_new(TYPE_INT));
-    add_symbol(ctx, "ferror", "int", type_new(TYPE_INT));
-    add_symbol(ctx, "usleep", "int", type_new(TYPE_INT));
+    add_symbol(ctx, "fopen", "void*", type_new_ptr(void_t), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "fclose", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "fread", "usize", type_new(TYPE_USIZE), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "fwrite", "usize", type_new(TYPE_USIZE), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "fseek", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "ftell", "long", type_new(TYPE_I64), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "rewind", "void", void_t, 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "fprintf", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "vprintf", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "vfprintf", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "sprintf", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "vsnprintf", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "snprintf", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "feof", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "ferror", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "mkdir", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "rmdir", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "chdir", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "getcwd", "string", type_new(TYPE_STRING), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "system", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "getenv", "string", type_new(TYPE_STRING), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "fgets", "string", type_new(TYPE_STRING), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
+    add_symbol(ctx, "usleep", "int", type_new(TYPE_INT), 0);
+    ctx->current_scope->symbols->kind = SYM_FUNCTION;
 
     ASTNode *va_def = ast_create(NODE_STRUCT);
     va_def->strct.name = xstrdup("va_list");
     register_struct_def(ctx, "va_list", va_def);
     register_impl(ctx, "Copy", "va_list");
+}
+
+void register_comptime_builtins(ParserContext *ctx)
+{
+    Type *void_t = type_new(TYPE_VOID);
+    add_symbol(ctx, "yield", "void", void_t, 0);
+    add_symbol(ctx, "code", "void", void_t, 0); // Alias for yield
+    add_symbol(ctx, "compile_warn", "void", void_t, 0);
+    add_symbol(ctx, "compile_error", "void", void_t, 0);
+
+    register_extern_symbol(ctx, "yield");
+    register_extern_symbol(ctx, "code");
+    register_extern_symbol(ctx, "compile_warn");
+    register_extern_symbol(ctx, "compile_error");
 }
 
 void add_instantiated_func(ParserContext *ctx, ASTNode *fn)
@@ -847,8 +1520,22 @@ void add_instantiated_func(ParserContext *ctx, ASTNode *fn)
     ctx->instantiated_funcs = fn;
 }
 
-void register_enum_variant(ParserContext *ctx, const char *ename, const char *vname, int tag)
+void register_enum_variant(ParserContext *ctx, const char *vname, const char *ename, int tag)
 {
+    // In LSP mode, check for existing variant to avoid duplicates
+    if (g_config.mode_lsp)
+    {
+        EnumVariantReg *existing = find_enum_variant(ctx, vname);
+        if (existing)
+        {
+            existing->tag_id = tag;
+            return;
+        }
+    }
+
+    // Record entry in the enum variant registry for global lookup
+    audit_section_5(ctx, ctx->global_scope, vname, NULL, (Token){0});
+
     EnumVariantReg *r = xmalloc(sizeof(EnumVariantReg));
     r->enum_name = xstrdup(ename);
     r->variant_name = xstrdup(vname);
@@ -857,16 +1544,44 @@ void register_enum_variant(ParserContext *ctx, const char *ename, const char *vn
     ctx->enum_variants = r;
 }
 
-EnumVariantReg *find_enum_variant(ParserContext *ctx, const char *vname)
+EnumVariantReg *find_enum_variant(ParserContext *ctx, const char *name)
 {
+    char *ename = NULL;
+    const char *vname = name;
+    const char *sep = strstr(name, "::");
+    if (!sep)
+    {
+        sep = strstr(name, "__");
+    }
+
+    if (sep)
+    {
+        int elen = (int)(sep - name);
+        ename = xmalloc(elen + 1);
+        strncpy(ename, name, elen);
+        ename[elen] = 0;
+        vname = sep + 2;
+    }
+
     EnumVariantReg *r = ctx->enum_variants;
     while (r)
     {
         if (strcmp(r->variant_name, vname) == 0)
         {
-            return r;
+            if (!ename || strcmp(r->enum_name, ename) == 0)
+            {
+                if (ename)
+                {
+                    free(ename);
+                }
+                return r;
+            }
         }
         r = r->next;
+    }
+    if (ename)
+    {
+        free(ename);
     }
     return NULL;
 }
@@ -953,6 +1668,11 @@ int should_suppress_undef_warning(ParserContext *ctx, const char *name)
 
 void register_slice(ParserContext *ctx, const char *type)
 {
+    if (is_known_generic(ctx, (char *)type))
+    {
+        return;
+    }
+
     SliceType *c = ctx->used_slices;
     while (c)
     {
@@ -968,8 +1688,8 @@ void register_slice(ParserContext *ctx, const char *type)
     ctx->used_slices = n;
 
     // Register Struct Def for Reflection
-    char slice_name[256];
-    sprintf(slice_name, "Slice_%s", type);
+    char slice_name[MAX_TYPE_NAME_LEN];
+    snprintf(slice_name, sizeof(slice_name), "Slice__%s", type);
 
     ASTNode *len_f = ast_create(NODE_FIELD);
     len_f->field.name = xstrdup("len");
@@ -979,8 +1699,8 @@ void register_slice(ParserContext *ctx, const char *type)
     cap_f->field.type = xstrdup("int");
     ASTNode *data_f = ast_create(NODE_FIELD);
     data_f->field.name = xstrdup("data");
-    char ptr_type[256];
-    sprintf(ptr_type, "%s*", type);
+    char ptr_type[MAX_TYPE_NAME_LEN];
+    snprintf(ptr_type, sizeof(ptr_type), "%s*", type);
     data_f->field.type = xstrdup(ptr_type);
 
     data_f->next = len_f;
@@ -991,6 +1711,14 @@ void register_slice(ParserContext *ctx, const char *type)
     def->strct.fields = data_f;
 
     register_struct_def(ctx, slice_name, def);
+
+    // Backward compatibility: alias Slice_T to Slice__T
+    char legacy_name[MAX_VAR_NAME_LEN];
+    snprintf(legacy_name, sizeof(legacy_name), "Slice_%s", type);
+    if (strcmp(slice_name, legacy_name) != 0)
+    {
+        register_type_alias(ctx, legacy_name, slice_name, NULL, 0, NULL, (Token){0}, 0);
+    }
 }
 
 void register_tuple(ParserContext *ctx, const char *sig)
@@ -1009,8 +1737,10 @@ void register_tuple(ParserContext *ctx, const char *sig)
     n->next = ctx->used_tuples;
     ctx->used_tuples = n;
 
-    char struct_name[1024];
-    sprintf(struct_name, "Tuple_%s", sig);
+    char struct_name[MAX_ERROR_MSG_LEN];
+    char *clean_sig = sanitize_mangled_name(sig);
+    snprintf(struct_name, sizeof(struct_name), "Tuple__%s", clean_sig);
+    free(clean_sig);
 
     ASTNode *s_def = ast_create(NODE_STRUCT);
     s_def->strct.name = xstrdup(struct_name);
@@ -1029,7 +1759,7 @@ void register_tuple(ParserContext *ctx, const char *sig)
 
         ASTNode *f = ast_create(NODE_FIELD);
         char fname[32];
-        sprintf(fname, "v%d", i++);
+        snprintf(fname, sizeof(fname), "v%d", i++);
         f->field.name = xstrdup(fname);
         f->field.type = xstrdup(current);
 
@@ -1061,15 +1791,140 @@ void register_tuple(ParserContext *ctx, const char *sig)
 
 void register_struct_def(ParserContext *ctx, const char *name, ASTNode *node)
 {
-    StructDef *d = xmalloc(sizeof(StructDef));
-    d->name = xstrdup(name);
+    // In LSP mode, check for existing struct def to avoid duplicates
+    if (g_config.mode_lsp)
+    {
+        StructDef *existing = NULL;
+        StructDef *curr = ctx->struct_defs;
+        while (curr)
+        {
+            if (strcmp(curr->name, name) == 0)
+            {
+                existing = curr;
+                break;
+            }
+            curr = curr->next;
+        }
+        if (existing)
+        {
+            existing->node = node;
+            // Symbol update will happen below
+        }
+    }
+
+    StructDef *d = NULL;
+    if (g_config.mode_lsp)
+    {
+        StructDef *curr = ctx->struct_defs;
+        while (curr)
+        {
+            if (strcmp(curr->name, name) == 0)
+            {
+                d = curr;
+                break;
+            }
+            curr = curr->next;
+        }
+    }
+
+    if (!d)
+    {
+        d = xmalloc(sizeof(StructDef));
+        d->name = xstrdup(name);
+        d->next = ctx->struct_defs;
+        ctx->struct_defs = d;
+    }
+
     d->node = node;
-    d->next = ctx->struct_defs;
-    ctx->struct_defs = d;
+
+    // MISRA Rule 5.7: Tag name shall be a unique identifier
+    if (g_config.misra_mode)
+    {
+        ZenSymbol *all = ctx->all_symbols;
+        while (all)
+        {
+            if ((all->kind == SYM_STRUCT || all->kind == SYM_ENUM) && strcmp(all->name, name) == 0)
+            {
+                zerror_at(node ? node->token : (Token){0}, "MISRA Rule 5.7");
+                break;
+            }
+            all = all->next;
+        }
+    }
+
+    ZenSymbol *sym_existing = symbol_lookup_local(ctx->global_scope, name);
+    ZenSymbol *sym = NULL;
+    if (!sym_existing)
+    {
+        sym = symbol_add(ctx->global_scope, name,
+                         (node && node->type == NODE_ENUM) ? SYM_ENUM : SYM_STRUCT);
+    }
+    else
+    {
+        sym = sym_existing;
+        // Ensure kind matches if re-registering
+        sym->kind = (node && node->type == NODE_ENUM) ? SYM_ENUM : SYM_STRUCT;
+    }
+
+    sym->data.node = node;
+    sym->link_name = node ? node->link_name : NULL;
+    if (node)
+    {
+        sym->decl_token = node->token;
+        if (node->type == NODE_STRUCT)
+        {
+            sym->is_export = node->strct.is_export;
+        }
+        else if (node->type == NODE_ENUM)
+        {
+            sym->is_export = node->enm.is_export;
+        }
+    }
+    sym->type_info = node ? node->type_info : NULL;
+
+    // MISRA Section 5 Auditing
+    audit_section_5(ctx, ctx->global_scope, name, sym->link_name, sym->decl_token);
+
+    register_symbol_to_lsp(ctx, sym);
 }
 
 ASTNode *find_struct_def(ParserContext *ctx, const char *name)
 {
+    ZenSymbol *sym = symbol_lookup_kind(ctx->current_scope, name, SYM_STRUCT);
+    if (!sym)
+    {
+        sym = symbol_lookup_kind(ctx->current_scope, name, SYM_ENUM);
+    }
+    if (sym)
+    {
+        return sym->data.node;
+    }
+
+    extern ASTNode *global_user_structs;
+    if (global_user_structs)
+    {
+        ASTNode *s = global_user_structs;
+        while (s)
+        {
+            if ((s->type == NODE_STRUCT || s->type == NODE_ENUM) &&
+                strcmp((s->type == NODE_STRUCT ? s->strct.name : s->enm.name), name) == 0)
+            {
+                if (s->type == NODE_STRUCT && s->strct.is_incomplete)
+                {
+                    s = s->next;
+                    continue;
+                }
+                return s;
+            }
+            s = s->next;
+        }
+    }
+
+    if (!ctx)
+    {
+        return NULL;
+    }
+
     Instantiation *i = ctx->instantiations;
     while (i)
     {
@@ -1083,7 +1938,8 @@ ASTNode *find_struct_def(ParserContext *ctx, const char *name)
     ASTNode *s = ctx->instantiated_structs;
     while (s)
     {
-        if (s->type == NODE_STRUCT && strcmp(s->strct.name, name) == 0)
+        if ((s->type == NODE_STRUCT || s->type == NODE_ENUM) &&
+            strcmp((s->type == NODE_STRUCT ? s->strct.name : s->enm.name), name) == 0)
         {
             return s;
         }
@@ -1093,11 +1949,29 @@ ASTNode *find_struct_def(ParserContext *ctx, const char *name)
     StructRef *r = ctx->parsed_structs_list;
     while (r)
     {
-        if (strcmp(r->node->strct.name, name) == 0)
+        if (r->node->type == NODE_STRUCT && strcmp(r->node->strct.name, name) == 0)
+        {
+            return r->node;
+        }
+        if (r->node->type == NODE_ENUM && strcmp(r->node->enm.name, name) == 0)
         {
             return r->node;
         }
         r = r->next;
+    }
+
+    // Fallback: Search all symbols ever registered (robust for cross-module/early calls)
+    ZenSymbol *all = ctx->all_symbols;
+    while (all)
+    {
+        if ((all->kind == SYM_STRUCT || all->kind == SYM_ENUM) && strcmp(all->name, name) == 0)
+        {
+            if (all->data.node)
+            {
+                return all->data.node;
+            }
+        }
+        all = all->next;
     }
 
     // Check manually registered definitions (e.g. Slices)
@@ -1120,6 +1994,73 @@ ASTNode *find_struct_def(ParserContext *ctx, const char *name)
             return e->node;
         }
         e = e->next;
+    }
+
+    return NULL;
+}
+
+ASTNode *find_trait_def(ParserContext *ctx, const char *name)
+{
+    if (!ctx || !name)
+    {
+        return NULL;
+    }
+
+    StructRef *r = ctx->parsed_globals_list;
+    while (r)
+    {
+        if (r->node && r->node->type == NODE_TRAIT && strcmp(r->node->trait.name, name) == 0)
+        {
+            return r->node;
+        }
+        r = r->next;
+    }
+    return NULL;
+}
+
+ASTNode *find_concrete_struct_def(ParserContext *ctx, const char *name)
+{
+    Instantiation *i = ctx->instantiations;
+    while (i)
+    {
+        if (strcmp(i->name, name) == 0 && i->struct_node && i->struct_node->type == NODE_STRUCT &&
+            !i->struct_node->strct.is_template)
+        {
+            return i->struct_node;
+        }
+        i = i->next;
+    }
+
+    ASTNode *s = ctx->instantiated_structs;
+    while (s)
+    {
+        if (s->type == NODE_STRUCT && !s->strct.is_template && strcmp(s->strct.name, name) == 0)
+        {
+            return s;
+        }
+        s = s->next;
+    }
+
+    StructRef *r = ctx->parsed_structs_list;
+    while (r)
+    {
+        if (r->node->type == NODE_STRUCT && !r->node->strct.is_template &&
+            strcmp(r->node->strct.name, name) == 0)
+        {
+            return r->node;
+        }
+        r = r->next;
+    }
+
+    StructDef *d = ctx->struct_defs;
+    while (d)
+    {
+        if (d->node && d->node->type == NODE_STRUCT && !d->node->strct.is_template &&
+            strcmp(d->name, name) == 0)
+        {
+            return d->node;
+        }
+        d = d->next;
     }
 
     return NULL;
@@ -1291,7 +2232,7 @@ char *replace_in_string(const char *src, const char *old_w, const char *new_w)
     int in_string = 0;
     for (i = 0; src[i] != '\0'; i++)
     {
-        if (src[i] == '"' && (i == 0 || src[i - 1] != '\\'))
+        if (src[i] == '\"' && (i == 0 || src[i - 1] != '\\'))
         {
             in_string = !in_string;
         }
@@ -1304,7 +2245,7 @@ char *replace_in_string(const char *src, const char *old_w, const char *new_w)
             {
                 valid = 0;
             }
-            if (valid && is_ident_char(src[i + oldWlen]))
+            if (valid && (is_ident_char(src[i + oldWlen]) || src[i + oldWlen] == '<'))
             {
                 valid = 0;
             }
@@ -1328,7 +2269,7 @@ char *replace_in_string(const char *src, const char *old_w, const char *new_w)
 
     while (src[src_idx] != '\0')
     {
-        if (src[src_idx] == '"' && (src_idx == 0 || src[src_idx - 1] != '\\'))
+        if (src[src_idx] == '\"' && (src_idx == 0 || src[src_idx - 1] != '\\'))
         {
             in_string = !in_string;
         }
@@ -1341,7 +2282,7 @@ char *replace_in_string(const char *src, const char *old_w, const char *new_w)
             {
                 valid = 0;
             }
-            if (valid && is_ident_char(src[src_idx + oldWlen]))
+            if (valid && (is_ident_char(src[src_idx + oldWlen]) || src[src_idx + oldWlen] == '<'))
             {
                 valid = 0;
             }
@@ -1364,38 +2305,203 @@ char *replace_in_string(const char *src, const char *old_w, const char *new_w)
     return result;
 }
 
+Type *replace_type_formal(Type *t, const char *p, const char *c, const char *os, const char *ns);
+// Helper to replace generic params in mangled names (e.g. Option_V_None ->
+// Option_int_None)
+char *replace_mangled_part(const char *src, const char *param, const char *concrete)
+{
+    if (!src || !param || !concrete)
+    {
+        return src ? xstrdup(src) : NULL;
+    }
+
+    size_t plen = strlen(param);
+    size_t clen = strlen(concrete);
+    size_t src_len = strlen(src);
+
+    // Initial estimate for result size
+    size_t res_cap = src_len + 512;
+    char *result = xmalloc(res_cap);
+    result[0] = 0;
+
+    const char *curr = src;
+    char *out = result;
+    size_t current_len = 0;
+
+    while (*curr)
+    {
+        // Ensure enough space (including the next character or replacement)
+        if (current_len + (clen > 1 ? clen : 1) + 1 >= res_cap)
+        {
+            res_cap = res_cap * 2 + clen;
+            char *new_res = xmalloc(res_cap);
+            memcpy(new_res, result, current_len);
+            free(result);
+            result = new_res;
+            out = result + current_len;
+        }
+
+        // Check if param matches here
+        if (strncmp(curr, param, plen) == 0)
+        {
+            int valid = 1;
+            int has_underscore_boundary = 0;
+
+            if (curr > src)
+            {
+                if (*(curr - 1) == '_')
+                {
+                    has_underscore_boundary = 1;
+                }
+                else if (is_ident_char(*(curr - 1)))
+                {
+                    valid = 0;
+                }
+            }
+
+            if (valid && curr[plen] != 0 && curr[plen] != '_' && is_ident_char(curr[plen]))
+            {
+                if (strncmp(curr + plen, "Ptr", 3) != 0)
+                {
+                    valid = 0;
+                }
+            }
+            if (valid && curr[plen] == '_')
+            {
+                has_underscore_boundary = 1;
+            }
+
+            if (valid && !has_underscore_boundary)
+            {
+                // Also allow <, ,, (, [ as boundaries
+                char prev = (curr > src) ? *(curr - 1) : 0;
+                if (prev == '<' || prev == ',' || prev == '(' || prev == '[' || prev == ' ')
+                {
+                    // OK
+                }
+                else
+                {
+                    valid = 0;
+                }
+            }
+
+            if (valid)
+            {
+                // Ensure double underscore boundary for the replacement
+                if (curr > src && *(curr - 1) == '_' && (curr == src + 1 || *(curr - 2) != '_'))
+                {
+                    *out++ = '_';
+                    current_len++;
+                }
+
+                memcpy(out, concrete, clen);
+                out += clen;
+                current_len += clen;
+
+                if (curr[plen] == '_' && curr[plen + 1] != '_')
+                {
+                    *out++ = '_';
+                    current_len++;
+                }
+
+                curr += plen;
+                continue;
+            }
+        }
+        *out++ = *curr++;
+        current_len++;
+    }
+    *out = 0;
+    return result;
+}
+
 char *replace_type_str(const char *src, const char *param, const char *concrete,
                        const char *old_struct, const char *new_struct)
 {
-    if (src && param && concrete)
-    {
-    }
     if (!src)
     {
         return NULL;
     }
+    if (!param || !concrete)
+    {
+        return xstrdup(src);
+    }
 
-    // Handle multi-param match
+    // 1. Exact match (base case)
+    if (strcmp(src, param) == 0)
+    {
+        return xstrdup(concrete);
+    }
+
+    // 2. Handle simple pointer cases recursively (safe as src shrinks)
+    size_t slen = strlen(src);
+    if (slen > 1 && src[slen - 1] == '*')
+    {
+        char *base = xmalloc(slen);
+        strncpy(base, src, slen - 1);
+        base[slen - 1] = 0;
+        char *nb = replace_type_str(base, param, concrete, old_struct, new_struct);
+        char *res = xmalloc(strlen(nb) + 2);
+        sprintf(res, "%s*", nb);
+        free(base);
+        free(nb);
+        return res;
+    }
+
+    // 3. Structural fallback for complex strings (e.g. "Self", "Option<T>")
+    char *res = xstrdup(src);
+
+    // Case 3a: Explicit template replacement (e.g. Vec<T> -> Vec__int32_t)
+    if (old_struct && new_struct && param)
+    {
+        char tpl_w[MAX_TYPE_NAME_LEN];
+        snprintf(tpl_w, sizeof(tpl_w), "%s<%s>", old_struct, param);
+        if (strstr(res, tpl_w))
+        {
+            char *tmp = replace_in_string(res, tpl_w, new_struct);
+            free(res);
+            res = tmp;
+        }
+    }
+
+    // Case 3b: Base struct replacement (e.g. Vec -> Vec__int32_t)
+    if (old_struct && new_struct && strstr(res, old_struct))
+    {
+        char *tmp = replace_in_string(res, old_struct, new_struct);
+        free(res);
+        res = tmp;
+    }
+
+    // 4. Boundary-safe mangled replacement (e.g. "Option_T" or "Option__T")
+    // Split multi-param strings (X, Y, Z) and replace each individually
+    char *final_res = xstrdup(res);
     if (param && concrete && strchr(param, ','))
     {
         char *p_ptr = (char *)param;
         char *c_ptr = (char *)concrete;
-
         while (*p_ptr && *c_ptr)
         {
             char *p_end = strchr(p_ptr, ',');
             int p_len = p_end ? (int)(p_end - p_ptr) : (int)strlen(p_ptr);
-
             char *c_end = strchr(c_ptr, ',');
             int c_len = c_end ? (int)(c_end - c_ptr) : (int)strlen(c_ptr);
 
-            if ((int)strlen(src) == p_len && strncmp(src, p_ptr, p_len) == 0)
-            {
-                char *ret = xmalloc(c_len + 1);
-                strncpy(ret, c_ptr, c_len);
-                ret[c_len] = 0;
-                return ret;
-            }
+            char *p_part = xmalloc(p_len + 1);
+            strncpy(p_part, p_ptr, p_len);
+            p_part[p_len] = 0;
+
+            char *c_part = xmalloc(c_len + 1);
+            strncpy(c_part, c_ptr, c_len);
+            c_part[c_len] = 0;
+
+            char *clean_c = sanitize_mangled_name(c_part);
+            char *tmp = replace_mangled_part(final_res, p_part, clean_c);
+            free(final_res);
+            final_res = tmp;
+
+            free(p_part);
+            free(c_part);
+            free(clean_c);
 
             if (p_end)
             {
@@ -1415,160 +2521,17 @@ char *replace_type_str(const char *src, const char *param, const char *concrete,
             }
         }
     }
-
-    size_t len = strlen(src);
-    if (len > 0 && src[len - 1] == ']')
+    else
     {
-        int depth = 0;
-        int bracket_idx = -1;
-        for (int i = len - 1; i >= 0; i--)
-        {
-            if (src[i] == ']')
-            {
-                depth++;
-            }
-            else if (src[i] == '[')
-            {
-                depth--;
-                if (depth == 0)
-                {
-                    bracket_idx = i;
-                    break;
-                }
-            }
-        }
-
-        if (bracket_idx > 0)
-        {
-            char *base = xmalloc(bracket_idx + 1);
-            strncpy(base, src, bracket_idx);
-            base[bracket_idx] = 0;
-
-            char *new_base = replace_type_str(base, param, concrete, old_struct, new_struct);
-
-            if (new_base && strcmp(new_base, base) != 0)
-            {
-                char *suffix = (char *)src + bracket_idx;
-                char *res = xmalloc(strlen(new_base) + strlen(suffix) + 1);
-                sprintf(res, "%s%s", new_base, suffix);
-                free(base);
-                free(new_base);
-                return res;
-            }
-            free(base);
-            if (new_base)
-            {
-                free(new_base);
-            }
-        }
+        char *clean_c = sanitize_mangled_name(concrete);
+        char *tmp = replace_mangled_part(final_res, param, clean_c);
+        free(final_res);
+        final_res = tmp;
+        free(clean_c);
     }
 
-    if (param && strcmp(src, param) == 0)
-    {
-
-        return xstrdup(concrete);
-    }
-
-    if (old_struct && new_struct && strcmp(src, old_struct) == 0)
-    {
-        return xstrdup(new_struct);
-    }
-
-    if (old_struct && new_struct && param)
-    {
-        char *mangled = xmalloc(strlen(old_struct) + strlen(param) + 2);
-        sprintf(mangled, "%s_%s", old_struct, param);
-        if (strcmp(src, mangled) == 0)
-        {
-            free(mangled);
-            return xstrdup(new_struct);
-        }
-        free(mangled);
-    }
-
-    if (param && concrete && src)
-    {
-        // Construct mangled suffix from param ("F,S" -> "_F_S")
-        char p_suffix[1024];
-        p_suffix[0] = 0;
-
-        char *p_temp = xstrdup(param);
-        char *tok = strtok(p_temp, ",");
-        while (tok)
-        {
-            strcat(p_suffix, "_");
-            strcat(p_suffix, tok);
-            tok = strtok(NULL, ",");
-        }
-        free(p_temp);
-
-        size_t slen = strlen(src);
-        size_t plen = strlen(p_suffix);
-
-        if (slen >= plen && strcmp(src + slen - plen, p_suffix) == 0)
-        {
-            // Construct replacement suffix from concrete ("int,float" -> "_int_float")
-            char c_suffix[1024];
-            c_suffix[0] = 0;
-
-            char *c_temp = xstrdup(concrete);
-            tok = strtok(c_temp, ",");
-            while (tok)
-            {
-                strcat(c_suffix, "_");
-                char *clean = sanitize_mangled_name(tok);
-                strcat(c_suffix, clean);
-                free(clean);
-                tok = strtok(NULL, ",");
-            }
-            free(c_temp);
-
-            // Perform replacement
-            char *ret = xmalloc(slen - plen + strlen(c_suffix) + 1);
-            strncpy(ret, src, slen - plen);
-            ret[slen - plen] = 0;
-            strcat(ret, c_suffix);
-            return ret;
-        }
-    }
-
-    len = strlen(src);
-    if (len > 1 && src[len - 1] == '*')
-    {
-        char *base = xmalloc(len);
-        strncpy(base, src, len - 1);
-        base[len - 1] = 0;
-
-        char *new_base = replace_type_str(base, param, concrete, old_struct, new_struct);
-        free(base);
-
-        if (strcmp(new_base, base) != 0)
-        {
-            char *ret = xmalloc(strlen(new_base) + 2);
-            sprintf(ret, "%s*", new_base);
-            free(new_base);
-            return ret;
-        }
-        free(new_base);
-    }
-
-    if (strncmp(src, "Slice_", 6) == 0)
-    {
-        char *base = xstrdup(src + 6);
-        char *new_base = replace_type_str(base, param, concrete, old_struct, new_struct);
-        free(base);
-
-        if (strcmp(new_base, base) != 0)
-        {
-            char *ret = xmalloc(strlen(new_base) + 7);
-            sprintf(ret, "Slice_%s", new_base);
-            free(new_base);
-            return ret;
-        }
-        free(new_base);
-    }
-
-    return xstrdup(src);
+    free(res);
+    return final_res;
 }
 
 ASTNode *copy_ast_replacing(ASTNode *n, const char *p, const char *c, const char *os,
@@ -1585,14 +2548,26 @@ Type *type_from_string_helper(const char *c)
     size_t len = strlen(c);
     if (len > 0 && c[len - 1] == '*')
     {
-        char *base = xmalloc(len);
-        strncpy(base, c, len - 1);
-        base[len - 1] = 0;
+        size_t base_len = len - 1;
+        char *base = xmalloc(base_len + 1);
+        strncpy(base, c, base_len);
+        base[base_len] = 0;
 
         Type *inner = type_from_string_helper(base);
         free(base);
 
         return type_new_ptr(inner);
+    }
+
+    // Check for 'const ' prefix
+    if (strncmp(c, "const ", 6) == 0)
+    {
+        Type *inner = type_from_string_helper(c + 6);
+        if (inner)
+        {
+            inner->is_const = 1;
+        }
+        return inner;
     }
 
     if (strncmp(c, "struct ", 7) == 0)
@@ -1752,7 +2727,7 @@ Type *replace_type_formal(Type *t, const char *p, const char *c, const char *os,
                 }
             }
         }
-        else if (strcmp(t->name, p) == 0)
+        else if (p && strcmp(t->name, p) == 0)
         {
             return type_from_string_helper(c);
         }
@@ -1773,42 +2748,130 @@ Type *replace_type_formal(Type *t, const char *p, const char *c, const char *os,
         else if (p && c)
         {
             // Suffix Match Logic (with multi-param splitting)
-            char p_suffix[1024];
+            char p_suffix[4096];
             p_suffix[0] = 0;
 
-            char *p_temp = xstrdup(p);
-            char *tok = strtok(p_temp, ",");
-            while (tok)
+            const char *p_ptr = p;
+            while (p_ptr && *p_ptr)
             {
-                strcat(p_suffix, "_");
-                strcat(p_suffix, tok);
-                tok = strtok(NULL, ",");
+                const char *p_next = strchr(p_ptr, ',');
+                int sub_len = p_next ? (int)(p_next - p_ptr) : (int)strlen(p_ptr);
+                char *sub = xmalloc(sub_len + 1);
+                strncpy(sub, p_ptr, sub_len);
+                sub[sub_len] = 0;
+
+                char *clean_sub = sanitize_mangled_name(sub);
+                strcat(p_suffix, "__");
+                strcat(p_suffix, clean_sub);
+                free(clean_sub);
+                free(sub);
+
+                if (p_next)
+                {
+                    p_ptr = p_next + 1;
+                }
+                else
+                {
+                    break;
+                }
             }
-            free(p_temp);
 
             size_t nlen = strlen(t->name);
             size_t slen = strlen(p_suffix);
 
+            int match = 0;
+            int found_slen = 0;
+            int num_ptr_suffixes = 0;
             if (nlen >= slen && strcmp(t->name + nlen - slen, p_suffix) == 0)
             {
-                char c_suffix[1024];
-                c_suffix[0] = 0;
-                char *c_temp = xstrdup(c);
-                tok = strtok(c_temp, ",");
-                while (tok)
+                match = 1;
+                found_slen = slen;
+            }
+            else if (nlen > slen)
+            {
+                // Try matching with Ptr suffix
+                const char *p_match = strstr(t->name, p_suffix);
+                while (p_match)
                 {
-                    strcat(c_suffix, "_");
-                    char *clean = sanitize_mangled_name(tok);
+                    const char *after = p_match + slen;
+                    int is_all_ptr = 1;
+                    if (*after == '\0')
+                    {
+                        is_all_ptr = 0; // Handled by exact match above
+                    }
+                    while (*after)
+                    {
+                        if (strncmp(after, "Ptr", 3) == 0)
+                        {
+                            after += 3;
+                        }
+                        else
+                        {
+                            is_all_ptr = 0;
+                            break;
+                        }
+                    }
+                    if (is_all_ptr)
+                    {
+                        match = 1;
+                        found_slen = nlen - (p_match - t->name);
+                        num_ptr_suffixes = (nlen - (p_match - t->name) - slen) / 3;
+                        break;
+                    }
+                    p_match = strstr(p_match + 1, p_suffix);
+                }
+            }
+
+            if (match)
+            {
+                slen = found_slen;
+                char c_suffix[MAX_ERROR_MSG_LEN];
+                c_suffix[0] = 0;
+                const char *c_ptr = c;
+                while (c_ptr && *c_ptr)
+                {
+                    const char *c_next = strchr(c_ptr, ',');
+                    int sub_len = c_next ? (int)(c_next - c_ptr) : (int)strlen(c_ptr);
+
+                    char *sub = xmalloc(sub_len + 1);
+                    strncpy(sub, c_ptr, sub_len);
+                    sub[sub_len] = 0;
+
+                    char *clean = sanitize_mangled_name(sub);
+                    // Standardize: always use __ for mangled part
+                    strcat(c_suffix, "__");
                     strcat(c_suffix, clean);
                     free(clean);
-                    tok = strtok(NULL, ",");
-                }
-                free(c_temp);
+                    free(sub);
 
-                char *new_name = xmalloc(nlen - slen + strlen(c_suffix) + 1);
+                    if (c_next)
+                    {
+                        c_ptr = c_next + 1;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+
+                char *new_name =
+                    xmalloc(nlen - slen + strlen(c_suffix) + (num_ptr_suffixes * 3) + 1);
                 strncpy(new_name, t->name, nlen - slen);
                 new_name[nlen - slen] = 0;
+
+                // Handle underscore merging: ensure exactly two underscores
+                char *p_end = new_name + strlen(new_name);
+                while (p_end > new_name && *(p_end - 1) == '_')
+                {
+                    *(--p_end) = '\0';
+                }
                 strcat(new_name, c_suffix);
+
+                // Restore Ptr suffixes
+                for (int k = 0; k < num_ptr_suffixes; k++)
+                {
+                    strcat(new_name, "Ptr");
+                }
                 n->name = new_name;
                 n->kind = TYPE_STRUCT;
                 n->arg_count = 0;
@@ -1842,75 +2905,6 @@ Type *replace_type_formal(Type *t, const char *p, const char *c, const char *os,
     return n;
 }
 
-// Helper to replace generic params in mangled names (e.g. Option_V_None ->
-// Option_int_None)
-char *replace_mangled_part(const char *src, const char *param, const char *concrete)
-{
-    if (!src || !param || !concrete)
-    {
-        return src ? xstrdup(src) : NULL;
-    }
-
-    char *result = xmalloc(4096); // Basic buffer for simplicity
-    result[0] = 0;
-
-    const char *curr = src;
-    char *out = result;
-    int plen = strlen(param);
-
-    while (*curr)
-    {
-        // Check if param matches here
-        if (strncmp(curr, param, plen) == 0)
-        {
-            // Check boundaries: Must be delimited by underscores to be a mangled identifier
-            // (e.g., Vec_T should match, but standalone T should not)
-            int valid = 1;
-            int has_underscore_boundary = 0;
-
-            // Check Prev: Start of string OR Underscore
-            if (curr > src)
-            {
-                if (*(curr - 1) == '_')
-                {
-                    has_underscore_boundary = 1;
-                }
-                else if (is_ident_char(*(curr - 1)))
-                {
-                    valid = 0;
-                }
-            }
-
-            // Check Next: End of string OR Underscore
-            if (valid && curr[plen] != 0 && curr[plen] != '_' && is_ident_char(curr[plen]))
-            {
-                valid = 0;
-            }
-            if (valid && curr[plen] == '_')
-            {
-                has_underscore_boundary = 1;
-            }
-
-            // Only replace if there's at least one underscore boundary
-            if (valid && !has_underscore_boundary)
-            {
-                valid = 0;
-            }
-
-            if (valid)
-            {
-                strcpy(out, concrete);
-                out += strlen(concrete);
-                curr += plen;
-                continue;
-            }
-        }
-        *out++ = *curr++;
-    }
-    *out = 0;
-    return xstrdup(result);
-}
-
 ASTNode *copy_ast_replacing(ASTNode *n, const char *p, const char *c, const char *os,
                             const char *ns)
 {
@@ -1936,20 +2930,78 @@ ASTNode *copy_ast_replacing(ASTNode *n, const char *p, const char *c, const char
         new_node->func.name = xstrdup(n->func.name);
         new_node->func.ret_type = replace_type_str(n->func.ret_type, p, c, os, ns);
 
-        char *tmp_args = replace_in_string(n->func.args, p, c);
+        char *tmp_args = xstrdup(n->func.args);
+        if (p && c && strchr(p, ','))
+        {
+            char *p_ptr = (char *)p;
+            char *c_ptr = (char *)c;
+            while (*p_ptr && *c_ptr)
+            {
+                char *p_end = strchr(p_ptr, ',');
+                int p_len = p_end ? (int)(p_end - p_ptr) : (int)strlen(p_ptr);
+                char *c_end = strchr(c_ptr, ',');
+                int c_len = c_end ? (int)(c_end - c_ptr) : (int)strlen(c_ptr);
+
+                char *p_part = xmalloc(p_len + 1);
+                strncpy(p_part, p_ptr, p_len);
+                p_part[p_len] = 0;
+
+                char *c_part = xmalloc(c_len + 1);
+                strncpy(c_part, c_ptr, c_len);
+                c_part[c_len] = 0;
+
+                char *t1 = replace_in_string(tmp_args, p_part, c_part);
+                free(tmp_args);
+                tmp_args = t1;
+
+                char *clean_c = sanitize_mangled_name(c_part);
+                char *t2 = replace_mangled_part(tmp_args, p_part, clean_c);
+                free(tmp_args);
+                tmp_args = t2;
+
+                free(p_part);
+                free(c_part);
+                free(clean_c);
+
+                if (p_end)
+                {
+                    p_ptr = p_end + 1;
+                }
+                else
+                {
+                    break;
+                }
+                if (c_end)
+                {
+                    c_ptr = c_end + 1;
+                }
+                else
+                {
+                    break;
+                }
+            }
+        }
+        else
+        {
+            char *t1 = replace_in_string(tmp_args, p, c);
+            free(tmp_args);
+            tmp_args = t1;
+
+            if (p && c)
+            {
+                char *clean_c = sanitize_mangled_name(c);
+                char *t2 = replace_mangled_part(tmp_args, p, clean_c);
+                free(tmp_args);
+                tmp_args = t2;
+                free(clean_c);
+            }
+        }
+
         if (os && ns)
         {
             char *tmp2 = replace_in_string(tmp_args, os, ns);
             free(tmp_args);
             tmp_args = tmp2;
-        }
-        if (p && c)
-        {
-            char *clean_c = sanitize_mangled_name(c);
-            char *tmp3 = replace_mangled_part(tmp_args, p, clean_c);
-            free(clean_c);
-            free(tmp_args);
-            tmp_args = tmp3;
         }
         new_node->func.args = tmp_args;
 
@@ -2004,21 +3056,78 @@ ASTNode *copy_ast_replacing(ASTNode *n, const char *p, const char *c, const char
         break;
     case NODE_RAW_STMT:
     {
-        char *s1 = replace_in_string(n->raw_stmt.content, p, c);
+        char *s1 = xstrdup(n->raw_stmt.content);
+        if (p && c && strchr(p, ','))
+        {
+            char *p_ptr = (char *)p;
+            char *c_ptr = (char *)c;
+            while (*p_ptr && *c_ptr)
+            {
+                char *p_end = strchr(p_ptr, ',');
+                int p_len = p_end ? (int)(p_end - p_ptr) : (int)strlen(p_ptr);
+                char *c_end = strchr(c_ptr, ',');
+                int c_len = c_end ? (int)(c_end - c_ptr) : (int)strlen(c_ptr);
+
+                char *p_part = xmalloc(p_len + 1);
+                strncpy(p_part, p_ptr, p_len);
+                p_part[p_len] = 0;
+
+                char *c_part = xmalloc(c_len + 1);
+                strncpy(c_part, c_ptr, c_len);
+                c_part[c_len] = 0;
+
+                char *t1 = replace_in_string(s1, p_part, c_part);
+                free(s1);
+                s1 = t1;
+
+                char *clean_c = sanitize_mangled_name(c_part);
+                char *t2 = replace_mangled_part(s1, p_part, clean_c);
+                free(s1);
+                s1 = t2;
+
+                free(p_part);
+                free(c_part);
+                free(clean_c);
+
+                if (p_end)
+                {
+                    p_ptr = p_end + 1;
+                }
+                else
+                {
+                    break;
+                }
+                if (c_end)
+                {
+                    c_ptr = c_end + 1;
+                }
+                else
+                {
+                    break;
+                }
+            }
+        }
+        else
+        {
+            char *t1 = replace_in_string(s1, p, c);
+            free(s1);
+            s1 = t1;
+
+            if (p && c)
+            {
+                char *clean_c = sanitize_mangled_name(c);
+                char *t2 = replace_mangled_part(s1, p, clean_c);
+                free(s1);
+                s1 = t2;
+                free(clean_c);
+            }
+        }
+
         if (os && ns)
         {
             char *s2 = replace_in_string(s1, os, ns);
             free(s1);
             s1 = s2;
-        }
-
-        if (p && c)
-        {
-            char *clean_c = sanitize_mangled_name(c);
-            char *s3 = replace_mangled_part(s1, p, clean_c);
-            free(clean_c);
-            free(s1);
-            s1 = s3;
         }
 
         new_node->raw_stmt.content = s1;
@@ -2050,22 +3159,84 @@ ASTNode *copy_ast_replacing(ASTNode *n, const char *p, const char *c, const char
     case NODE_EXPR_VAR:
     {
         char *n1 = xstrdup(n->var_ref.name);
-        if (p && c)
+        if (p && c && strchr(p, ','))
         {
-            char *clean_c = sanitize_mangled_name(c);
-            char *n2 = replace_mangled_part(n1, p, clean_c);
-            free(clean_c);
-            free(n1);
-            n1 = n2;
+            char *p_ptr = (char *)p;
+            char *c_ptr = (char *)c;
+            while (*p_ptr && *c_ptr)
+            {
+                char *p_end = strchr(p_ptr, ',');
+                int p_len = p_end ? (int)(p_end - p_ptr) : (int)strlen(p_ptr);
+                char *c_end = strchr(c_ptr, ',');
+                int c_len = c_end ? (int)(c_end - c_ptr) : (int)strlen(c_ptr);
+
+                char *p_part = xmalloc(p_len + 1);
+                strncpy(p_part, p_ptr, p_len);
+                p_part[p_len] = 0;
+
+                char *c_part = xmalloc(c_len + 1);
+                strncpy(c_part, c_ptr, c_len);
+                c_part[c_len] = 0;
+
+                char *t1 = replace_in_string(n1, p_part, c_part);
+                free(n1);
+                n1 = t1;
+
+                char *clean_c = sanitize_mangled_name(c_part);
+                char *t2 = replace_mangled_part(n1, p_part, clean_c);
+                free(n1);
+                n1 = t2;
+
+                free(p_part);
+                free(c_part);
+                free(clean_c);
+
+                if (p_end)
+                {
+                    p_ptr = p_end + 1;
+                }
+                else
+                {
+                    break;
+                }
+                if (c_end)
+                {
+                    c_ptr = c_end + 1;
+                }
+                else
+                {
+                    break;
+                }
+            }
         }
+        else
+        {
+            if (p && c)
+            {
+                char *t1 = replace_in_string(n1, p, c);
+                free(n1);
+                n1 = t1;
+
+                char *clean_c = sanitize_mangled_name(c);
+                char *n2 = replace_mangled_part(n1, p, clean_c);
+                free(clean_c);
+                free(n1);
+                n1 = n2;
+            }
+        }
+
         if (os && ns)
         {
             int os_len = strlen(os);
-            if (strncmp(n1, os, os_len) == 0 && n1[os_len] == '_' && n1[os_len + 1] == '_')
+            int ns_len = strlen(ns);
+            // Only replace if it starts with os__ and DOES NOT already start with ns__
+            if (strncmp(n1, os, os_len) == 0 && n1[os_len] == '_' && n1[os_len + 1] == '_' &&
+                strncmp(n1, ns, ns_len) != 0)
             {
                 char *suffix = n1 + os_len;
-                char *n3 = xmalloc(strlen(ns) + strlen(suffix) + 1);
-                sprintf(n3, "%s%s", ns, suffix);
+                char buf[MAX_ERROR_MSG_LEN];
+                snprintf(buf, sizeof(buf), "%s%s", ns, suffix);
+                char *n3 = merge_underscores(buf);
                 free(n1);
                 n1 = n3;
             }
@@ -2153,11 +3324,67 @@ ASTNode *copy_ast_replacing(ASTNode *n, const char *p, const char *c, const char
         new_node->for_stmt.step = copy_ast_replacing(n->for_stmt.step, p, c, os, ns);
         new_node->for_stmt.body = copy_ast_replacing(n->for_stmt.body, p, c, os, ns);
         break;
+    case NODE_FOR_RANGE:
+        new_node->for_range.start = copy_ast_replacing(n->for_range.start, p, c, os, ns);
+        new_node->for_range.end = copy_ast_replacing(n->for_range.end, p, c, os, ns);
+        new_node->for_range.body = copy_ast_replacing(n->for_range.body, p, c, os, ns);
+        break;
 
     case NODE_MATCH_CASE:
         if (n->match_case.pattern)
         {
-            char *s1 = replace_in_string(n->match_case.pattern, p, c);
+            char *s1 = xstrdup(n->match_case.pattern);
+            if (p && c && strchr(p, ','))
+            {
+                char *p_ptr = (char *)p;
+                char *c_ptr = (char *)c;
+                while (*p_ptr && *c_ptr)
+                {
+                    char *p_end = strchr(p_ptr, ',');
+                    int p_len = p_end ? (int)(p_end - p_ptr) : (int)strlen(p_ptr);
+                    char *c_end = strchr(c_ptr, ',');
+                    int c_len = c_end ? (int)(c_end - c_ptr) : (int)strlen(c_ptr);
+
+                    char *p_part = xmalloc(p_len + 1);
+                    strncpy(p_part, p_ptr, p_len);
+                    p_part[p_len] = 0;
+
+                    char *c_part = xmalloc(c_len + 1);
+                    strncpy(c_part, c_ptr, c_len);
+                    c_part[c_len] = 0;
+
+                    char *t1 = replace_mangled_part(s1, p_part, c_part);
+                    free(s1);
+                    s1 = t1;
+
+                    free(p_part);
+                    free(c_part);
+
+                    if (p_end)
+                    {
+                        p_ptr = p_end + 1;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                    if (c_end)
+                    {
+                        c_ptr = c_end + 1;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                char *t1 = replace_mangled_part(s1, p, c);
+                free(s1);
+                s1 = t1;
+            }
+
             if (os && ns)
             {
                 char *s2 = replace_in_string(s1, os, ns);
@@ -2189,6 +3416,7 @@ ASTNode *copy_ast_replacing(ASTNode *n, const char *p, const char *c, const char
             replace_type_str(n->impl_trait.target_type, p, c, os, ns);
         new_node->impl_trait.methods = copy_ast_replacing(n->impl_trait.methods, p, c, os, ns);
         break;
+    case NODE_TYPEOF:
     case NODE_EXPR_SIZEOF:
         if (n->size_of.target_type)
         {
@@ -2200,7 +3428,20 @@ ASTNode *copy_ast_replacing(ASTNode *n, const char *p, const char *c, const char
                 replaced = mangled;
             }
             new_node->size_of.target_type = replaced;
+            if (replaced && strcmp(replaced, n->size_of.target_type) != 0)
+            {
+                new_node->size_of.target_type_info = NULL;
+            }
+            else
+            {
+                new_node->size_of.target_type_info = n->size_of.target_type_info;
+            }
         }
+        else
+        {
+            new_node->size_of.target_type_info = n->size_of.target_type_info;
+        }
+        new_node->size_of.is_type = n->size_of.is_type;
         new_node->size_of.expr = copy_ast_replacing(n->size_of.expr, p, c, os, ns);
         break;
     default:
@@ -2230,6 +3471,7 @@ char *sanitize_mangled_name(const char *s)
         }
         else if (*s == '<' || *s == ',' || *s == ' ')
         {
+            *p++ = '_';
             *p++ = '_';
         }
         else if (*s == '>' || *s == '&')
@@ -2289,6 +3531,12 @@ char *unmangle_ptr_suffix(const char *s)
 
 FuncSig *find_func(ParserContext *ctx, const char *name)
 {
+    ZenSymbol *sym = symbol_lookup_kind(ctx->current_scope, name, SYM_FUNCTION);
+    if (sym)
+    {
+        return sym->data.sig;
+    }
+
     FuncSig *c = ctx->func_registry;
     while (c)
     {
@@ -2317,7 +3565,7 @@ FuncSig *find_func(ParserContext *ctx, const char *name)
                 sig->ret_type = n->func.ret_type_info;
                 sig->is_varargs = n->func.is_varargs;
                 sig->is_async = n->func.is_async;
-                sig->must_use = 0;
+                sig->required = 0;
                 sig->next = NULL;
                 return sig;
             }
@@ -2360,12 +3608,16 @@ static void trigger_instantiations(ParserContext *ctx, ASTNode *node)
                 }
             }
 
-            char *underscore = strrchr(type_copy, '_');
-            if (underscore && underscore > type_copy)
+            char *underscore = strchr(type_copy, '_');
+            if (underscore)
             {
+                char *concrete_arg = underscore;
+                while (*concrete_arg == '_')
+                {
+                    concrete_arg++;
+                }
                 *underscore = '\0';
                 char *template_name = type_copy;
-                char *concrete_arg = underscore + 1;
 
                 // Check if this is a known generic template
                 GenericTemplate *gt = ctx->templates;
@@ -2400,10 +3652,10 @@ static void trigger_instantiations(ParserContext *ctx, ASTNode *node)
             while (t)
             {
                 size_t tlen = strlen(t->name);
-                if (strncmp(name, t->name, tlen) == 0 && name[tlen] == '_')
+                if (strncmp(name, t->name, tlen) == 0 && name[tlen] == '_' && name[tlen + 1] == '_')
                 {
                     char *template_name = t->name;
-                    char *concrete_arg = (char *)name + tlen + 1; // cast to avoid warning
+                    char *concrete_arg = (char *)name + tlen + 2;
 
                     char *unmangled = unmangle_ptr_suffix(concrete_arg);
                     instantiate_function_template(ctx, template_name, concrete_arg, unmangled);
@@ -2465,6 +3717,11 @@ static void trigger_instantiations(ParserContext *ctx, ASTNode *node)
         trigger_instantiations(ctx, node->for_stmt.step);
         trigger_instantiations(ctx, node->for_stmt.body);
         break;
+    case NODE_FOR_RANGE:
+        trigger_instantiations(ctx, node->for_range.start);
+        trigger_instantiations(ctx, node->for_range.end);
+        trigger_instantiations(ctx, node->for_range.body);
+        break;
     case NODE_EXPR_STRUCT_INIT:
         trigger_instantiations(ctx, node->struct_init.fields);
         break;
@@ -2506,8 +3763,9 @@ char *instantiate_function_template(ParserContext *ctx, const char *name, const 
         is_still_generic = 1;
     }
 
-    char *mangled = xmalloc(strlen(name) + strlen(clean_type) + 2);
-    sprintf(mangled, "%s_%s", name, clean_type);
+    char buf[MAX_ERROR_MSG_LEN];
+    snprintf(buf, sizeof(buf), "%s__%s", name, clean_type);
+    char *mangled = merge_underscores(buf);
     free(clean_type);
 
     if (is_still_generic)
@@ -2529,17 +3787,24 @@ char *instantiate_function_template(ParserContext *ctx, const char *name, const 
         const char *ret = tpl->func_node->func.ret_type;
 
         // Build the param suffix (e.g., for "X,Y,Z" -> "_X_Y_Z")
-        char param_suffix[256];
+        char param_suffix[2048];
         param_suffix[0] = 0;
-        char *tmp = xstrdup(tpl->generic_param);
-        char *tokp = strtok(tmp, ",");
-        while (tokp)
+        const char *p_ptr = tpl->generic_param;
+        while (p_ptr && *p_ptr)
         {
-            strcat(param_suffix, "_");
-            strcat(param_suffix, tokp);
-            tokp = strtok(NULL, ",");
+            strcat(param_suffix, "__");
+            const char *p_next = strchr(p_ptr, ',');
+            int sub_len = p_next ? (int)(p_next - p_ptr) : (int)strlen(p_ptr);
+            strncat(param_suffix, p_ptr, sub_len);
+            if (p_next)
+            {
+                p_ptr = p_next + 1;
+            }
+            else
+            {
+                break;
+            }
         }
-        free(tmp);
 
         // Check if ret_type ends with param_suffix (e.g., "Triple_X_Y_Z" ends with "_X_Y_Z")
         size_t ret_len = strlen(ret);
@@ -2576,14 +3841,27 @@ char *instantiate_function_template(ParserContext *ctx, const char *name, const 
                 // Split concrete types
                 char **args = xmalloc(sizeof(char *) * template_param_count);
                 int arg_count = 0;
-                char *types_copy = xstrdup(types_src);
-                char *tok = strtok(types_copy, ",");
-                while (tok && arg_count < template_param_count)
+                const char *types_ptr = types_src;
+                while (types_ptr && *types_ptr && arg_count < template_param_count)
                 {
-                    args[arg_count++] = xstrdup(tok);
-                    tok = strtok(NULL, ",");
+                    const char *types_next = strchr(types_ptr, ',');
+                    int types_len =
+                        types_next ? (int)(types_next - types_ptr) : (int)strlen(types_ptr);
+
+                    args[arg_count] = xmalloc(types_len + 1);
+                    strncpy(args[arg_count], types_ptr, types_len);
+                    args[arg_count][types_len] = 0;
+                    arg_count++;
+
+                    if (types_next)
+                    {
+                        types_ptr = types_next + 1;
+                    }
+                    else
+                    {
+                        break;
+                    }
                 }
-                free(types_copy);
 
                 // Now instantiate the struct with these args
                 Token dummy_tok = {0};
@@ -2633,6 +3911,16 @@ char *instantiate_function_template(ParserContext *ctx, const char *name, const 
         return NULL;
     }
 
+    free(new_fn->func.name);
+    new_fn->func.name = xstrdup(mangled);
+    new_fn->func.generic_params = NULL;
+
+    add_instantiated_func(ctx, new_fn);
+
+    register_func(ctx, ctx->global_scope, mangled, new_fn->func.arg_count, new_fn->func.defaults,
+                  new_fn->func.arg_types, new_fn->func.ret_type_info, new_fn->func.is_varargs, 0,
+                  new_fn->func.pure, new_fn->link_name, new_fn->token, new_fn->func.is_export);
+
     trigger_instantiations(ctx, new_fn->func.body);
 
     if (new_fn->func.arg_types)
@@ -2649,15 +3937,6 @@ char *instantiate_function_template(ParserContext *ctx, const char *name, const 
         }
     }
 
-    free(new_fn->func.name);
-    new_fn->func.name = xstrdup(mangled);
-    new_fn->func.generic_params = NULL;
-
-    register_func(ctx, mangled, new_fn->func.arg_count, new_fn->func.defaults,
-                  new_fn->func.arg_types, new_fn->func.ret_type_info, new_fn->func.is_varargs, 0,
-                  new_fn->token);
-
-    add_instantiated_func(ctx, new_fn);
     return mangled;
 }
 
@@ -2821,33 +4100,27 @@ int check_impl(ParserContext *ctx, const char *trait, const char *strct)
         r = r->next;
     }
 
-    char *base_strct = strdup(strct);
-    char *ptr = strchr(base_strct, '_');
-    if (ptr)
-    {
-        *ptr = 0;
-    }
-
     r = ctx->registered_impls;
     while (r)
     {
-        char *base_reg = strdup(r->strct);
+        char *base_reg = xstrdup(r->strct);
         char *ptr2 = strchr(base_reg, '<');
         if (ptr2)
         {
             *ptr2 = 0;
-        }
-
-        if (strcmp(r->trait, trait) == 0 && strcmp(base_reg, base_strct) == 0)
-        {
-            free(base_strct);
-            free(base_reg);
-            return 1;
+            size_t blen = strlen(base_reg);
+            if (strncmp(strct, base_reg, blen) == 0 && strct[blen] == '_')
+            {
+                if (strcmp(r->trait, trait) == 0)
+                {
+                    free(base_reg);
+                    return 1;
+                }
+            }
         }
         free(base_reg);
         r = r->next;
     }
-    free(base_strct);
 
     return 0;
 }
@@ -2930,6 +4203,17 @@ ASTNode *copy_fields_replacing(ParserContext *ctx, ASTNode *fields, const char *
                 if (found)
                 {
                     char *unmangled = unmangle_ptr_suffix(concrete_arg);
+                    if (concrete)
+                    {
+                        char *clean_concrete = sanitize_mangled_name(concrete);
+                        if (strcmp(concrete_arg, clean_concrete) == 0)
+                        {
+                            free(unmangled);
+                            unmangled = xstrdup(concrete);
+                        }
+                        free(clean_concrete);
+                    }
+
                     instantiate_generic(ctx, template_name, concrete_arg, unmangled, fields->token);
                     free(unmangled);
                 }
@@ -2956,11 +4240,13 @@ ASTNode *copy_fields_replacing(ParserContext *ctx, ASTNode *fields, const char *
             while (gt)
             {
                 size_t tlen = strlen(gt->name);
-                // Check if name starts with template name followed by underscore
-                if (strncmp(inner->name, gt->name, tlen) == 0 && inner->name[tlen] == '_')
+                // Check if name starts with template name followed by double underscore
+                if (strncmp(inner->name, gt->name, tlen) == 0 && inner->name[tlen] == '_' &&
+                    inner->name[tlen + 1] == '_')
                 {
                     template_name = gt->name;
-                    concrete_arg = inner->name + tlen + 1; // Skip template name and underscore
+                    concrete_arg =
+                        inner->name + tlen + 2; // Skip template name and double underscore
                     break;
                 }
                 gt = gt->next;
@@ -2969,6 +4255,16 @@ ASTNode *copy_fields_replacing(ParserContext *ctx, ASTNode *fields, const char *
             if (template_name && concrete_arg)
             {
                 char *unmangled = unmangle_ptr_suffix(concrete_arg);
+                if (concrete)
+                {
+                    char *clean_concrete = sanitize_mangled_name(concrete);
+                    if (strcmp(concrete_arg, clean_concrete) == 0)
+                    {
+                        free(unmangled);
+                        unmangled = xstrdup(concrete);
+                    }
+                    free(clean_concrete);
+                }
                 instantiate_generic(ctx, template_name, concrete_arg, unmangled, fields->token);
                 free(unmangled);
             }
@@ -2997,6 +4293,34 @@ void instantiate_methods(ParserContext *ctx, GenericImplTemplate *it,
 
     ASTNode *new_impl = copy_ast_replacing(it->impl_node, it->generic_param, subst_arg,
                                            it->struct_name, mangled_struct_name);
+
+    // Also replace mangled template name (both List__G and List_G)
+    if (strchr(it->struct_name, '<'))
+    {
+        char *sanitized = sanitize_mangled_name(it->struct_name);
+        if (strcmp(sanitized, it->struct_name) != 0)
+        {
+            ASTNode *tmp = copy_ast_replacing(new_impl, NULL, NULL, sanitized, mangled_struct_name);
+            new_impl = tmp;
+        }
+
+        char *old_sanitized = xstrdup(sanitized);
+        char *double_underscore = strstr(old_sanitized, "__");
+        if (double_underscore)
+        {
+            memmove(double_underscore, double_underscore + 1, strlen(double_underscore + 1) + 1);
+        }
+
+        if (strcmp(old_sanitized, it->struct_name) != 0 && strcmp(old_sanitized, sanitized) != 0)
+        {
+            ASTNode *tmp =
+                copy_ast_replacing(new_impl, NULL, NULL, old_sanitized, mangled_struct_name);
+            new_impl = tmp;
+        }
+
+        free(old_sanitized);
+        free(sanitized);
+    }
     free(subst_arg);
     it->impl_node->next = backup_next; // Restore
 
@@ -3015,17 +4339,38 @@ void instantiate_methods(ParserContext *ctx, GenericImplTemplate *it,
 
     while (meth)
     {
-        char *suffix = meth->func.name + strlen(it->struct_name);
-        if (suffix && *suffix)
+        // Standardize: ensure __ between type and method
+        // If it's already correctly mangled (e.g. Vec__int32_t__with_capacity), skip
+        size_t mlen = strlen(mangled_struct_name);
+        int correctly_mangled = (strncmp(meth->func.name, mangled_struct_name, mlen) == 0 &&
+                                 meth->func.name[mlen] == '_' && meth->func.name[mlen + 1] == '_');
+
+        if (!correctly_mangled)
         {
-            char *new_name = xmalloc(strlen(mangled_struct_name) + strlen(suffix) + 1);
-            sprintf(new_name, "%s%s", mangled_struct_name, suffix);
+            // Find the method part in the original name (e.g. "with_capacity" in
+            // "Vec_with_capacity")
+            char *original_method = meth->func.name;
+            if (strncmp(original_method, it->struct_name, strlen(it->struct_name)) == 0)
+            {
+                original_method += strlen(it->struct_name);
+            }
+            while (*original_method == '_')
+            {
+                original_method++;
+            }
+
+            char *temp = xmalloc(strlen(mangled_struct_name) + strlen(original_method) + 3);
+            sprintf(temp, "%s__%s", mangled_struct_name, original_method);
+            char *new_name = merge_underscores(temp);
+            free(temp);
             free(meth->func.name);
             meth->func.name = new_name;
-            register_func(ctx, new_name, meth->func.arg_count, meth->func.defaults,
-                          meth->func.arg_types, meth->func.ret_type_info, meth->func.is_varargs, 0,
-                          meth->token);
         }
+
+        register_func(ctx, ctx->global_scope, meth->func.name, meth->func.arg_count,
+                      meth->func.defaults, meth->func.arg_types, meth->func.ret_type_info,
+                      meth->func.is_varargs, (meth->type == NODE_FUNCTION && meth->func.is_async),
+                      meth->func.pure, meth->link_name, meth->token, meth->func.is_export);
 
         // Handle generic return types in methods (e.g., Option<T> -> Option_int)
         if (meth->func.ret_type &&
@@ -3041,11 +4386,14 @@ void instantiate_methods(ParserContext *ctx, GenericImplTemplate *it,
                     (delim == '_' || delim == '<'))
                 {
                     // Found matching template prefix
-                    const char *arg = meth->func.ret_type + tlen + 1;
+                    const char *type_arg = meth->func.ret_type + tlen;
+                    while (*type_arg == '_' || *type_arg == '<')
+                    {
+                        type_arg++;
+                    }
 
                     // Simple approach: instantiate 'Template' with 'Arg'.
-                    // If delimited by <, we need to extract the inside.
-                    char *clean_arg = xstrdup(arg);
+                    char *clean_arg = xstrdup(type_arg);
                     if (delim == '<')
                     {
                         char *closer = strrchr(clean_arg, '>');
@@ -3056,28 +4404,27 @@ void instantiate_methods(ParserContext *ctx, GenericImplTemplate *it,
                     }
 
                     // Unmangle Ptr suffix if present (e.g., intPtr -> int*)
-                    char *unmangled_arg = xstrdup(clean_arg);
+                    char *inner_unmangled_arg = xstrdup(clean_arg);
                     size_t alen = strlen(clean_arg);
                     if (alen > 3 && strcmp(clean_arg + alen - 3, "Ptr") == 0)
                     {
                         char *base = xstrdup(clean_arg);
                         base[alen - 3] = '\0';
-                        free(unmangled_arg);
-                        unmangled_arg = xmalloc(strlen(base) + 16);
+                        free(inner_unmangled_arg);
+                        inner_unmangled_arg = xmalloc(strlen(base) + 16);
                         // Check if base is a primitive type
                         if (is_unmangle_primitive(base))
                         {
-                            sprintf(unmangled_arg, "%s*", base);
+                            sprintf(inner_unmangled_arg, "%s*", base);
                         }
                         else
                         {
-                            sprintf(unmangled_arg, "struct %s*", base);
+                            sprintf(inner_unmangled_arg, "struct %s*", base);
                         }
                         free(base);
                     }
 
-                    instantiate_generic(ctx, gt->name, clean_arg, unmangled_arg, meth->token);
-                    free(unmangled_arg);
+                    instantiate_generic(ctx, gt->name, clean_arg, inner_unmangled_arg, meth->token);
                     free(clean_arg);
                 }
                 gt = gt->next;
@@ -3106,8 +4453,15 @@ void instantiate_generic(ParserContext *ctx, const char *tpl, const char *arg,
     }
 
     char *clean_arg = sanitize_mangled_name(arg);
-    char m[256];
-    sprintf(m, "%s_%s", tpl, clean_arg);
+    char *m = xmalloc(strlen(tpl) + strlen(clean_arg) + 4);
+    strcpy(m, tpl);
+    char *m_end = m + strlen(m);
+    while (m_end > m && *(m_end - 1) == '_')
+    {
+        *(--m_end) = '\0';
+    }
+    strcat(m, "__");
+    strcat(m, clean_arg);
     free(clean_arg);
 
     Instantiation *c = ctx->instantiations;
@@ -3115,6 +4469,7 @@ void instantiate_generic(ParserContext *ctx, const char *tpl, const char *arg,
     {
         if (strcmp(c->name, m) == 0)
         {
+            free(m);
             return; // Already instantiated, DO NOTHING.
         }
         c = c->next;
@@ -3152,6 +4507,7 @@ void instantiate_generic(ParserContext *ctx, const char *tpl, const char *arg,
         ASTNode *i = ast_create(NODE_STRUCT);
         i->strct.name = xstrdup(m);
         i->strct.is_template = 0;
+        i->strct.is_export = t->struct_node->strct.is_export;
 
         // Copy type attributes (e.g. has_drop)
         i->type_info = type_new(TYPE_STRUCT);
@@ -3180,10 +4536,9 @@ void instantiate_generic(ParserContext *ctx, const char *tpl, const char *arg,
         ASTNode *fld = i->strct.fields;
         while (fld)
         {
-            if (fld->type == NODE_FIELD && fld->field.type &&
-                strncmp(fld->field.type, "Slice_", 6) == 0)
+            if (fld->field.type && strncmp(fld->field.type, "Slice__", 7) == 0)
             {
-                register_slice(ctx, fld->field.type + 6);
+                register_slice(ctx, fld->field.type + 7);
             }
             fld = fld->next;
         }
@@ -3193,6 +4548,7 @@ void instantiate_generic(ParserContext *ctx, const char *tpl, const char *arg,
         ASTNode *i = ast_create(NODE_ENUM);
         i->enm.name = xstrdup(m);
         i->enm.is_template = 0;
+        i->enm.is_export = t->struct_node->enm.is_export;
 
         // Copy type attributes (e.g. has_drop)
         i->type_info = type_new(TYPE_ENUM);
@@ -3212,9 +4568,33 @@ void instantiate_generic(ParserContext *ctx, const char *tpl, const char *arg,
             const char *subst_arg = unmangled_arg ? unmangled_arg : arg;
             nv->variant.payload = replace_type_formal(
                 v->variant.payload, t->struct_node->enm.generic_param, subst_arg, NULL, NULL);
-            char mangled_var[512];
-            sprintf(mangled_var, "%s_%s", m, nv->variant.name);
+            size_t mangled_var_sz = strlen(m) + strlen(nv->variant.name) + 3;
+            char *mangled_var = xmalloc(mangled_var_sz);
+            snprintf(mangled_var, mangled_var_sz, "%s__%s", m, nv->variant.name);
             register_enum_variant(ctx, m, mangled_var, nv->variant.tag_id);
+
+            // Register Constructor Function Signature for the instantiated variant
+            if (nv->variant.payload)
+            {
+                Type **at = xmalloc(sizeof(Type *));
+                at[0] = nv->variant.payload;
+                Type *ret_t = type_new(TYPE_ENUM);
+                ret_t->name = xstrdup(m);
+
+                register_func(ctx, ctx->global_scope, mangled_var, 1, NULL, at, ret_t, 0, 0, 0,
+                              NULL, token, i->enm.is_export);
+            }
+            else
+            {
+                // For variants without payload, we still need to register it as a zero-arg function
+                // so that MyOption::None() works and is consistent.
+                Type *ret_t = type_new(TYPE_ENUM);
+                ret_t->name = xstrdup(m);
+                register_func(ctx, ctx->global_scope, mangled_var, 0, NULL, NULL, ret_t, 0, 0, 0,
+                              NULL, token, i->enm.is_export);
+            }
+
+            free(mangled_var);
             if (!h)
             {
                 h = nv;
@@ -3243,11 +4623,11 @@ void instantiate_generic(ParserContext *ctx, const char *tpl, const char *arg,
     {
         if (strcmp(it->struct_name, tpl) == 0)
         {
-            const char *subst_arg = unmangled_arg ? unmangled_arg : arg;
-            instantiate_methods(ctx, it, m, arg, subst_arg);
+            instantiate_methods(ctx, it, m, arg, unmangled_arg);
         }
         it = it->next;
     }
+    free(m);
 }
 
 static void free_field_list(ASTNode *fields)
@@ -3272,12 +4652,24 @@ void instantiate_generic_multi(ParserContext *ctx, const char *tpl, char **args,
                                Token token)
 {
     // Build mangled name from all args
-    char m[256];
-    strcpy(m, tpl);
+    size_t m_len = strlen(tpl) + 1;
     for (int i = 0; i < arg_count; i++)
     {
         char *clean = sanitize_mangled_name(args[i]);
-        strcat(m, "_");
+        m_len += 2 + strlen(clean);
+        free(clean);
+    }
+    char *m = xmalloc(m_len + 1);
+    strcpy(m, tpl);
+    char *m_end = m + strlen(m);
+    while (m_end > m && *(m_end - 1) == '_')
+    {
+        *(--m_end) = '\0';
+    }
+    for (int i = 0; i < arg_count; i++)
+    {
+        char *clean = sanitize_mangled_name(args[i]);
+        strcat(m, "__");
         strcat(m, clean);
         free(clean);
     }
@@ -3288,6 +4680,7 @@ void instantiate_generic_multi(ParserContext *ctx, const char *tpl, char **args,
     {
         if (strcmp(c->name, m) == 0)
         {
+            free(m);
             return; // Already done
         }
         c = c->next;
@@ -3322,6 +4715,7 @@ void instantiate_generic_multi(ParserContext *ctx, const char *tpl, char **args,
         ASTNode *i = ast_create(NODE_STRUCT);
         i->strct.name = xstrdup(m);
         i->strct.is_template = 0;
+        i->strct.is_export = t->struct_node->strct.is_export;
 
         // Copy struct attributes
         i->strct.is_packed = t->struct_node->strct.is_packed;
@@ -3363,10 +4757,113 @@ void instantiate_generic_multi(ParserContext *ctx, const char *tpl, char **args,
         i->next = ctx->instantiated_structs;
         ctx->instantiated_structs = i;
     }
+    else if (t->struct_node->type == NODE_ENUM)
+    {
+        ASTNode *i = ast_create(NODE_ENUM);
+        i->enm.name = xstrdup(m);
+        i->enm.is_template = 0;
+        i->enm.is_export = t->struct_node->enm.is_export;
+
+        // Copy type attributes
+        i->type_info = type_new(TYPE_ENUM);
+        i->type_info->name = xstrdup(m);
+        if (t->struct_node->type_info)
+        {
+            i->type_info->traits = t->struct_node->type_info->traits;
+        }
+
+        ASTNode *h = 0, *tl = 0;
+        ASTNode *v = t->struct_node->enm.variants;
+        while (v)
+        {
+            ASTNode *nv = ast_create(NODE_ENUM_VARIANT);
+            nv->variant.name = xstrdup(v->variant.name);
+            nv->variant.tag_id = v->variant.tag_id;
+
+            // Use multi-parameter substitution for payload
+            Type *payload = v->variant.payload;
+            if (payload)
+            {
+                // We need to apply all substitutions
+
+                // Actually, for multi-param enums, we should check how they are stored.
+                // If it's Result<T, E>, generic_param is "T,E".
+                // We use replace_type_formal which handles "T,E" as p and "int,float" as c.
+
+                // Construct comma-separated concrete args string
+                size_t c_args_len = 1;
+                for (int j = 0; j < arg_count; j++)
+                {
+                    c_args_len += strlen(args[j]) + 1;
+                }
+                char *c_args = xmalloc(c_args_len);
+                c_args[0] = 0;
+                for (int j = 0; j < arg_count; j++)
+                {
+                    if (j > 0)
+                    {
+                        strcat(c_args, ",");
+                    }
+                    strcat(c_args, args[j]);
+                }
+
+                nv->variant.payload = replace_type_formal(
+                    payload, t->struct_node->enm.generic_param, c_args, NULL, NULL);
+                free(c_args);
+            }
+
+            size_t mangled_var_sz = strlen(m) + strlen(nv->variant.name) + 3;
+            char *mangled_var = xmalloc(mangled_var_sz);
+            snprintf(mangled_var, mangled_var_sz, "%s__%s", m, nv->variant.name);
+            register_enum_variant(ctx, m, mangled_var, nv->variant.tag_id);
+
+            // Register Constructor Function Signature for the instantiated variant
+            if (nv->variant.payload)
+            {
+                Type **at = xmalloc(sizeof(Type *));
+                at[0] = nv->variant.payload;
+                Type *ret_t = type_new(TYPE_ENUM);
+                ret_t->name = xstrdup(m);
+
+                register_func(ctx, ctx->global_scope, mangled_var, 1, NULL, at, ret_t, 0, 0, 0,
+                              NULL, token, i->enm.is_export);
+            }
+            else
+            {
+                Type *ret_t = type_new(TYPE_ENUM);
+                ret_t->name = xstrdup(m);
+                register_func(ctx, ctx->global_scope, mangled_var, 0, NULL, NULL, ret_t, 0, 0, 0,
+                              NULL, token, i->enm.is_export);
+            }
+
+            free(mangled_var);
+            if (!h)
+            {
+                h = nv;
+            }
+            else
+            {
+                tl->next = nv;
+            }
+            tl = nv;
+            v = v->next;
+        }
+        i->enm.variants = h;
+        ni->struct_node = i;
+        register_struct_def(ctx, m, i);
+
+        i->next = ctx->instantiated_structs;
+        ctx->instantiated_structs = i;
+    }
+    free(m);
 }
 
 int is_file_imported(ParserContext *ctx, const char *p)
 {
+    if (!p)
+    {
+        return 0;
+    }
     ImportedFile *c = ctx->imported_files;
     while (c)
     {
@@ -3573,8 +5070,9 @@ char *rewrite_expr_methods(ParserContext *ctx, char *raw)
                 }
 
                 // Mixin Lookup Logic
-                char target_func[256];
-                sprintf(target_func, "%s__%s", ptr_check, method);
+                char target_func_raw[MAX_FUNC_NAME_LEN];
+                sprintf(target_func_raw, "%s__%s", ptr_check, method);
+                char *target_func = merge_underscores(target_func_raw);
 
                 char *final_cast = NULL;
                 char *final_method = xstrdup(method);
@@ -3584,18 +5082,21 @@ char *rewrite_expr_methods(ParserContext *ctx, char *raw)
                 if (!find_func(ctx, target_func))
                 {
                     // Not found, check mixins
-                    ASTNode *def = find_struct_def(ctx, ptr_check);
-                    if (def && def->type == NODE_STRUCT && def->strct.used_structs)
+                    ASTNode *mixin_def = find_struct_def(ctx, ptr_check);
+                    if (mixin_def && mixin_def->type == NODE_STRUCT &&
+                        mixin_def->strct.used_structs)
                     {
-                        for (int k = 0; k < def->strct.used_struct_count; k++)
+                        for (int k = 0; k < mixin_def->strct.used_struct_count; k++)
                         {
-                            char mixin_func[128];
-                            sprintf(mixin_func, "%s__%s", def->strct.used_structs[k], method);
+                            char mixin_func_raw[128];
+                            sprintf(mixin_func_raw, "%s__%s", mixin_def->strct.used_structs[k],
+                                    method);
+                            char *mixin_func = merge_underscores(mixin_func_raw);
                             if (find_func(ctx, mixin_func))
                             {
                                 // Found in mixin!
                                 free(final_struct);
-                                final_struct = xstrdup(def->strct.used_structs[k]);
+                                final_struct = xstrdup(mixin_def->strct.used_structs[k]);
 
                                 // Create cast string: (Mixin*) or (Mixin*)&
                                 char cast_buf[128];
@@ -3617,15 +5118,21 @@ char *rewrite_expr_methods(ParserContext *ctx, char *raw)
                 if (final_cast)
                 {
                     // Mixin call: Foo__method((Foo*)&obj
-                    dest +=
-                        sprintf(dest, "%s__%s(%s%s", final_struct, final_method, final_cast, acc);
+                    char call_buf[MAX_ERROR_MSG_LEN];
+                    snprintf(call_buf, sizeof(call_buf), "%s__%s", final_struct, final_method);
+                    char *mangled_call = merge_underscores(call_buf);
+
+                    dest += sprintf(dest, "%s(%s%s", mangled_call, final_cast, acc);
                     free(final_cast);
                 }
                 else
                 {
                     // Standard call
-                    dest += sprintf(dest, "%s__%s(%s%s", final_struct, final_method,
-                                    is_ptr ? "" : "&", acc);
+                    char call_buf[MAX_ERROR_MSG_LEN];
+                    snprintf(call_buf, sizeof(call_buf), "%s__%s", final_struct, final_method);
+                    char *mangled_call = merge_underscores(call_buf);
+
+                    dest += sprintf(dest, "%s(%s%s", mangled_call, is_ptr ? "" : "&", acc);
                 }
                 free(final_struct);
                 free(final_method);
@@ -3679,8 +5186,9 @@ char *rewrite_expr_methods(ParserContext *ctx, char *raw)
                     }
                 }
                 // Mixin Lookup Logic (No Parens)
-                char target_func[256];
-                sprintf(target_func, "%s__%s", ptr_check, method);
+                char target_func_raw[MAX_FUNC_NAME_LEN];
+                sprintf(target_func_raw, "%s__%s", ptr_check, method);
+                char *target_func = merge_underscores(target_func_raw);
 
                 char *final_cast = NULL;
                 char *final_method = xstrdup(method);
@@ -3690,18 +5198,21 @@ char *rewrite_expr_methods(ParserContext *ctx, char *raw)
                 if (!find_func(ctx, target_func))
                 {
                     // Not found, check mixins
-                    ASTNode *def = find_struct_def(ctx, ptr_check);
-                    if (def && def->type == NODE_STRUCT && def->strct.used_structs)
+                    ASTNode *mixin_def = find_struct_def(ctx, ptr_check);
+                    if (mixin_def && mixin_def->type == NODE_STRUCT &&
+                        mixin_def->strct.used_structs)
                     {
-                        for (int k = 0; k < def->strct.used_struct_count; k++)
+                        for (int k = 0; k < mixin_def->strct.used_struct_count; k++)
                         {
-                            char mixin_func[128];
-                            sprintf(mixin_func, "%s__%s", def->strct.used_structs[k], method);
+                            char mixin_func_raw[128];
+                            sprintf(mixin_func_raw, "%s__%s", mixin_def->strct.used_structs[k],
+                                    method);
+                            char *mixin_func = merge_underscores(mixin_func_raw);
                             if (find_func(ctx, mixin_func))
                             {
                                 // Found in mixin!
                                 free(final_struct);
-                                final_struct = xstrdup(def->strct.used_structs[k]);
+                                final_struct = xstrdup(mixin_def->strct.used_structs[k]);
 
                                 // Create cast string: (Mixin*) or (Mixin*)&
                                 char cast_buf[128];
@@ -3722,14 +5233,20 @@ char *rewrite_expr_methods(ParserContext *ctx, char *raw)
 
                 if (final_cast)
                 {
-                    dest +=
-                        sprintf(dest, "%s__%s(%s%s)", final_struct, final_method, final_cast, acc);
+                    char call_buf[MAX_ERROR_MSG_LEN];
+                    snprintf(call_buf, sizeof(call_buf), "%s__%s", final_struct, final_method);
+                    char *mangled_call = merge_underscores(call_buf);
+
+                    dest += sprintf(dest, "%s(%s%s)", mangled_call, final_cast, acc);
                     free(final_cast);
                 }
                 else
                 {
-                    dest += sprintf(dest, "%s__%s(%s%s)", final_struct, final_method,
-                                    is_ptr ? "" : "&", acc);
+                    char call_buf[MAX_ERROR_MSG_LEN];
+                    snprintf(call_buf, sizeof(call_buf), "%s__%s", final_struct, final_method);
+                    char *mangled_call = merge_underscores(call_buf);
+
+                    dest += sprintf(dest, "%s(%s%s)", mangled_call, is_ptr ? "" : "&", acc);
                 }
                 free(final_struct);
                 free(final_method);
@@ -3788,7 +5305,7 @@ char *rewrite_expr_methods(ParserContext *ctx, char *raw)
                     }
                     if (is_variant)
                     {
-                        dest += sprintf(dest, "%s_%s", acc, field);
+                        dest += sprintf(dest, "%s__%s", acc, field);
                     }
                     else
                     {
@@ -3804,7 +5321,7 @@ char *rewrite_expr_methods(ParserContext *ctx, char *raw)
                 else
                 {
                     // Module function
-                    dest += sprintf(dest, "%s_%s", acc, field);
+                    dest += sprintf(dest, "%s__%s", acc, field);
                 }
             }
             continue;
@@ -3847,7 +5364,7 @@ char *rewrite_expr_methods(ParserContext *ctx, char *raw)
                 {
                     src++;
 
-                    char mangled[256];
+                    char mangled[MAX_MANGLED_NAME_LEN];
 
                     const char *aliased = find_type_alias(ctx, func_name);
                     const char *use_name = aliased ? aliased : func_name;
@@ -3861,7 +5378,12 @@ char *rewrite_expr_methods(ParserContext *ctx, char *raw)
                         }
                         else
                         {
-                            snprintf(mangled, sizeof(mangled), "%s_%s", mod->base_name, method);
+                            char mangled_raw[MAX_MANGLED_NAME_LEN];
+                            snprintf(mangled_raw, sizeof(mangled_raw), "%s__%s", mod->base_name,
+                                     method);
+                            char *mangled_merged = merge_underscores(mangled_raw);
+                            strncpy(mangled, mangled_merged, sizeof(mangled) - 1);
+                            mangled[sizeof(mangled) - 1] = 0;
                         }
                     }
                     else
@@ -3869,11 +5391,19 @@ char *rewrite_expr_methods(ParserContext *ctx, char *raw)
                         ASTNode *sdef = find_struct_def(ctx, use_name);
                         if (sdef)
                         {
-                            snprintf(mangled, sizeof(mangled), "%s__%s", use_name, method);
+                            char mangled_raw[MAX_MANGLED_NAME_LEN];
+                            snprintf(mangled_raw, sizeof(mangled_raw), "%s__%s", use_name, method);
+                            char *mangled_merged = merge_underscores(mangled_raw);
+                            strncpy(mangled, mangled_merged, sizeof(mangled) - 1);
+                            mangled[sizeof(mangled) - 1] = 0;
                         }
                         else
                         {
-                            snprintf(mangled, sizeof(mangled), "%s_%s", use_name, method);
+                            char mangled_raw[MAX_MANGLED_NAME_LEN];
+                            snprintf(mangled_raw, sizeof(mangled_raw), "%s__%s", use_name, method);
+                            char *mangled_merged = merge_underscores(mangled_raw);
+                            strncpy(mangled, mangled_merged, sizeof(mangled) - 1);
+                            mangled[sizeof(mangled) - 1] = 0;
                         }
                     }
 
@@ -3946,7 +5476,8 @@ char *parse_and_convert_args(ParserContext *ctx, Lexer *l, char ***defaults_out,
         zpanic_at(t, "Expected '(' in function args");
     }
 
-    char *buf = xmalloc(1024);
+    size_t buf_size = 8192;
+    char *buf = xmalloc(buf_size);
     buf[0] = 0;
     int count = 0;
     char **defaults = xmalloc(sizeof(char *) * 16);
@@ -4000,134 +5531,87 @@ char *parse_and_convert_args(ParserContext *ctx, Lexer *l, char ***defaults_out,
                 }
             }
 
-            Token t = lexer_next(l);
+            int is_const_param = 0;
+            Token param_tok = lexer_next(l);
+
+            if (is_token(param_tok, "const"))
+            {
+                is_const_param = 1;
+                param_tok = lexer_next(l);
+            }
+
             // Handle 'self'
-            if (t.type == TOK_IDENT && strncmp(t.start, "self", 4) == 0 && t.len == 4)
+            if (is_token(param_tok, "self"))
             {
                 names[count] = xstrdup("self");
                 if (ctx->current_impl_struct)
                 {
-                    Type *st = NULL;
-                    // Check for primitives to avoid creating struct int*
-                    const char *is = ctx->current_impl_struct;
-                    if (strcmp(is, "int") == 0 || strcmp(is, "int32_t") == 0 ||
-                        strcmp(is, "i32") == 0 || strcmp(is, "I32") == 0)
+                    char *buf_type = xmalloc(strlen(ctx->current_impl_struct) + 2);
+                    sprintf(buf_type, "%s*", ctx->current_impl_struct);
+
+                    if (is_primitive_type_name(ctx->current_impl_struct))
                     {
-                        st = type_new(TYPE_INT);
-                    }
-                    else if (strcmp(is, "uint") == 0 || strcmp(is, "uint32_t") == 0 ||
-                             strcmp(is, "u32") == 0 || strcmp(is, "U32") == 0)
-                    {
-                        st = type_new(TYPE_U32);
-                    }
-                    else if (strcmp(is, "float") == 0 || strcmp(is, "f32") == 0 ||
-                             strcmp(is, "F32") == 0)
-                    {
-                        st = type_new(TYPE_F32);
-                    }
-                    else if (strcmp(is, "double") == 0 || strcmp(is, "f64") == 0 ||
-                             strcmp(is, "F64") == 0)
-                    {
-                        st = type_new(TYPE_F64);
-                    }
-                    else if (strcmp(is, "char") == 0)
-                    {
-                        st = type_new(TYPE_CHAR);
-                    }
-                    else if (strcmp(is, "bool") == 0)
-                    {
-                        st = type_new(TYPE_BOOL);
-                    }
-                    else if (strcmp(is, "string") == 0)
-                    {
-                        st = type_new(TYPE_STRING);
-                    }
-                    else if (strcmp(is, "void") == 0)
-                    {
-                        st = type_new(TYPE_VOID);
-                    }
-                    else if (strcmp(is, "usize") == 0 || strcmp(is, "size_t") == 0)
-                    {
-                        st = type_new(TYPE_USIZE);
-                    }
-                    else if (strcmp(is, "isize") == 0 || strcmp(is, "ptrdiff_t") == 0)
-                    {
-                        st = type_new(TYPE_ISIZE);
-                    }
-                    else if (strcmp(is, "byte") == 0 || strcmp(is, "u8") == 0 ||
-                             strcmp(is, "U8") == 0 || strcmp(is, "uint8_t") == 0)
-                    {
-                        st = type_new(TYPE_U8);
-                    }
-                    else if (strcmp(is, "i8") == 0 || strcmp(is, "I8") == 0 ||
-                             strcmp(is, "int8_t") == 0)
-                    {
-                        st = type_new(TYPE_I8);
-                    }
-                    else if (strcmp(is, "i16") == 0 || strcmp(is, "I16") == 0 ||
-                             strcmp(is, "int16_t") == 0)
-                    {
-                        st = type_new(TYPE_I16);
-                    }
-                    else if (strcmp(is, "u16") == 0 || strcmp(is, "U16") == 0 ||
-                             strcmp(is, "uint16_t") == 0)
-                    {
-                        st = type_new(TYPE_U16);
-                    }
-                    else if (strcmp(is, "i64") == 0 || strcmp(is, "I64") == 0 ||
-                             strcmp(is, "int64_t") == 0 || strcmp(is, "long") == 0)
-                    {
-                        st = type_new(TYPE_I64);
-                    }
-                    else if (strcmp(is, "u64") == 0 || strcmp(is, "U64") == 0 ||
-                             strcmp(is, "uint64_t") == 0 || strcmp(is, "ulong") == 0)
-                    {
-                        st = type_new(TYPE_U64);
-                    }
-                    else if (strcmp(is, "i128") == 0 || strcmp(is, "I128") == 0)
-                    {
-                        st = type_new(TYPE_I128);
-                    }
-                    else if (strcmp(is, "u128") == 0 || strcmp(is, "U128") == 0)
-                    {
-                        st = type_new(TYPE_U128);
-                    }
-                    else if (strcmp(is, "rune") == 0)
-                    {
-                        st = type_new(TYPE_RUNE);
+                        // Primitives: self is a pointer in signature and body
+                        TypeKind pk = get_primitive_type_kind(ctx->current_impl_struct);
+                        Type *bt = type_new(pk);
+                        if (pk == TYPE_STRUCT)
+                        { // Fallback if get_primitive_type_kind failed for some reason
+                            bt->name = xstrdup(ctx->current_impl_struct);
+                        }
+                        bt->is_const = is_const_param;
+                        Type *ptr = type_new_ptr(bt);
+
+                        add_symbol(ctx, "self", buf_type, ptr, 0);
+                        types[count] = ptr;
                     }
                     else
                     {
-                        st = type_new(TYPE_STRUCT);
+                        // Structs: self is a pointer in signature and body
+                        Type *st = type_new(TYPE_STRUCT);
                         st->name = xstrdup(ctx->current_impl_struct);
+                        st->is_const = is_const_param;
+                        Type *ptr = type_new_ptr(st);
+
+                        add_symbol(ctx, "self", buf_type, ptr, 0);
+                        types[count] = ptr;
                     }
-                    Type *pt = type_new_ptr(st);
-
-                    char buf_type[256];
-                    sprintf(buf_type, "%s*", ctx->current_impl_struct);
-                    // Register 'self' with actual type in symbol table
-                    add_symbol(ctx, "self", buf_type, pt);
-
-                    types[count] = pt;
-
-                    strcat(buf, "void* self");
+                    free(buf_type);
+                    if (is_const_param)
+                    {
+                        strcat(buf, "const void* self");
+                    }
+                    else
+                    {
+                        strcat(buf, "void* self");
+                    }
                 }
                 else
                 {
-                    strcat(buf, "void* self");
-                    types[count] = type_new_ptr(type_new(TYPE_VOID));
-                    add_symbol(ctx, "self", "void*", types[count]);
+                    if (is_const_param)
+                    {
+                        strcat(buf, "const void* self");
+                    }
+                    else
+                    {
+                        strcat(buf, "void* self");
+                    }
+                    Type *void_type = type_new(TYPE_VOID);
+                    void_type->is_const = is_const_param;
+                    types[count] = type_new_ptr(void_type);
+                    add_symbol(ctx, "self", is_const_param ? "const void*" : "void*", types[count],
+                               0);
                 }
                 ctype_overrides[count] = ctype_override;
                 count++;
             }
             else
             {
-                if (t.type != TOK_IDENT)
+                if (param_tok.type != TOK_IDENT)
                 {
                     zpanic_at(lexer_peek(l), "Expected arg name");
                 }
-                char *name = token_strdup(t);
+                check_identifier(ctx, param_tok);
+                char *name = token_strdup(param_tok);
                 names[count] = name; // Store name
                 if (lexer_next(l).type != TOK_COLON)
                 {
@@ -4135,9 +5619,13 @@ char *parse_and_convert_args(ParserContext *ctx, Lexer *l, char ***defaults_out,
                 }
 
                 Type *arg_type = parse_type_formal(ctx, l);
+                if (is_const_param)
+                {
+                    arg_type->is_const = 1;
+                }
                 char *type_str = type_to_string(arg_type);
 
-                add_symbol(ctx, name, type_str, arg_type);
+                add_symbol(ctx, name, type_str, arg_type, 0);
                 types[count] = arg_type;
 
                 if (strlen(buf) > 0)
@@ -4145,8 +5633,19 @@ char *parse_and_convert_args(ParserContext *ctx, Lexer *l, char ***defaults_out,
                     strcat(buf, ", ");
                 }
 
+                // Ensure buf has enough space before appending
+                size_t needed = strlen(buf) + strlen(type_str) + strlen(name) + 32;
+                if (needed > buf_size)
+                {
+                    while (needed > buf_size)
+                    {
+                        buf_size *= 2;
+                    }
+                    buf = xrealloc(buf, buf_size);
+                }
+
                 char *fn_ptr = strstr(type_str, "(*)");
-                if (arg_type->kind == TYPE_FUNCTION)
+                if (get_inner_type(arg_type)->kind == TYPE_FUNCTION)
                 {
                     strcat(buf, "z_closure_T ");
                     strcat(buf, name);
@@ -4266,6 +5765,53 @@ char *find_similar_symbol(ParserContext *ctx, const char *name)
     return best_match ? xstrdup(best_match) : NULL;
 }
 
+static const char *get_closest_type_hint(ParserContext *ctx, const char *name)
+{
+    int best_dist = 4;
+    const char *best = NULL;
+
+    StructDef *def = ctx->struct_defs;
+    while (def)
+    {
+        int dist = levenshtein(name, def->name);
+        if (dist < best_dist)
+        {
+            best_dist = dist;
+            best = def->name;
+        }
+        def = def->next;
+    }
+
+    StructRef *er = ctx->parsed_enums_list;
+    while (er)
+    {
+        if (er->node && er->node->type == NODE_ENUM)
+        {
+            int dist = levenshtein(name, er->node->enm.name);
+            if (dist < best_dist)
+            {
+                best_dist = dist;
+                best = er->node->enm.name;
+            }
+        }
+        er = er->next;
+    }
+
+    TypeAlias *ta = ctx->type_aliases;
+    while (ta)
+    {
+        int dist = levenshtein(name, ta->alias);
+        if (dist < best_dist)
+        {
+            best_dist = dist;
+            best = ta->alias;
+        }
+        ta = ta->next;
+    }
+
+    return best;
+}
+
 void register_plugin(ParserContext *ctx, const char *name, const char *alias)
 {
     // Try to find existing (built-in) or already loaded plugin
@@ -4278,16 +5824,34 @@ void register_plugin(ParserContext *ctx, const char *name, const char *alias)
 
         if (!plugin)
         {
-            char path[1024];
+            char path[MAX_PATH_LEN];
             snprintf(path, sizeof(path), "%s%s", name, z_get_plugin_ext());
             plugin = zptr_load_plugin(path);
         }
 
         if (!plugin && !strchr(name, '/'))
         {
-            char path[1024];
+            char path[MAX_PATH_LEN];
             snprintf(path, sizeof(path), "%s%s%s", z_get_run_prefix(), name, z_get_plugin_ext());
             plugin = zptr_load_plugin(path);
+        }
+
+        // Fallback for system-wide plugins
+        if (!plugin)
+        {
+            char path[MAX_PATH_LEN];
+            // Try full name first
+            snprintf(path, sizeof(path), ZEN_SHARE_DIR "/plugins/%s%s", name, z_get_plugin_ext());
+            plugin = zptr_load_plugin(path);
+
+            // If it was a path like "plugins/name", try matching just the base "name" in system dir
+            if (!plugin && strchr(name, '/'))
+            {
+                const char *last_slash = strrchr(name, '/');
+                snprintf(path, sizeof(path), ZEN_SHARE_DIR "/plugins/%s%s", last_slash + 1,
+                         z_get_plugin_ext());
+                plugin = zptr_load_plugin(path);
+            }
         }
     }
 
@@ -4297,6 +5861,16 @@ void register_plugin(ParserContext *ctx, const char *name, const char *alias)
                 COLOR_RED "Error:" COLOR_RESET " Could not load plugin '%s'\n"
                           "       Tried built-ins and dynamic loading (.so)\n",
                 name);
+        if (g_config.mode_lsp)
+        {
+            // Register alias anyway to avoid redundant "Unknown plugin" noise
+            ImportedPlugin *p = xmalloc(sizeof(ImportedPlugin));
+            p->name = xstrdup(name);
+            p->alias = alias ? xstrdup(alias) : NULL;
+            p->next = ctx->imported_plugins;
+            ctx->imported_plugins = p;
+            return;
+        }
         exit(1);
     }
 
@@ -4347,14 +5921,35 @@ int validate_types(ParserContext *ctx)
     while (u)
     {
         ASTNode *def = find_struct_def(ctx, u->name);
-        const char *alias = find_type_alias(ctx, u->name);
-
-        if (!def && !alias)
+        if (!def)
         {
-            SelectiveImport *si = find_selective_import(ctx, u->name);
-            if (!si && !is_trait(u->name))
+            const char *alias = find_type_alias(ctx, u->name);
+            if (!alias)
             {
-                zwarn_at(u->location, "Unknown type '%s' (assuming external C struct)", u->name);
+                SelectiveImport *si = find_selective_import(ctx, u->name);
+                if (!si && !is_extern_symbol(ctx, u->name))
+                {
+                    if (!is_trait(u->name) && TYPE_UNKNOWN == find_primitive_kind(u->name))
+                    {
+                        if (!g_config.mode_lsp)
+                        {
+                            char msg[MAX_SHORT_MSG_LEN];
+                            snprintf(msg, sizeof(msg),
+                                     "Unknown type '%s' (assuming external C struct)", u->name);
+                            const char *hint = get_closest_type_hint(ctx, u->name);
+                            if (hint)
+                            {
+                                char help[MAX_MANGLED_NAME_LEN];
+                                snprintf(help, sizeof(help), "Did you mean '%s'?", hint);
+                                zwarn_with_suggestion(u->location, msg, help);
+                            }
+                            else
+                            {
+                                zwarn_at(u->location, "%s", msg);
+                            }
+                        }
+                    }
+                }
             }
         }
         u = u->next;
@@ -4386,6 +5981,8 @@ void propagate_drop_traits(ParserContext *ctx)
     while (changed)
     {
         changed = 0;
+
+        // Process regular structs
         StructRef *ref = ctx->parsed_structs_list;
         while (ref)
         {
@@ -4397,20 +5994,76 @@ void propagate_drop_traits(ParserContext *ctx)
                 while (field)
                 {
                     Type *ft = field->type_info;
-                    if (ft && ft->kind == TYPE_STRUCT && ft->name)
+                    if (ft)
                     {
-                        ASTNode *fdef = find_struct_def(ctx, ft->name);
-                        if (fdef && fdef->type_info && fdef->type_info->traits.has_drop)
+                        if (ft->kind == TYPE_VECTOR)
                         {
                             strct->type_info->traits.has_drop = 1;
                             changed = 1;
                             break;
+                        }
+                        if (ft->kind == TYPE_FUNCTION && ft->traits.has_drop && !ft->is_raw)
+                        {
+                            strct->type_info->traits.has_drop = 1;
+                            changed = 1;
+                            break;
+                        }
+                        if (ft->kind == TYPE_STRUCT && ft->name)
+                        {
+                            ASTNode *fdef = find_struct_def(ctx, ft->name);
+                            if (fdef && fdef->type_info && fdef->type_info->traits.has_drop)
+                            {
+                                strct->type_info->traits.has_drop = 1;
+                                changed = 1;
+                                break;
+                            }
                         }
                     }
                     field = field->next;
                 }
             }
             ref = ref->next;
+        }
+
+        // Process instantiated templates
+        ASTNode *ins = ctx->instantiated_structs;
+        while (ins)
+        {
+            if (ins->type == NODE_STRUCT && ins->type_info && !ins->type_info->traits.has_drop)
+            {
+                ASTNode *field = ins->strct.fields;
+                while (field)
+                {
+                    Type *ft = field->type_info;
+                    if (ft)
+                    {
+                        if (ft->kind == TYPE_VECTOR)
+                        {
+                            ins->type_info->traits.has_drop = 1;
+                            changed = 1;
+                            break;
+                        }
+                        if (ft->kind == TYPE_FUNCTION && ft->traits.has_drop && !ft->is_raw)
+                        {
+                            ins->type_info->traits.has_drop = 1;
+                            changed = 1;
+                            break;
+                        }
+                        if (ft->kind == TYPE_STRUCT && ft->name)
+                        {
+                            ASTNode *fdef = find_struct_def(ctx, ft->name);
+                            if (fdef && fdef->type_info && fdef->type_info->traits.has_drop)
+                            {
+                                ins->type_info->traits.has_drop = 1;
+                                changed = 1;
+                                break;
+                            }
+                        }
+                    }
+                    field = field->next;
+                }
+            }
+            ins = ins->next;
         }
     }
 }
@@ -4422,98 +6075,225 @@ const char *normalize_type_name(const char *name)
         return NULL;
     }
 
-    // Zen Primitives & Aliases
-    if (strcmp(name, "int") == 0)
+    return get_primitive_c_name(name);
+}
+
+int is_reserved_keyword(Token t)
+{
+    // Lexer-level keywords
+    switch (t.type)
     {
-        return "int32_t";
-    }
-    if (strcmp(name, "uint") == 0)
-    {
-        return "uint32_t";
-    }
-    if (strcmp(name, "short") == 0)
-    {
-        return "int16_t";
-    }
-    if (strcmp(name, "ushort") == 0)
-    {
-        return "uint16_t";
-    }
-    if (strcmp(name, "long") == 0)
-    {
-        return "int64_t";
-    }
-    if (strcmp(name, "ulong") == 0)
-    {
-        return "uint64_t";
+    case TOK_TEST:
+    case TOK_ASSERT:
+    case TOK_SIZEOF:
+    case TOK_DEF:
+    case TOK_DEFER:
+    case TOK_AUTOFREE:
+    case TOK_USE:
+    case TOK_TRAIT:
+    case TOK_IMPL:
+    case TOK_AND:
+    case TOK_OR:
+    case TOK_FOR:
+    case TOK_COMPTIME:
+    case TOK_UNION:
+    case TOK_ASM:
+    case TOK_VOLATILE:
+    case TOK_ASYNC:
+    case TOK_AWAIT:
+    case TOK_ALIAS:
+    case TOK_OPAQUE:
+        return 1;
+    default:
+        break;
     }
 
-    // Terse aliases
-    if (strcmp(name, "i8") == 0 || strcmp(name, "I8") == 0)
+    if (t.type == TOK_IDENT)
     {
-        return "int8_t";
-    }
-    if (strcmp(name, "u8") == 0 || strcmp(name, "U8") == 0)
-    {
-        return "uint8_t";
-    }
-    if (strcmp(name, "i16") == 0 || strcmp(name, "I16") == 0)
-    {
-        return "int16_t";
-    }
-    if (strcmp(name, "u16") == 0 || strcmp(name, "U16") == 0)
-    {
-        return "uint16_t";
-    }
-    if (strcmp(name, "i32") == 0 || strcmp(name, "I32") == 0)
-    {
-        return "int32_t";
-    }
-    if (strcmp(name, "u32") == 0 || strcmp(name, "U32") == 0)
-    {
-        return "uint32_t";
-    }
-    if (strcmp(name, "i64") == 0 || strcmp(name, "I64") == 0)
-    {
-        return "int64_t";
-    }
-    if (strcmp(name, "u64") == 0 || strcmp(name, "U64") == 0)
-    {
-        return "uint64_t";
+        static const char *pseudo_keywords[] = {
+            "let",   "var",      "static", "const",  "return", "if",    "else",   "while",
+            "break", "continue", "loop",   "repeat", "unless", "guard", "launch", "do",
+            "goto",  "plugin",   "fn",     "struct", "enum",   "self",  NULL};
+
+        for (int i = 0; pseudo_keywords[i] != NULL; i++)
+        {
+            if (t.len == (int)strlen(pseudo_keywords[i]) &&
+                strncmp(t.start, pseudo_keywords[i], t.len) == 0)
+            {
+                return 1;
+            }
+        }
     }
 
-    if (strcmp(name, "usize") == 0)
+    return 0;
+}
+
+void check_identifier(ParserContext *ctx, Token t)
+{
+    (void)ctx;
+    if (is_reserved_keyword(t))
     {
-        return "size_t";
+        char buf[MAX_SHORT_MSG_LEN];
+        char name[64];
+        int len = t.len < 63 ? t.len : 63;
+        strncpy(name, t.start, len);
+        name[len] = 0;
+        snprintf(buf, sizeof(buf), "Cannot use reserved keyword '%s' as an identifier", name);
+        zpanic_at(t, "%s", buf);
     }
-    if (strcmp(name, "isize") == 0)
+}
+
+static void audit_section_5(ParserContext *ctx, Scope *scope, const char *name,
+                            const char *link_name, Token tok)
+{
+    if (!scope || !name)
     {
-        return "ptrdiff_t";
+        return;
     }
-    if (strcmp(name, "byte") == 0)
+    if (strcmp(name, "it") == 0 || strcmp(name, "self") == 0)
     {
-        return "uint8_t";
-    }
-    if (strcmp(name, "rune") == 0)
-    {
-        return "int32_t";
-    }
-    if (strcmp(name, "i128") == 0 || strcmp(name, "I128") == 0)
-    {
-        return "__int128";
-    }
-    if (strcmp(name, "u128") == 0 || strcmp(name, "U128") == 0)
-    {
-        return "unsigned __int128";
-    }
-    if (strcmp(name, "u0") == 0 || strcmp(name, "U0") == 0)
-    {
-        return "void";
-    }
-    if (strcmp(name, "string") == 0)
-    {
-        return "char*";
+        return;
     }
 
-    return name;
+    Scope *p = scope;
+    int limit = (p == ctx->global_scope) ? 31 : 63;
+
+    while (p)
+    {
+        ZenSymbol *sh = p->symbols;
+        while (sh)
+        {
+            // Rule 5.3: Shadowing
+            if (p != scope && strcmp(sh->name, name) == 0 && !ctx->silent_warnings)
+            {
+                if (g_config.misra_mode)
+                {
+                    zerror_at(tok, "MISRA Rule 5.3");
+                }
+                else
+                {
+                    warn_shadowing(tok, name);
+                }
+            }
+
+            // Rules 5.1/5.2: Distinctness
+            if (g_config.misra_mode)
+            {
+                const char *actual_name = link_name ? link_name : name;
+                const char *sh_actual_name = sh->link_name ? sh->link_name : sh->name;
+
+                // For distinctness, we check if they are different names but collide
+                if (strcmp(sh_actual_name, actual_name) != 0)
+                {
+                    misra_check_identifier_collision(tok, sh_actual_name, actual_name, limit);
+                }
+            }
+
+            sh = sh->next;
+        }
+        p = p->parent;
+    }
+}
+
+static void sync_type_linkage(ParserContext *ctx, Type *t)
+{
+    if (!t)
+    {
+        return;
+    }
+    if ((t->kind == TYPE_STRUCT || t->kind == TYPE_ENUM) && !t->link_name && t->name)
+    {
+        ASTNode *def = find_struct_def(ctx, t->name);
+        if (def && def->link_name)
+        {
+            t->link_name = xstrdup(def->link_name);
+        }
+    }
+    if (t->inner)
+    {
+        sync_type_linkage(ctx, t->inner);
+    }
+    for (int i = 0; i < t->arg_count; i++)
+    {
+        sync_type_linkage(ctx, t->args[i]);
+    }
+}
+
+static void sync_link_names_recursive(ParserContext *ctx, ASTNode *node)
+{
+    if (!node)
+    {
+        return;
+    }
+
+    // Sync type_info if present
+    if (node->type_info)
+    {
+        sync_type_linkage(ctx, node->type_info);
+    }
+
+    // Node-specific sync
+    switch (node->type)
+    {
+    case NODE_FUNCTION:
+        if (node->func.ret_type_info)
+        {
+            sync_type_linkage(ctx, node->func.ret_type_info);
+        }
+        if (node->func.arg_types)
+        {
+            for (int i = 0; i < node->func.arg_count; i++)
+            {
+                sync_type_linkage(ctx, node->func.arg_types[i]);
+            }
+        }
+        sync_link_names_recursive(ctx, node->func.body);
+        break;
+    case NODE_STRUCT:
+        sync_link_names_recursive(ctx, node->strct.fields);
+        break;
+    case NODE_VAR_DECL:
+        sync_link_names_recursive(ctx, node->var_decl.init_expr);
+        break;
+    case NODE_BLOCK:
+        sync_link_names_recursive(ctx, node->block.statements);
+        break;
+    case NODE_IF:
+        sync_link_names_recursive(ctx, node->if_stmt.condition);
+        sync_link_names_recursive(ctx, node->if_stmt.then_body);
+        sync_link_names_recursive(ctx, node->if_stmt.else_body);
+        break;
+    case NODE_RETURN:
+        sync_link_names_recursive(ctx, node->ret.value);
+        break;
+    case NODE_EXPR_CALL:
+        sync_link_names_recursive(ctx, node->call.callee);
+        sync_link_names_recursive(ctx, node->call.args);
+        break;
+    case NODE_EXPR_BINARY:
+        sync_link_names_recursive(ctx, node->binary.left);
+        sync_link_names_recursive(ctx, node->binary.right);
+        break;
+    case NODE_EXPR_UNARY:
+        sync_link_names_recursive(ctx, node->unary.operand);
+        break;
+    case NODE_EXPR_MEMBER:
+        sync_link_names_recursive(ctx, node->member.target);
+        break;
+    case NODE_EXPR_CAST:
+        sync_link_names_recursive(ctx, node->cast.expr);
+        break;
+    case NODE_ROOT:
+        sync_link_names_recursive(ctx, node->root.children);
+        break;
+    default:
+        break;
+    }
+
+    sync_link_names_recursive(ctx, node->next);
+}
+
+void sync_all_link_names(ParserContext *ctx, ASTNode *root)
+{
+    sync_link_names_recursive(ctx, root);
 }

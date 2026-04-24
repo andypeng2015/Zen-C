@@ -1,5 +1,6 @@
 
 #include "parser.h"
+#include "../constants.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,83 +37,27 @@ static void auto_import_std_slice(ParserContext *ctx)
         t = t->next;
     }
 
-    // Try to find and import std/slice.zc
-    static const char *std_paths[] = {"std/slice.zc", "./std/slice.zc", NULL};
-    static const char *system_paths[] = {"/usr/local/share/zenc", "/usr/share/zenc", NULL};
-
-    char resolved_path[1024];
-    int found = 0;
-
-    // First, try relative to current file
-    if (g_current_filename)
+    // Resolve path to std/slice.zc
+    char *resolved = z_resolve_path("std/slice.zc", g_current_filename);
+    if (!resolved)
     {
-        char *current_dir = xstrdup(g_current_filename);
-        char *last_slash = z_path_last_sep(current_dir);
-        if (last_slash)
-        {
-            *last_slash = 0;
-            snprintf(resolved_path, sizeof(resolved_path), "%s/std/slice.zc", current_dir);
-            if (access(resolved_path, R_OK) == 0)
-            {
-                found = 1;
-            }
-        }
-        free(current_dir);
+        return; // Could not find slice.zc
     }
 
-    // Try relative paths
-    if (!found)
+    // Check if already imported by path
+    if (is_file_imported(ctx, resolved))
     {
-        for (int i = 0; std_paths[i] && !found; i++)
-        {
-            if (access(std_paths[i], R_OK) == 0)
-            {
-                strncpy(resolved_path, std_paths[i], sizeof(resolved_path) - 1);
-                resolved_path[sizeof(resolved_path) - 1] = '\0';
-                found = 1;
-            }
-        }
-    }
-
-    // Try system paths
-    if (!found)
-    {
-        for (int i = 0; system_paths[i] && !found; i++)
-        {
-            snprintf(resolved_path, sizeof(resolved_path), "%s/std/slice.zc", system_paths[i]);
-            if (access(resolved_path, R_OK) == 0)
-            {
-                found = 1;
-            }
-        }
-    }
-
-    if (!found)
-    {
-        return; // Could not find std/slice.zc, instantiate_generic will error
-    }
-
-    // Canonicalize path
-    char *real_fn = realpath(resolved_path, NULL);
-    if (real_fn)
-    {
-        strncpy(resolved_path, real_fn, sizeof(resolved_path) - 1);
-        resolved_path[sizeof(resolved_path) - 1] = '\0';
-        free(real_fn);
-    }
-
-    // Check if already imported
-    if (is_file_imported(ctx, resolved_path))
-    {
+        free(resolved);
         return;
     }
-    mark_file_imported(ctx, resolved_path);
+    mark_file_imported(ctx, resolved);
 
     // Load and parse the file
-    char *src = load_file(resolved_path);
+    char *src = load_file(resolved);
     if (!src)
     {
-        return; // Could not load file
+        free(resolved);
+        return;
     }
 
     Lexer i;
@@ -120,12 +65,13 @@ static void auto_import_std_slice(ParserContext *ctx)
 
     // Save and restore filename context
     char *saved_fn = g_current_filename;
-    g_current_filename = resolved_path;
+    g_current_filename = resolved;
 
     // Parse the slice module contents
     parse_program_nodes(ctx, &i);
 
     g_current_filename = saved_fn;
+    free(resolved);
 }
 
 static void check_assignment_condition(ASTNode *cond)
@@ -144,7 +90,7 @@ static void check_assignment_condition(ASTNode *cond)
     }
 }
 
-static char *normalize_raw_content(const char *content)
+char *normalize_raw_content(const char *content)
 {
     if (!content)
     {
@@ -160,10 +106,10 @@ static char *normalize_raw_content(const char *content)
     {
         if (*s == '\r')
         {
-            // Skip \r, we only want \n
             if (*(s + 1) == '\n')
             {
-                s++;
+                *d++ = '\n';
+                s += 2;
                 continue;
             }
             // Bare \r -> \n
@@ -189,7 +135,15 @@ ASTNode *parse_match(ParserContext *ctx, Lexer *l)
     Token t_brace = lexer_next(l);
     if (t_brace.type != TOK_LBRACE)
     {
-        zpanic_at(t_brace, "Expected { in match");
+        zpanic_at(t_brace, "Expected '{' in match");
+        if (ctx->is_fault_tolerant)
+        {
+            ASTNode *node = ast_create(NODE_MATCH);
+            node->token = start_token;
+            node->match_stmt.expr = expr;
+            node->match_stmt.cases = NULL;
+            return node;
+        }
     }
 
     ASTNode *h = 0, *tl = 0;
@@ -215,7 +169,8 @@ ASTNode *parse_match(ParserContext *ctx, Lexer *l)
         //   - Single value: 1
         //   - OR patterns: 1 || 2 or 1 or 2 or 1, 2
         //   - Range patterns: 1..5 or 1..=5 or 1..<5
-        char patterns_buf[1024];
+        size_t pat_cap = 1024;
+        char *patterns_buf = xmalloc(pat_cap);
         patterns_buf[0] = 0;
         int pattern_count = 0;
 
@@ -228,9 +183,9 @@ ASTNode *parse_match(ParserContext *ctx, Lexer *l)
             {
                 lexer_next(l); // eat ::
                 Token suffix = lexer_next(l);
-                char *tmp = xmalloc(strlen(p_str) + suffix.len + 2);
-                // Join with underscore: Result::Ok -> Result_Ok
-                sprintf(tmp, "%s_%.*s", p_str, suffix.len, suffix.start);
+                char *tmp = xmalloc(strlen(p_str) + suffix.len + 3);
+                // Join with underscore: Result::Ok -> Result__Ok
+                sprintf(tmp, "%s__%.*s", p_str, suffix.len, suffix.start);
                 free(p_str);
                 p_str = tmp;
             }
@@ -245,11 +200,18 @@ ASTNode *parse_match(ParserContext *ctx, Lexer *l)
                 char *end_str = token_strdup(end_tok);
 
                 // Build range pattern: "start..end" or "start..=end"
-                char *range_str = xmalloc(strlen(p_str) + strlen(end_str) + 4);
+                char *range_str = xmalloc(strlen(p_str) + strlen(end_str) + 5);
                 sprintf(range_str, "%s%s%s", p_str, is_inclusive ? "..=" : "..", end_str);
                 free(p_str);
                 free(end_str);
                 p_str = range_str;
+            }
+
+            size_t needed = strlen(patterns_buf) + strlen(p_str) + 4;
+            if (needed >= pat_cap)
+            {
+                pat_cap = pat_cap * 2 + needed;
+                patterns_buf = xrealloc(patterns_buf, pat_cap);
             }
 
             if (pattern_count > 0)
@@ -341,7 +303,21 @@ ASTNode *parse_match(ParserContext *ctx, Lexer *l)
 
         if (lexer_next(l).type != TOK_ARROW)
         {
-            zpanic_at(lexer_peek(l), "Expected =>");
+            zpanic_at(lexer_peek(l), "Expected => after match pattern");
+            if (ctx->is_fault_tolerant)
+            {
+                // Skip until next comma, RBRACE or ARROW
+                while (lexer_peek(l).type != TOK_RBRACE && lexer_peek(l).type != TOK_COMMA &&
+                       lexer_peek(l).type != TOK_EOF)
+                {
+                    lexer_next(l);
+                }
+                if (lexer_peek(l).type == TOK_COMMA)
+                {
+                    lexer_next(l);
+                }
+                continue;
+            }
         }
 
         // Create scope for the case to hold the binding
@@ -368,15 +344,15 @@ ASTNode *parse_match(ParserContext *ctx, Lexer *l)
                     while (v)
                     {
                         // Match by variant name (pattern suffix after last _)
-                        char *v_full =
-                            xmalloc(strlen(vreg->enum_name) + strlen(v->variant.name) + 2);
-                        sprintf(v_full, "%s_%s", vreg->enum_name, v->variant.name);
+                        int size = strlen(vreg->enum_name) + strlen(v->variant.name) + 2;
+                        char *v_full = xmalloc(size + 1);
+                        snprintf(v_full, size + 1, "%s__%s", vreg->enum_name, v->variant.name);
                         if (strcmp(v_full, pattern) == 0 && v->variant.payload)
                         {
                             // Found the variant, extract payload type
                             payload_type = v->variant.payload;
                             if (payload_type && payload_type->kind == TYPE_STRUCT &&
-                                strncmp(payload_type->name, "Tuple_", 6) == 0)
+                                strncmp(payload_type->name, "Tuple__", 7) == 0)
                             {
                                 is_tuple_payload = 1;
                                 ASTNode *tuple_def = find_struct_def(ctx, payload_type->name);
@@ -473,11 +449,11 @@ ASTNode *parse_match(ParserContext *ctx, Lexer *l)
                     }
                 }
 
-                add_symbol(ctx, binding, binding_type, binding_type_info);
+                add_symbol(ctx, binding, binding_type, binding_type_info, 0);
             }
         }
 
-        ASTNode *body;
+        ASTNode *body = NULL;
         Token pk = lexer_peek(l);
         if (pk.type == TOK_LBRACE)
         {
@@ -492,14 +468,28 @@ ASTNode *parse_match(ParserContext *ctx, Lexer *l)
         {
             body = parse_return(ctx, l);
         }
+        else if (ctx->is_fault_tolerant && (pk.type == TOK_RBRACE || pk.type == TOK_COMMA))
+        {
+            // Missing body after => - do NOT call parse_expression if it's the end of the block
+            // return a dummy node
+            body = ast_create(NODE_BLOCK);
+            body->token = pk;
+        }
         else
         {
             body = parse_expression(ctx, l);
         }
 
+        if (!body)
+        {
+            body = ast_create(NODE_BLOCK);
+            body->token = pk;
+        }
+
         exit_scope(ctx);
 
         ASTNode *c = ast_create(NODE_MATCH_CASE);
+        c->token = pk;
         c->match_case.pattern = pattern;
         c->match_case.binding_names = bindings;
         c->match_case.binding_count = binding_count;
@@ -531,9 +521,10 @@ ASTNode *parse_match(ParserContext *ctx, Lexer *l)
 
 ASTNode *parse_loop(ParserContext *ctx, Lexer *l)
 {
-    lexer_next(l);
+    Token tk = lexer_next(l);
     ASTNode *b = parse_block(ctx, l);
     ASTNode *n = ast_create(NODE_LOOP);
+    n->token = tk;
     n->loop_stmt.body = b;
     return n;
 }
@@ -563,7 +554,7 @@ ASTNode *parse_unless(ParserContext *ctx, Lexer *l)
 
 ASTNode *parse_guard(ParserContext *ctx, Lexer *l)
 {
-    lexer_next(l); // consume 'guard'
+    Token tk = lexer_next(l); // consume 'guard'
 
     // Parse the condition as an AST
     ASTNode *cond = parse_expression(ctx, l);
@@ -590,6 +581,7 @@ ASTNode *parse_guard(ParserContext *ctx, Lexer *l)
 
     // Create the node
     ASTNode *n = ast_create(NODE_GUARD);
+    n->token = tk;
     n->guard_stmt.condition = cond;
     n->guard_stmt.body = body;
     return n;
@@ -644,44 +636,60 @@ ASTNode *parse_asm(ParserContext *ctx, Lexer *l)
     lexer_next(l);
 
     // Parse assembly template strings
-    char *code = xmalloc(4096); // Buffer for assembly code
+    size_t code_cap = 4096;
+    char *code = xmalloc(code_cap); // Buffer for assembly code
     code[0] = 0;
 
     while (1)
     {
-        Token t = lexer_peek(l);
+        Token inner_t = lexer_peek(l);
 
         // Check for end of asm block or start of operands
-        if (t.type == TOK_RBRACE)
+        if (inner_t.type == TOK_RBRACE)
         {
             break;
         }
-        if (t.type == TOK_COLON)
+        if (inner_t.type == TOK_COLON)
         {
             break;
         }
 
-        // Support string literals for assembly instructions
-        if (t.type == TOK_STRING)
+        if (inner_t.type == TOK_STRING)
         {
             lexer_next(l);
             // Extract string content (strip quotes)
-            int str_len = t.len - 2;
-            if (strlen(code) > 0)
+            int str_len = inner_t.len - 2;
+            size_t current_len = strlen(code);
+            size_t needed = current_len + str_len + 5; // + newline + null + safety
+            if (needed >= code_cap)
+            {
+                code_cap = code_cap * 2 + needed;
+                code = xrealloc(code, code_cap);
+            }
+
+            if (current_len > 0)
             {
                 strcat(code, "\n");
             }
-            strncat(code, t.start + 1, str_len);
+            strncat(code, inner_t.start + 1, str_len);
         }
         // Also support bare identifiers for simple instructions like 'nop', 'pause'
-        else if (t.type == TOK_IDENT)
+        else if (inner_t.type == TOK_IDENT)
         {
             lexer_next(l);
-            if (strlen(code) > 0)
+            size_t current_len = strlen(code);
+            size_t needed = current_len + inner_t.len + 5;
+            if (needed >= code_cap)
+            {
+                code_cap = code_cap * 2 + needed;
+                code = xrealloc(code, code_cap);
+            }
+
+            if (current_len > 0)
             {
                 strcat(code, "\n");
             }
-            strncat(code, t.start, t.len);
+            strncat(code, inner_t.start, inner_t.len);
 
             // Check for instruction arguments
             while (lexer_peek(l).type != TOK_RBRACE && lexer_peek(l).type != TOK_COLON)
@@ -698,16 +706,33 @@ ASTNode *parse_asm(ParserContext *ctx, Lexer *l)
                 if (arg.type == TOK_LBRACE)
                 {
                     lexer_next(l);
+
+                    if (strlen(code) + 2 >= code_cap)
+                    {
+                        code_cap *= 2;
+                        code = xrealloc(code, code_cap);
+                    }
                     strcat(code, "{");
+
                     // Consume until }
                     while (lexer_peek(l).type != TOK_RBRACE && lexer_peek(l).type != TOK_EOF)
                     {
                         Token sub = lexer_next(l);
+                        if (strlen(code) + sub.len + 1 >= code_cap)
+                        {
+                            code_cap = code_cap * 2 + sub.len;
+                            code = xrealloc(code, code_cap);
+                        }
                         strncat(code, sub.start, sub.len);
                     }
                     if (lexer_peek(l).type == TOK_RBRACE)
                     {
                         lexer_next(l);
+                        if (strlen(code) + 2 >= code_cap)
+                        {
+                            code_cap *= 2;
+                            code = xrealloc(code, code_cap);
+                        }
                         strcat(code, "}");
                     }
                     continue;
@@ -776,21 +801,21 @@ ASTNode *parse_asm(ParserContext *ctx, Lexer *l)
 
         while (1)
         {
-            Token t = lexer_peek(l);
-            if (t.type == TOK_COLON || t.type == TOK_RBRACE)
+            Token inner_t = lexer_peek(l);
+            if (inner_t.type == TOK_COLON || inner_t.type == TOK_RBRACE)
             {
                 break;
             }
-            if (t.type == TOK_COMMA)
+            if (inner_t.type == TOK_COMMA)
             {
                 lexer_next(l);
                 continue;
             }
 
             // Parse out(var) or inout(var)
-            if (t.type == TOK_IDENT)
+            if (inner_t.type == TOK_IDENT)
             {
-                char *mode = token_strdup(t);
+                char *mode = token_strdup(inner_t);
                 lexer_next(l);
 
                 if (lexer_peek(l).type != TOK_LPAREN)
@@ -834,19 +859,19 @@ ASTNode *parse_asm(ParserContext *ctx, Lexer *l)
 
         while (1)
         {
-            Token t = lexer_peek(l);
-            if (t.type == TOK_COLON || t.type == TOK_RBRACE)
+            Token inner_t = lexer_peek(l);
+            if (inner_t.type == TOK_COLON || inner_t.type == TOK_RBRACE)
             {
                 break;
             }
-            if (t.type == TOK_COMMA)
+            if (inner_t.type == TOK_COMMA)
             {
                 lexer_next(l);
                 continue;
             }
 
             // Parse in(var)
-            if (t.type == TOK_IDENT && strncmp(t.start, "in", 2) == 0)
+            if (inner_t.type == TOK_IDENT && strncmp(inner_t.start, "in", 2) == 0)
             {
                 lexer_next(l);
 
@@ -890,19 +915,19 @@ ASTNode *parse_asm(ParserContext *ctx, Lexer *l)
 
         while (1)
         {
-            Token t = lexer_peek(l);
-            if (t.type == TOK_RBRACE)
+            Token inner_t = lexer_peek(l);
+            if (inner_t.type == TOK_RBRACE)
             {
                 break;
             }
-            if (t.type == TOK_COMMA)
+            if (inner_t.type == TOK_COMMA)
             {
                 lexer_next(l);
                 continue;
             }
 
             // check for clobber("...")
-            if (t.type == TOK_IDENT && strncmp(t.start, "clobber", 7) == 0)
+            if (inner_t.type == TOK_IDENT && strncmp(inner_t.start, "clobber", 7) == 0)
             {
                 lexer_next(l); // eat clobber
                 if (lexer_peek(l).type != TOK_LPAREN)
@@ -963,15 +988,13 @@ ASTNode *parse_test(ParserContext *ctx, Lexer *l)
 {
     lexer_next(l); // eat 'test'
     Token t = lexer_next(l);
-    if (t.type != TOK_STRING)
+    if (t.type != TOK_STRING && t.type != TOK_RAW_STRING)
     {
         zpanic_at(t, "Test name must be a string literal");
     }
 
     // Strip quotes for AST storage
-    char *name = xmalloc(t.len);
-    strncpy(name, t.start + 1, t.len - 2);
-    name[t.len - 2] = 0;
+    char *name = token_get_string_content(t);
 
     ASTNode *body = parse_block(ctx, l);
 
@@ -983,7 +1006,7 @@ ASTNode *parse_test(ParserContext *ctx, Lexer *l)
 
 ASTNode *parse_assert(ParserContext *ctx, Lexer *l)
 {
-    lexer_next(l); // assert
+    Token tk = lexer_next(l); // assert
     if (lexer_peek(l).type == TOK_LPAREN)
     {
         lexer_next(l); // optional paren? usually yes
@@ -1015,6 +1038,7 @@ ASTNode *parse_assert(ParserContext *ctx, Lexer *l)
     }
 
     ASTNode *n = ast_create(NODE_ASSERT);
+    n->token = tk;
     n->assert_stmt.condition = cond;
     n->assert_stmt.message = msg;
     return n;
@@ -1034,7 +1058,7 @@ ASTNode *parse_return(ParserContext *ctx, Lexer *l)
 
     int handled = 0;
 
-    if (curr_func_ret && strncmp(curr_func_ret, "Tuple_", 6) == 0 &&
+    if (curr_func_ret && strncmp(curr_func_ret, "Tuple__", 7) == 0 &&
         lexer_peek(l).type == TOK_LPAREN)
     {
 
@@ -1077,10 +1101,8 @@ ASTNode *parse_return(ParserContext *ctx, Lexer *l)
 
         if (is_tuple_lit)
         {
-            char *code = parse_tuple_literal(ctx, l, curr_func_ret);
-            ASTNode *raw = ast_create(NODE_RAW_STMT);
-            raw->raw_stmt.content = code;
-            n->ret.value = raw;
+            n->ret.value = parse_tuple_expression(ctx, l, curr_func_ret, NULL);
+            n->ret.value->token = return_token;
             handled = 1;
         }
     }
@@ -1106,7 +1128,7 @@ ASTNode *parse_return(ParserContext *ctx, Lexer *l)
 
 ASTNode *parse_if(ParserContext *ctx, Lexer *l)
 {
-    lexer_next(l); // eat if
+    Token if_token = lexer_next(l); // eat if
     ASTNode *cond = parse_expression(ctx, l);
     check_assignment_condition(cond);
 
@@ -1117,6 +1139,10 @@ ASTNode *parse_if(ParserContext *ctx, Lexer *l)
     }
     else
     {
+        if (g_config.misra_mode)
+        {
+            zerror_at(lexer_peek(l), "MISRA Rule 15.6");
+        }
         // Single statement: Wrap in scope + block
         enter_scope(ctx);
         ASTNode *s = parse_statement(ctx, l);
@@ -1140,6 +1166,10 @@ ASTNode *parse_if(ParserContext *ctx, Lexer *l)
         }
         else
         {
+            if (g_config.misra_mode)
+            {
+                zerror_at(lexer_peek(l), "MISRA Rule 15.6");
+            }
             // Single statement else
             enter_scope(ctx);
             ASTNode *s = parse_statement(ctx, l);
@@ -1149,6 +1179,7 @@ ASTNode *parse_if(ParserContext *ctx, Lexer *l)
         }
     }
     ASTNode *n = ast_create(NODE_IF);
+    n->token = if_token;
     n->if_stmt.condition = cond;
     n->if_stmt.then_body = then_b;
     n->if_stmt.else_body = else_b;
@@ -1157,7 +1188,7 @@ ASTNode *parse_if(ParserContext *ctx, Lexer *l)
 
 ASTNode *parse_while(ParserContext *ctx, Lexer *l)
 {
-    lexer_next(l);
+    Token tk = lexer_next(l);
     ASTNode *cond = parse_expression(ctx, l);
     check_assignment_condition(cond);
 
@@ -1175,9 +1206,14 @@ ASTNode *parse_while(ParserContext *ctx, Lexer *l)
     }
     else
     {
+        if (g_config.misra_mode)
+        {
+            zerror_at(lexer_peek(l), "MISRA Rule 15.6: compound-statement body");
+        }
         body = parse_statement(ctx, l);
     }
     ASTNode *n = ast_create(NODE_WHILE);
+    n->token = tk;
     n->while_stmt.condition = cond;
     n->while_stmt.body = body;
     return n;
@@ -1185,38 +1221,51 @@ ASTNode *parse_while(ParserContext *ctx, Lexer *l)
 
 ASTNode *parse_for(ParserContext *ctx, Lexer *l)
 {
-    lexer_next(l);
+    Token for_token = lexer_next(l);
 
-    // Range Loop: for i in 0..10
     if (lexer_peek(l).type == TOK_IDENT)
     {
         int saved_pos = l->pos;
         Token var = lexer_next(l);
+
+        char *enum_idx_name = NULL;
+        Token val_tok = {0};
+        if (lexer_peek(l).type == TOK_COMMA)
+        {
+            lexer_next(l);
+            val_tok = lexer_next(l);
+            enum_idx_name = xmalloc(var.len + 1);
+            strncpy(enum_idx_name, var.start, var.len);
+            enum_idx_name[var.len] = 0;
+            var = val_tok;
+        }
+
         Token in_tok = lexer_next(l);
 
         if (in_tok.type == TOK_IDENT && strncmp(in_tok.start, "in", 2) == 0)
         {
             ASTNode *start_expr = parse_expression(ctx, l);
-            // Check for Range Loop (.. or ..= or ..<)
-            ZenTokenType next_tok = lexer_peek(l).type;
+            Token tk = lexer_peek(l);
+            ZenTokenType next_tok = tk.type;
             if (next_tok == TOK_DOTDOT || next_tok == TOK_DOTDOT_LT || next_tok == TOK_DOTDOT_EQ)
             {
                 int is_inclusive = 0;
                 if (next_tok == TOK_DOTDOT || next_tok == TOK_DOTDOT_LT)
                 {
-                    lexer_next(l); // consume .. or ..<
+                    lexer_next(l);
                 }
                 else if (next_tok == TOK_DOTDOT_EQ)
                 {
                     is_inclusive = 1;
-                    lexer_next(l); // consume ..=
+                    lexer_next(l);
                 }
 
-                if (1) // Block to keep scope for variables
+                if (1)
                 {
                     ASTNode *end_expr = parse_expression(ctx, l);
 
                     ASTNode *n = ast_create(NODE_FOR_RANGE);
+                    n->token = for_token;
                     n->for_range.var_name = xmalloc(var.len + 1);
                     strncpy(n->for_range.var_name, var.start, var.len);
                     n->for_range.var_name[var.len] = 0;
@@ -1253,46 +1302,106 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
                     }
 
                     enter_scope(ctx);
-                    add_symbol(ctx, n->for_range.var_name, "int", type_new(TYPE_INT));
+                    add_symbol(ctx, n->for_range.var_name, "int", type_new(TYPE_INT), 0);
+                    if (enum_idx_name)
+                    {
+                        add_symbol(ctx, enum_idx_name, "int", type_new(TYPE_INT), 0);
+                    }
 
+                    ASTNode *user_body = NULL;
                     if (lexer_peek(l).type == TOK_LBRACE)
                     {
-                        n->for_range.body = parse_block(ctx, l);
+                        user_body = parse_block(ctx, l);
                     }
                     else
                     {
-                        n->for_range.body = parse_statement(ctx, l);
+                        if (g_config.misra_mode)
+                        {
+                            zerror_at(lexer_peek(l), "MISRA Rule 15.6: compound-statement body");
+                        }
+                        user_body = parse_statement(ctx, l);
                     }
                     exit_scope(ctx);
 
-                    return n;
+                    if (enum_idx_name)
+                    {
+                        ASTNode *idx_decl = ast_create(NODE_VAR_DECL);
+                        idx_decl->token = tk;
+                        idx_decl->var_decl.name = xstrdup("__zc_enum_idx");
+                        idx_decl->var_decl.type_str = xstrdup("int");
+                        idx_decl->var_decl.type_info = type_new(TYPE_INT);
+                        ASTNode *zero_lit = ast_create(NODE_EXPR_LITERAL);
+                        zero_lit->literal.type_kind = LITERAL_INT;
+                        zero_lit->literal.int_val = 0;
+                        zero_lit->literal.string_val = xstrdup("0");
+                        idx_decl->var_decl.init_expr = zero_lit;
+
+                        ASTNode *idx_bind = ast_create(NODE_VAR_DECL);
+                        idx_bind->token = tk;
+                        idx_bind->var_decl.name = enum_idx_name;
+                        idx_bind->var_decl.type_str = xstrdup("int");
+                        idx_bind->var_decl.type_info = type_new(TYPE_INT);
+                        ASTNode *idx_ref = ast_create(NODE_EXPR_VAR);
+                        idx_ref->var_ref.name = xstrdup("__zc_enum_idx");
+                        idx_bind->var_decl.init_expr = idx_ref;
+
+                        ASTNode *idx_inc = ast_create(NODE_EXPR_UNARY);
+                        idx_inc->unary.op = xstrdup("++");
+                        ASTNode *idx_ref2 = ast_create(NODE_EXPR_VAR);
+                        idx_ref2->var_ref.name = xstrdup("__zc_enum_idx");
+                        idx_inc->unary.operand = idx_ref2;
+
+                        ASTNode *new_body = ast_create(NODE_BLOCK);
+                        idx_bind->next = user_body;
+                        if (user_body && user_body->type == NODE_BLOCK)
+                        {
+                            ASTNode *last = user_body->block.statements;
+                            if (last)
+                            {
+                                while (last->next)
+                                {
+                                    last = last->next;
+                                }
+                                last->next = idx_inc;
+                            }
+                            idx_bind->next = user_body->block.statements;
+                            user_body->block.statements = idx_bind;
+                            new_body = user_body;
+                        }
+                        else
+                        {
+                            if (user_body)
+                            {
+                                user_body->next = idx_inc;
+                            }
+                            idx_bind->next = user_body;
+                            new_body->block.statements = idx_bind;
+                        }
+
+                        n->for_range.body = new_body;
+
+                        ASTNode *outer = ast_create(NODE_BLOCK);
+                        idx_decl->next = n;
+                        outer->block.statements = idx_decl;
+                        return outer;
+                    }
+                    else
+                    {
+                        n->for_range.body = user_body;
+                        return n;
+                    }
                 }
             }
             else
             {
-                // Iterator Loop: for x in obj
-                // Desugar to:
-                /*
-                   {
-                       var __it = obj.iterator();
-                       while (true) {
-                           var __opt = __it.next();
-                           if (__opt.is_none()) break;
-                           var x = __opt.unwrap();
-                           <body...>
-                       }
-                   }
-                */
-
                 char *var_name = xmalloc(var.len + 1);
                 strncpy(var_name, var.start, var.len);
                 var_name[var.len] = 0;
 
                 ASTNode *obj_expr = start_expr;
                 char *iter_method = "iterator";
-                ASTNode *slice_decl = NULL; // Track if we need to add a slice declaration
+                ASTNode *slice_decl = NULL;
 
-                // Check for reference iteration: for x in &vec
                 if (obj_expr->type == NODE_EXPR_UNARY && obj_expr->unary.op &&
                     strcmp(obj_expr->unary.op, "&") == 0)
                 {
@@ -1300,38 +1409,35 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
                     iter_method = "iter_ref";
                 }
 
-                // Check for array iteration: wrap with Slice<T>::from_array
                 if (obj_expr->type_info && obj_expr->type_info->kind == TYPE_ARRAY &&
                     obj_expr->type_info->array_size > 0)
                 {
-                    // Create a var decl for the slice
                     slice_decl = ast_create(NODE_VAR_DECL);
+                    slice_decl->token = tk;
                     slice_decl->var_decl.name = xstrdup("__zc_arr_slice");
 
-                    // Build type string: Slice<elem_type>
                     char *elem_type_str = type_to_string(obj_expr->type_info->inner);
-                    char slice_type[256];
-                    sprintf(slice_type, "Slice<%s>", elem_type_str);
+                    char slice_type[MAX_TYPE_NAME_LEN];
+                    snprintf(slice_type, sizeof(slice_type), "Slice<%s>", elem_type_str);
                     slice_decl->var_decl.type_str = xstrdup(slice_type);
 
                     ASTNode *from_array_call = ast_create(NODE_EXPR_CALL);
+                    from_array_call->token = tk;
                     ASTNode *static_method = ast_create(NODE_EXPR_VAR);
 
-                    // The function name for static methods is Type::method format
-                    char func_name[512];
-                    snprintf(func_name, 511, "%s::from_array", slice_type);
+                    char func_name[MAX_FUNC_NAME_LEN];
+                    snprintf(func_name, sizeof(func_name), "Slice__%s__from_array", elem_type_str);
                     static_method->var_ref.name = xstrdup(func_name);
 
                     from_array_call->call.callee = static_method;
 
-                    // Create arguments
                     ASTNode *arr_addr = ast_create(NODE_EXPR_UNARY);
                     arr_addr->unary.op = xstrdup("&");
                     arr_addr->unary.operand = obj_expr;
 
                     ASTNode *arr_cast = ast_create(NODE_EXPR_CAST);
-                    char cast_type[256];
-                    sprintf(cast_type, "%s*", elem_type_str);
+                    char cast_type[MAX_TYPE_NAME_LEN];
+                    snprintf(cast_type, sizeof(cast_type), "%s*", elem_type_str);
                     arr_cast->cast.target_type = xstrdup(cast_type);
                     arr_cast->cast.expr = arr_addr;
 
@@ -1339,7 +1445,7 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
                     size_arg->literal.type_kind = LITERAL_INT;
                     size_arg->literal.int_val = obj_expr->type_info->array_size;
                     char size_buf[32];
-                    sprintf(size_buf, "%d", obj_expr->type_info->array_size);
+                    snprintf(size_buf, sizeof(size_buf), "%d", obj_expr->type_info->array_size);
                     size_arg->literal.string_val = xstrdup(size_buf);
 
                     arr_cast->next = size_arg;
@@ -1348,57 +1454,54 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
 
                     slice_decl->var_decl.init_expr = from_array_call;
 
-                    // Manually trigger generic instantiation for Slice<T>
-                    // This ensures that Slice_int, Slice_float, etc. structures are generated
-                    // First, ensure std/slice.zc is imported (auto-import if needed)
                     auto_import_std_slice(ctx);
                     Token dummy_tok = {0};
                     instantiate_generic(ctx, "Slice", elem_type_str, elem_type_str, dummy_tok);
 
-                    // Instantiate SliceIter and Option too for the loop logic
-                    char iter_type[256];
+                    char iter_type[MAX_TYPE_NAME_LEN];
                     sprintf(iter_type, "SliceIter<%s>", elem_type_str);
                     instantiate_generic(ctx, "SliceIter", elem_type_str, elem_type_str, dummy_tok);
 
-                    char option_type[256];
+                    char option_type[MAX_TYPE_NAME_LEN];
                     sprintf(option_type, "Option<%s>", elem_type_str);
                     instantiate_generic(ctx, "Option", elem_type_str, elem_type_str, dummy_tok);
 
-                    // Replace obj_expr with a reference to the slice variable
                     ASTNode *slice_ref = ast_create(NODE_EXPR_VAR);
                     slice_ref->var_ref.name = xstrdup("__zc_arr_slice");
-                    slice_ref->resolved_type =
-                        xstrdup(slice_type); // Explicitly set type for codegen
+                    slice_ref->resolved_type = xstrdup(slice_type);
                     obj_expr = slice_ref;
 
                     free(elem_type_str);
                 }
 
-                // var __it = obj.iterator();
                 ASTNode *it_decl = ast_create(NODE_VAR_DECL);
+                it_decl->token = tk;
                 it_decl->var_decl.name = xstrdup("__it");
-                it_decl->var_decl.type_str = NULL; // inferred
+                it_decl->var_decl.type_str = NULL;
 
-                // obj.iterator() or obj.iter_ref()
                 ASTNode *call_iter = ast_create(NODE_EXPR_CALL);
                 ASTNode *memb_iter = ast_create(NODE_EXPR_MEMBER);
                 memb_iter->member.target = obj_expr;
                 memb_iter->member.field = xstrdup(iter_method);
+                memb_iter->token = tk;
+                call_iter->token = tk;
                 call_iter->call.callee = memb_iter;
                 call_iter->call.args = NULL;
                 call_iter->call.arg_count = 0;
 
                 it_decl->var_decl.init_expr = call_iter;
 
-                // while(true)
-                ASTNode *while_loop = ast_create(NODE_WHILE);
+                ASTNode *while_loop = ast_create(NODE_FOR);
                 ASTNode *true_lit = ast_create(NODE_EXPR_LITERAL);
-                true_lit->literal.type_kind = LITERAL_INT; // Treated as bool in conditions
+                true_lit->literal.type_kind = LITERAL_INT;
                 true_lit->literal.int_val = 1;
                 true_lit->literal.string_val = xstrdup("1");
-                while_loop->while_stmt.condition = true_lit;
+                true_lit->token = tk;
+                while_loop->token = tk;
+                while_loop->for_stmt.condition = true_lit;
 
                 ASTNode *loop_body = ast_create(NODE_BLOCK);
+                loop_body->token = tk;
                 ASTNode *stmts_head = NULL;
                 ASTNode *stmts_tail = NULL;
 
@@ -1416,8 +1519,95 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
 
                 char *iter_type_ptr = NULL;
                 char *option_type_ptr = NULL;
+                char *u_type = NULL;
+                char *inner = NULL;
 
-                if (slice_decl)
+                char *coll_type = infer_type(ctx, start_expr);
+                if (coll_type)
+                {
+                    char *t_start = strchr(coll_type, '<');
+                    if (t_start)
+                    {
+                        char *t_end = strrchr(coll_type, '>');
+                        if (t_end)
+                        {
+                            int len = t_end - t_start - 1;
+                            inner = xmalloc(len + 1);
+                            strncpy(inner, t_start + 1, len);
+                            inner[len] = 0;
+                        }
+                    }
+                    else
+                    {
+                        // Try mangled name Vec__T or Slice__T
+                        char *m_start = strstr(coll_type, "__");
+                        if (m_start)
+                        {
+                            m_start += 2;
+                            char *m_end = strchr(m_start, '*');
+                            if (!m_end)
+                            {
+                                m_end = m_start + strlen(m_start);
+                            }
+                            int len = m_end - m_start;
+                            inner = xmalloc(len + 1);
+                            strncpy(inner, m_start, len);
+                            inner[len] = 0;
+                        }
+                    }
+
+                    if (inner)
+                    {
+                        // Default inference: if name contains 'Ref', assume pointer.
+                        u_type = xmalloc(strlen(inner) + 16);
+                        if (strchr(coll_type, '&') || (coll_type[0] == '&') ||
+                            (strchr(coll_type, '*')) || strstr(coll_type, "Ref"))
+                        {
+                            sprintf(u_type, "%s*", inner);
+                        }
+                        else
+                        {
+                            strcpy(u_type, inner);
+                        }
+
+                        // Specialization for common collections
+                        if (strstr(coll_type, "Map"))
+                        {
+                            char *old_u = u_type;
+                            u_type = xmalloc(strlen(inner) + 32);
+                            sprintf(u_type, "MapEntry<%s>", inner);
+                            if (old_u)
+                            {
+                                free(old_u);
+                            }
+
+                            option_type_ptr = xmalloc(strlen(inner) + 128);
+                            sprintf(option_type_ptr, "MapIterResult<%s>", inner);
+                        }
+                        else if (strstr(coll_type, "Vec") || strstr(coll_type, "Slice"))
+                        {
+                            option_type_ptr = xmalloc(strlen(inner) + 128);
+                            if (strchr(coll_type, '&') || (coll_type[0] == '&') ||
+                                (strchr(coll_type, '*')) || strstr(coll_type, "Ref"))
+                            {
+                                sprintf(option_type_ptr, "VecIterResult<%s>", inner);
+                            }
+                            else
+                            {
+                                sprintf(option_type_ptr, "Option<%s>", u_type);
+                            }
+                        }
+                        else
+                        {
+                            option_type_ptr = xmalloc(strlen(u_type) + 64);
+                            sprintf(option_type_ptr, "Option<%s>", u_type);
+                        }
+
+                        free(inner);
+                    }
+                }
+
+                if (slice_decl && !u_type)
                 {
                     char *slice_t = slice_decl->var_decl.type_str;
                     char *start = strchr(slice_t, '<');
@@ -1431,11 +1621,14 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
                             strncpy(elem, start + 1, len);
                             elem[len] = 0;
 
+                            u_type = xmalloc(len + 8);
+                            strcpy(u_type, elem);
+
                             iter_type_ptr = xmalloc(256);
-                            sprintf(iter_type_ptr, "SliceIter<%s>", elem);
+                            snprintf(iter_type_ptr, 256, "SliceIter<%s>", elem);
 
                             option_type_ptr = xmalloc(256);
-                            sprintf(option_type_ptr, "Option<%s>", elem);
+                            snprintf(option_type_ptr, 256, "Option<%s>", elem);
 
                             free(elem);
                         }
@@ -1444,6 +1637,7 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
 
                 // var __opt = __it.next();
                 ASTNode *opt_decl = ast_create(NODE_VAR_DECL);
+                opt_decl->token = tk;
                 opt_decl->var_decl.name = xstrdup("__opt");
                 opt_decl->var_decl.type_str = NULL;
 
@@ -1458,6 +1652,8 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
                 }
                 memb_next->member.target = it_ref;
                 memb_next->member.field = xstrdup("next");
+                memb_next->token = tk;
+                call_next->token = tk;
                 call_next->call.callee = memb_next;
 
                 opt_decl->var_decl.init_expr = call_next;
@@ -1474,22 +1670,30 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
                 }
                 memb_is_none->member.target = opt_ref1;
                 memb_is_none->member.field = xstrdup("is_none");
+                memb_is_none->token = tk;
+                call_is_none->token = tk;
                 call_is_none->call.callee = memb_is_none;
                 call_is_none->call.args = NULL;
                 call_is_none->call.arg_count = 0;
 
                 // if (__opt.is_none()) break;
                 ASTNode *if_break = ast_create(NODE_IF);
+                if_break->token = tk;
                 if_break->if_stmt.condition = call_is_none;
-                ASTNode *break_stmt = ast_create(NODE_BREAK);
-                if_break->if_stmt.then_body = break_stmt;
+
+                ASTNode *break_blk = ast_create(NODE_BLOCK);
+                break_blk->block.statements = ast_create(NODE_BREAK);
+                break_blk->block.statements->token = tk;
+
+                if_break->if_stmt.then_body = break_blk;
                 if_break->if_stmt.else_body = NULL;
                 APPEND_STMT(if_break);
 
                 // var <user_var> = __opt.unwrap();
                 ASTNode *user_var_decl = ast_create(NODE_VAR_DECL);
+                user_var_decl->token = tk;
                 user_var_decl->var_decl.name = var_name;
-                user_var_decl->var_decl.type_str = NULL;
+                user_var_decl->var_decl.type_str = u_type;
 
                 // __opt.unwrap()
                 ASTNode *call_unwrap = ast_create(NODE_EXPR_CALL);
@@ -1502,16 +1706,37 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
                 }
                 memb_unwrap->member.target = opt_ref2;
                 memb_unwrap->member.field = xstrdup("unwrap");
+                memb_unwrap->token = tk;
+                call_unwrap->token = tk;
                 call_unwrap->call.callee = memb_unwrap;
                 call_unwrap->call.args = NULL;
                 call_unwrap->call.arg_count = 0;
 
                 user_var_decl->var_decl.init_expr = call_unwrap;
+
+                // If enumerated, bind idx before user_var
+                if (enum_idx_name)
+                {
+                    ASTNode *idx_bind = ast_create(NODE_VAR_DECL);
+                    idx_bind->token = tk;
+                    idx_bind->var_decl.name = enum_idx_name;
+                    idx_bind->var_decl.type_str = xstrdup("int");
+                    idx_bind->var_decl.type_info = type_new(TYPE_INT);
+                    ASTNode *idx_ref = ast_create(NODE_EXPR_VAR);
+                    idx_ref->var_ref.name = xstrdup("__zc_enum_idx");
+                    idx_bind->var_decl.init_expr = idx_ref;
+                    APPEND_STMT(idx_bind);
+                }
+
                 APPEND_STMT(user_var_decl);
 
                 // User body statements
                 enter_scope(ctx);
-                add_symbol(ctx, var_name, NULL, NULL);
+                add_symbol(ctx, var_name, u_type, NULL, 0);
+                if (enum_idx_name)
+                {
+                    add_symbol(ctx, enum_idx_name, "int", type_new(TYPE_INT), 0);
+                }
 
                 // Body block
                 ASTNode *stmt = parse_statement(ctx, l);
@@ -1527,23 +1752,68 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
                 // Append user body statements to our loop body
                 APPEND_STMT(user_body_node);
 
+                // If enumerated, set __zc_enum_idx++ as the for-loop step
+                if (enum_idx_name)
+                {
+                    ASTNode *idx_inc = ast_create(NODE_EXPR_UNARY);
+                    idx_inc->unary.op = xstrdup("++");
+                    ASTNode *idx_ref3 = ast_create(NODE_EXPR_VAR);
+                    idx_ref3->var_ref.name = xstrdup("__zc_enum_idx");
+                    idx_inc->unary.operand = idx_ref3;
+                    while_loop->for_stmt.step = idx_inc;
+                }
+
                 loop_body->block.statements = stmts_head;
-                while_loop->while_stmt.body = loop_body;
+                while_loop->for_stmt.body = loop_body;
 
                 // Wrap entire thing in a block to scope __it (and __zc_arr_slice if present)
                 ASTNode *outer_block = ast_create(NODE_BLOCK);
+
+                // If enumerated, add __zc_enum_idx decl to the chain
+                ASTNode *enum_idx_decl_node = NULL;
+                if (enum_idx_name)
+                {
+                    enum_idx_decl_node = ast_create(NODE_VAR_DECL);
+                    enum_idx_decl_node->token = tk;
+                    enum_idx_decl_node->var_decl.name = xstrdup("__zc_enum_idx");
+                    enum_idx_decl_node->var_decl.type_str = xstrdup("int");
+                    enum_idx_decl_node->var_decl.type_info = type_new(TYPE_INT);
+                    ASTNode *zero_lit = ast_create(NODE_EXPR_LITERAL);
+                    zero_lit->literal.type_kind = LITERAL_INT;
+                    zero_lit->literal.int_val = 0;
+                    zero_lit->literal.string_val = xstrdup("0");
+                    enum_idx_decl_node->var_decl.init_expr = zero_lit;
+                }
+
                 if (slice_decl)
                 {
-                    // Chain: slice_decl -> it_decl -> while_loop
-                    slice_decl->next = it_decl;
-                    it_decl->next = while_loop;
-                    outer_block->block.statements = slice_decl;
+                    if (enum_idx_decl_node)
+                    {
+                        enum_idx_decl_node->next = slice_decl;
+                        slice_decl->next = it_decl;
+                        it_decl->next = while_loop;
+                        outer_block->block.statements = enum_idx_decl_node;
+                    }
+                    else
+                    {
+                        slice_decl->next = it_decl;
+                        it_decl->next = while_loop;
+                        outer_block->block.statements = slice_decl;
+                    }
                 }
                 else
                 {
-                    // Chain: it_decl -> while_loop
-                    it_decl->next = while_loop;
-                    outer_block->block.statements = it_decl;
+                    if (enum_idx_decl_node)
+                    {
+                        enum_idx_decl_node->next = it_decl;
+                        it_decl->next = while_loop;
+                        outer_block->block.statements = enum_idx_decl_node;
+                    }
+                    else
+                    {
+                        it_decl->next = while_loop;
+                        outer_block->block.statements = it_decl;
+                    }
                 }
 
                 return outer_block;
@@ -1564,7 +1834,7 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
     {
         if (lexer_peek(l).type == TOK_IDENT && strncmp(lexer_peek(l).start, "let", 3) == 0)
         {
-            init = parse_var_decl(ctx, l);
+            init = parse_var_decl(ctx, l, 0);
         }
         else if (lexer_peek(l).type == TOK_IDENT && strncmp(lexer_peek(l).start, "var", 3) == 0)
         {
@@ -1592,10 +1862,10 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
     else
     {
         // Empty condition = true
-        ASTNode *true_lit = ast_create(NODE_EXPR_LITERAL);
-        true_lit->literal.type_kind = LITERAL_INT;
-        true_lit->literal.int_val = 1;
-        cond = true_lit;
+        ASTNode *true_var = ast_create(NODE_EXPR_VAR);
+        true_var->var_ref.name = xstrdup("true");
+        true_var->token = for_token;
+        cond = true_var;
     }
     if (lexer_peek(l).type == TOK_SEMICOLON)
     {
@@ -1620,11 +1890,17 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
     }
     else
     {
+        if (g_config.misra_mode)
+        {
+            zerror_at(lexer_peek(l), "MISRA Rule 15.6"
+                                     "compound-statement body");
+        }
         body = parse_statement(ctx, l);
     }
     exit_scope(ctx);
 
     ASTNode *n = ast_create(NODE_FOR);
+    n->token = for_token;
     n->for_stmt.init = init;
     n->for_stmt.condition = cond;
     n->for_stmt.step = step;
@@ -1632,34 +1908,128 @@ ASTNode *parse_for(ParserContext *ctx, Lexer *l)
     return n;
 }
 
-char *process_printf_sugar(ParserContext *ctx, const char *content, int newline, const char *target,
-                           char ***used_syms, int *count, int check_symbols)
+void append_to_gen(char **gen, size_t *cap, const char *s)
+{
+    size_t len = strlen(*gen);
+    size_t slen = strlen(s);
+    if (len + slen + 1 >= *cap)
+    {
+        *cap = (*cap + slen) * 2;
+        *gen = xrealloc(*gen, *cap);
+    }
+    strcat(*gen, s);
+}
+
+void append_to_gen_fmt(char **gen, size_t *cap, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    int size = vsnprintf(NULL, 0, fmt, args);
+    va_end(args);
+
+    if (size < 0)
+    {
+        return;
+    }
+
+    char *buf = xmalloc(size + 1);
+    va_start(args, fmt);
+    vsnprintf(buf, size + 1, fmt, args);
+    va_end(args);
+
+    append_to_gen(gen, cap, buf);
+    free(buf);
+}
+
+char *process_printf_sugar(ParserContext *ctx, Token srctoken, const char *content, int newline,
+                           const char *target, char ***used_syms, int *count, int check_symbols,
+                           int is_raw, int is_expr)
 {
     int saved_silent = ctx->silent_warnings;
     ctx->silent_warnings = !check_symbols;
-    char *gen = xmalloc(8192);
-    strcpy(gen, "({ ");
+
+    static int fs_id_gen = 0;
+    int fs_id = fs_id_gen++;
+
+    size_t gen_cap = 1024 * 32;
+    char *gen = xmalloc(gen_cap);
+    gen[0] = 0;
+    append_to_gen(&gen, &gen_cap, "({ ");
+
+    if (is_expr)
+    {
+        append_to_gen_fmt(&gen, &gen_cap,
+                          "static char _fs_buf_%d[8192]; _fs_buf_%d[0]=0; char _fs_t_%d[2048]; ",
+                          fs_id, fs_id, fs_id);
+    }
 
     char *s = xstrdup(content);
     char *cur = s;
 
     while (*cur)
     {
-        // 1. Find text before the next '{'
         char *brace = cur;
-        while (*brace && *brace != '{')
+        while (*brace)
         {
+            if (*brace == '{' && !is_raw)
+
+            {
+                if (brace[1] == '{')
+                {
+                    brace += 2;
+                    continue;
+                }
+                break; // Found single '{'
+            }
+            if (*brace == '}' && brace[1] == '}')
+            {
+                // We'll treat '}}' as part of literal text and unescape it later
+                brace += 2;
+                continue;
+            }
             brace++;
         }
 
         if (brace > cur)
         {
             // Append text literal
-            char buf[256];
-            sprintf(buf, "fprintf(%s, \"%%s\", \"", target);
-            strcat(gen, buf);
-            strncat(gen, cur, brace - cur);
-            strcat(gen, "\"); ");
+            if (is_expr)
+            {
+                append_to_gen_fmt(&gen, &gen_cap, "strcat(_fs_buf_%d, \"", fs_id);
+            }
+            else
+            {
+                append_to_gen_fmt(&gen, &gen_cap, "fprintf(%s, \"%%s\", \"", target);
+            }
+
+            int seg_len = brace - cur;
+            char *txt = xmalloc(seg_len + 1);
+            int write_idx = 0;
+            for (int i = 0; i < seg_len; i++)
+            {
+                if (cur[i] == '{' && cur[i + 1] == '{')
+                {
+                    txt[write_idx++] = '{';
+                    i++;
+                }
+                else if (cur[i] == '}' && cur[i + 1] == '}')
+                {
+                    txt[write_idx++] = '}';
+                    i++;
+                }
+                else
+                {
+                    txt[write_idx++] = cur[i];
+                }
+            }
+            txt[write_idx] = 0;
+
+            char *escaped = escape_c_string(txt);
+            append_to_gen(&gen, &gen_cap, escaped);
+            append_to_gen(&gen, &gen_cap, "\"); ");
+
+            free(escaped);
+            free(txt);
         }
 
         if (*brace == 0)
@@ -1667,7 +2037,6 @@ char *process_printf_sugar(ParserContext *ctx, const char *content, int newline,
             break;
         }
 
-        // 2. Handle {expression}
         char *p = brace + 1;
         char *colon = NULL;
         int depth = 1;
@@ -1699,6 +2068,10 @@ char *process_printf_sugar(ParserContext *ctx, const char *content, int newline,
             p++;
         }
 
+        if (*p == 0)
+        {
+            zpanic_at(srctoken, "Unclosed interpolation brace in printf-sugar");
+        }
         *p = 0; // Terminate expression
         char *expr = brace + 1;
 
@@ -1741,11 +2114,22 @@ char *process_printf_sugar(ParserContext *ctx, const char *content, int newline,
         {
             Lexer lex;
             lexer_init(&lex, clean_expr); // Scan original for symbols
+            lex.line = srctoken.line;
+            lex.col = srctoken.col;
+
             Token t;
+            Token prev = {0};
             while ((t = lexer_next(&lex)).type != TOK_EOF)
             {
                 if (t.type == TOK_IDENT)
                 {
+                    // Skip if preceded by '.' (member access)
+                    if (prev.type == TOK_OP && prev.len == 1 && prev.start[0] == '.')
+                    {
+                        prev = t;
+                        continue;
+                    }
+
                     char *name = token_strdup(t);
                     ZenSymbol *sym = find_symbol_entry(ctx, name);
                     if (sym)
@@ -1764,6 +2148,7 @@ char *process_printf_sugar(ParserContext *ctx, const char *content, int newline,
                         free(name);
                     }
                 }
+                prev = t;
             }
         }
 
@@ -1773,11 +2158,49 @@ char *process_printf_sugar(ParserContext *ctx, const char *content, int newline,
         // Parse expression fully
         Lexer lex;
         lexer_init(&lex, clean_expr);
+        lex.line = srctoken.line;
+        lex.col = srctoken.col;
 
         ASTNode *expr_node = parse_expression(ctx, &lex);
+        if (expr_node)
+        {
+            infer_type(ctx, expr_node);
+        }
+        else
+        {
+            zpanic_at(srctoken, "Could not parse expression in interpolation");
+        }
 
         char *rw_expr = NULL;
         int used_codegen = 0;
+        char *mangled_to_string = NULL;
+        int to_string_is_ptr = 0;
+        char *to_string_struct_name = NULL;
+
+        int is_temporary = 1;
+        int is_simple_type = 0;
+        if (expr_node)
+        {
+            if (expr_node->type == NODE_EXPR_VAR || expr_node->type == NODE_EXPR_MEMBER ||
+                expr_node->type == NODE_EXPR_INDEX)
+            {
+                is_temporary = 0;
+            }
+
+            Type *t = expr_node->type_info;
+            if (t && t->kind != TYPE_STRUCT && t->kind != TYPE_ENUM && t->kind != TYPE_UNKNOWN &&
+                t->kind != TYPE_ALIAS)
+            {
+                is_simple_type = 1;
+            }
+        }
+        else if (clean_expr[0] == '"' || clean_expr[0] == '\'' || isdigit(clean_expr[0]))
+        {
+            is_simple_type = 1;
+        }
+
+        // Bypassing RAII and capture for comptime contexts
+        int force_simple = is_simple_type || ctx->is_comptime || !is_temporary;
 
         if (expr_node)
         {
@@ -1800,60 +2223,37 @@ char *process_printf_sugar(ParserContext *ctx, const char *content, int newline,
 
                 if (struct_name)
                 {
-                    char mangled[256];
-                    sprintf(mangled, "%s__to_string", struct_name);
+                    size_t mangled_sz = strlen(struct_name) + sizeof("__to_string");
+                    char *mangled = xmalloc(mangled_sz);
+                    snprintf(mangled, mangled_sz, "%s__to_string", struct_name);
                     if (find_func(ctx, mangled))
                     {
-                        char *inner_c = NULL;
-                        size_t len = 0;
-                        FILE *ms = tmpfile();
-                        if (ms)
-                        {
-                            codegen_expression(ctx, expr_node, ms);
-                            len = ftell(ms);
-                            fseek(ms, 0, SEEK_SET);
-                            inner_c = xmalloc(len + 1);
-                            fread(inner_c, 1, len, ms);
-                            inner_c[len] = 0;
-                            fclose(ms);
-                        }
-
-                        if (inner_c)
-                        {
-                            char *new_expr = xmalloc(strlen(inner_c) + strlen(mangled) + 64);
-                            if (is_ptr)
-                            {
-                                sprintf(new_expr, "%s(%s)", mangled, inner_c);
-                            }
-                            else
-                            {
-                                sprintf(new_expr, "%s(({ %s _z_tmp = (%s); &_z_tmp; }))", mangled,
-                                        struct_name, inner_c);
-                            }
-                            rw_expr = new_expr;
-                            free(inner_c);
-                        }
+                        mangled_to_string = xstrdup(mangled);
+                        to_string_is_ptr = is_ptr;
+                        to_string_struct_name = xstrdup(struct_name);
                     }
+                    free(mangled);
                 }
             }
+        }
 
-            if (!rw_expr)
+        // Always codegen the base expression first
+        if (expr_node)
+        {
+            char *expr_buf = NULL;
+            size_t len = 0;
+            FILE *ms = tmpfile();
+            if (ms)
             {
-                char *buf = NULL;
-                size_t len = 0;
-                FILE *ms = tmpfile();
-                if (ms)
-                {
-                    codegen_expression(ctx, expr_node, ms);
-                    len = ftell(ms);
-                    fseek(ms, 0, SEEK_SET);
-                    buf = xmalloc(len + 1);
-                    fread(buf, 1, len, ms);
-                    buf[len] = 0;
-                    fclose(ms);
-                    rw_expr = buf;
-                    used_codegen = 1;
-                }
+                codegen_expression(ctx, expr_node, ms);
+                len = ftell(ms);
+                fseek(ms, 0, SEEK_SET);
+                expr_buf = xmalloc(len + 1);
+                fread(expr_buf, 1, len, ms);
+                expr_buf[len] = 0;
+                fclose(ms);
+                rw_expr = expr_buf;
+                used_codegen = 1;
             }
         }
 
@@ -1865,13 +2265,40 @@ char *process_printf_sugar(ParserContext *ctx, const char *content, int newline,
         if (fmt)
         {
             // Explicit format: {x:%.2f}
-            char buf[128];
-            sprintf(buf, "fprintf(%s, \"%%", target);
-            strcat(gen, buf);
-            strcat(gen, fmt);
-            strcat(gen, "\", ");
-            strcat(gen, rw_expr); // Use rewritten expr
-            strcat(gen, "); ");
+            if (force_simple)
+            {
+                if (is_expr)
+                {
+                    append_to_gen_fmt(&gen, &gen_cap,
+                                      "snprintf(_fs_t_%d, 2048, \"%%%s\", %s); strncat(_fs_buf_%d, "
+                                      "_fs_t_%d, 8192 - strlen(_fs_buf_%d) - 1); ",
+                                      fs_id, fmt, rw_expr, fs_id, fs_id, fs_id);
+                }
+                else
+                {
+                    append_to_gen_fmt(&gen, &gen_cap, "fprintf(%s, \"%%%s\", %s); ", target, fmt,
+                                      rw_expr);
+                }
+            }
+            else
+            {
+                if (is_expr)
+                {
+                    append_to_gen_fmt(&gen, &gen_cap,
+                                      "({ ZC_AUTO_INIT(_z_interp_val, %s); snprintf(_fs_t_%d, "
+                                      "2048, \"%%%s\", _z_interp_val); strncat(_fs_buf_%d, "
+                                      "_fs_t_%d, 8192 - strlen(_fs_buf_%d) - 1); "
+                                      "_z_drop(_z_interp_val); }); ",
+                                      rw_expr, fs_id, fmt, fs_id, fs_id, fs_id);
+                }
+                else
+                {
+                    append_to_gen_fmt(&gen, &gen_cap,
+                                      "({ ZC_AUTO_INIT(_z_interp_val, %s); fprintf(%s, \"%%%s\", "
+                                      "_z_interp_val); _z_drop(_z_interp_val); }); ",
+                                      rw_expr, target, fmt);
+                }
+            }
         }
         else
         {
@@ -1880,7 +2307,208 @@ char *process_printf_sugar(ParserContext *ctx, const char *content, int newline,
             char *inferred_type = t ? type_to_string(t) : find_symbol_type(ctx, clean_expr);
 
             int is_bool = 0;
-            if (inferred_type)
+
+            // Robust string-like detection (Slice/Vector or compatible struct)
+            // MUST run before name-based heuristics to handle pointers to slices/vectors correctly
+            if (t && !mangled_to_string)
+            {
+                Type *base = t;
+                int is_p = 0;
+                if (base->kind == TYPE_POINTER)
+                {
+                    base = base->inner;
+                    is_p = 1;
+                }
+
+                while (base)
+                {
+                    if (base->kind == TYPE_ALIAS)
+                    {
+                        base = base->inner;
+                    }
+                    else if (base->kind == TYPE_STRUCT && base->name)
+                    {
+                        TypeAlias *ta = find_type_alias_node(ctx, base->name);
+                        if (ta && ta->type_info)
+                        {
+                            base = ta->type_info;
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+
+                if (base && base->kind == TYPE_ARRAY && base->array_size == 0)
+                {
+                    char *inner_name = type_to_string(base->inner);
+                    char slice_name[MAX_TYPE_NAME_LEN];
+                    snprintf(slice_name, sizeof(slice_name), "Slice__%s", inner_name);
+                    free(inner_name);
+
+                    ASTNode *def = find_struct_def(ctx, slice_name);
+                    if (def && def->type == NODE_STRUCT)
+                    {
+                        int has_data = 0;
+                        int has_len = 0;
+                        char *data_type = NULL;
+
+                        ASTNode *curr = def->strct.fields;
+                        while (curr)
+                        {
+                            if (strcmp(curr->field.name, "data") == 0)
+                            {
+                                has_data = 1;
+                                data_type = curr->field.type;
+                            }
+                            else if (strcmp(curr->field.name, "len") == 0)
+                            {
+                                has_len = 1;
+                            }
+                            curr = curr->next;
+                        }
+
+                        if (has_data && has_len && data_type &&
+                            (strstr(data_type, "char") || strstr(data_type, "u8") ||
+                             strstr(data_type, "byte")))
+                        {
+                            const char *acc = is_p ? "->" : ".";
+                            if (force_simple)
+                            {
+                                if (is_expr)
+                                {
+                                    append_to_gen_fmt(
+                                        &gen, &gen_cap,
+                                        "snprintf(_fs_t_%d, 2048, \"%%.*s\", (int)(%s)%slen, "
+                                        "(%s)%sdata); strncat(_fs_buf_%d, _fs_t_%d, 8192 - "
+                                        "strlen(_fs_buf_%d) - 1); ",
+                                        fs_id, rw_expr, acc, rw_expr, acc, fs_id, fs_id);
+                                }
+                                else
+                                {
+                                    append_to_gen_fmt(
+                                        &gen, &gen_cap,
+                                        "fprintf(%s, \"%%.*s\", (int)(%s)%slen, (%s)%sdata); ",
+                                        target, rw_expr, acc, rw_expr, acc);
+                                }
+                            }
+                            else
+                            {
+                                if (is_expr)
+                                {
+                                    append_to_gen_fmt(
+                                        &gen, &gen_cap,
+                                        "({ ZC_AUTO_INIT(_z_interp_val, %s); snprintf(_fs_t_%d, "
+                                        "2048, \"%%.*s\", (int)(_z_interp_val)%slen, "
+                                        "(_z_interp_val)%sdata); strncat(_fs_buf_%d, "
+                                        "_fs_t_%d, 8192 - strlen(_fs_buf_%d) - 1); "
+                                        "_z_drop(_z_interp_val); }); ",
+                                        rw_expr, fs_id, acc, acc, fs_id, fs_id);
+                                }
+                                else
+                                {
+                                    append_to_gen_fmt(
+                                        &gen, &gen_cap,
+                                        "({ ZC_AUTO_INIT(_z_interp_val, %s); fprintf(%s, "
+                                        "\"%%.*s\", "
+                                        "(int)(_z_interp_val)%slen, (_z_interp_val)%sdata); "
+                                        "_z_drop(_z_interp_val); }); ",
+                                        rw_expr, target, acc, acc);
+                                }
+                            }
+                            goto next_segment;
+                        }
+                    }
+                }
+                else if (base && base->kind == TYPE_STRUCT && base->name)
+                {
+                    ASTNode *def = find_struct_def(ctx, base->name);
+                    if (def && def->type == NODE_STRUCT)
+                    {
+                        int has_data = 0;
+                        int has_len = 0;
+                        char *data_type = NULL;
+
+                        ASTNode *curr = def->strct.fields;
+                        while (curr)
+                        {
+                            if (strcmp(curr->field.name, "data") == 0)
+                            {
+                                has_data = 1;
+                                data_type = curr->field.type;
+                            }
+                            else if (strcmp(curr->field.name, "len") == 0)
+                            {
+                                has_len = 1;
+                            }
+                            curr = curr->next;
+                        }
+
+                        if (has_data && has_len && data_type &&
+                            (strstr(data_type, "char") || strstr(data_type, "u8") ||
+                             strstr(data_type, "byte")))
+                        {
+                            const char *acc = is_p ? "->" : ".";
+                            if (force_simple)
+                            {
+                                if (is_expr)
+                                {
+                                    append_to_gen_fmt(
+                                        &gen, &gen_cap,
+                                        "sprintf(_fs_t_%d, \"%%.*s\", (int)(%s)%slen, "
+                                        "(%s)%sdata); strcat(_fs_buf_%d, _fs_t_%d); ",
+                                        fs_id, rw_expr, acc, rw_expr, acc, fs_id, fs_id);
+                                }
+                                else
+                                {
+                                    append_to_gen_fmt(
+                                        &gen, &gen_cap,
+                                        "fprintf(%s, \"%%.*s\", (int)(%s)%slen, (%s)%sdata); ",
+                                        target, rw_expr, acc, rw_expr, acc);
+                                }
+                            }
+                            else
+                            {
+                                if (is_expr)
+                                {
+                                    append_to_gen_fmt(
+                                        &gen, &gen_cap,
+                                        "({ ZC_AUTO_INIT(_z_interp_val, %s); sprintf(_fs_t_%d, "
+                                        "\"%%.*s\", (int)(_z_interp_val)%slen, "
+                                        "(_z_interp_val)%sdata); strcat(_fs_buf_%d, "
+                                        "_fs_t_%d); _z_drop(_z_interp_val); }); ",
+                                        rw_expr, fs_id, acc, acc, fs_id, fs_id);
+                                }
+                                else
+                                {
+                                    append_to_gen_fmt(
+                                        &gen, &gen_cap,
+                                        "({ ZC_AUTO_INIT(_z_interp_val, %s); fprintf(%s, "
+                                        "\"%%.*s\", "
+                                        "(int)(_z_interp_val)%slen, (_z_interp_val)%sdata); "
+                                        "_z_drop(_z_interp_val); }); ",
+                                        rw_expr, target, acc, acc);
+                                }
+                            }
+                            goto next_segment;
+                        }
+                    }
+                }
+            }
+
+            if (t && t->kind == TYPE_RUNE)
+            {
+                format_spec = "%s";
+                char *orig = rw_expr;
+                rw_expr = xmalloc(strlen(orig) + 32);
+                sprintf(rw_expr, "_z_str_rune(%s)", orig);
+            }
+            else if (inferred_type)
             {
                 if (strcmp(inferred_type, "bool") == 0)
                 {
@@ -1895,7 +2523,7 @@ char *process_printf_sugar(ParserContext *ctx, const char *content, int newline,
                          strcmp(inferred_type, "i8") == 0 || strcmp(inferred_type, "I8") == 0 ||
                          strcmp(inferred_type, "int8_t") == 0 ||
                          strcmp(inferred_type, "short") == 0 ||
-                         strcmp(inferred_type, "ushort") == 0 || strcmp(inferred_type, "rune") == 0)
+                         strcmp(inferred_type, "ushort") == 0)
                 {
                     format_spec = "%d";
                 }
@@ -1948,18 +2576,26 @@ char *process_printf_sugar(ParserContext *ctx, const char *content, int newline,
                 {
                     format_spec = "%p"; // Pointer
                 }
+
                 if (t)
                 {
                     free(inferred_type);
                 }
             }
 
-            // Check for Literals if variable lookup failed
             if (!format_spec)
             {
-                if (isdigit(clean_expr[0]) || clean_expr[0] == '-')
+                if (isdigit(clean_expr[0]) || (clean_expr[0] == '-' && isdigit(clean_expr[1])))
                 {
-                    format_spec = "%d"; // Naive integer guess (could be float)
+                    if (strchr(clean_expr, '.') || strchr(clean_expr, 'e') ||
+                        strchr(clean_expr, 'E'))
+                    {
+                        format_spec = "%f";
+                    }
+                    else
+                    {
+                        format_spec = "%d";
+                    }
                 }
                 else if (clean_expr[0] == '"')
                 {
@@ -1973,34 +2609,181 @@ char *process_printf_sugar(ParserContext *ctx, const char *content, int newline,
 
             if (format_spec)
             {
-                char buf[128];
-                sprintf(buf, "fprintf(%s, \"", target);
-                strcat(gen, buf);
-                strcat(gen, format_spec);
-                strcat(gen, "\", ");
                 if (is_bool)
                 {
-                    strcat(gen, "_z_bool_str(");
-                    strcat(gen, rw_expr);
-                    strcat(gen, ")");
+                    if (force_simple)
+                    {
+                        if (is_expr)
+                        {
+                            append_to_gen_fmt(&gen, &gen_cap,
+                                              "sprintf(_fs_t_%d, \"%%%s\", _z_bool_str(%s)); "
+                                              "strcat(_fs_buf_%d, _fs_t_%d); ",
+                                              fs_id, format_spec + 1, rw_expr, fs_id, fs_id);
+                        }
+                        else
+                        {
+                            append_to_gen_fmt(&gen, &gen_cap,
+                                              "fprintf(%s, \"%%%s\", _z_bool_str(%s)); ", target,
+                                              format_spec + 1, rw_expr);
+                        }
+                    }
+                    else
+                    {
+                        if (is_expr)
+                        {
+                            append_to_gen_fmt(
+                                &gen, &gen_cap,
+                                "({ ZC_AUTO_INIT(_z_interp_val, %s); sprintf(_fs_t_%d, "
+                                "\"%%%s\", _z_bool_str(_z_interp_val)); strcat(_fs_buf_%d, "
+                                "_fs_t_%d); _z_drop(_z_interp_val); }); ",
+                                rw_expr, fs_id, format_spec + 1, fs_id, fs_id);
+                        }
+                        else
+                        {
+                            append_to_gen_fmt(
+                                &gen, &gen_cap,
+                                "({ ZC_AUTO_INIT(_z_interp_val, %s); fprintf(%s, \"%%%s\", "
+                                "_z_bool_str(_z_interp_val)); _z_drop(_z_interp_val); "
+                                "}); ",
+                                rw_expr, target, format_spec + 1);
+                        }
+                    }
                 }
                 else
                 {
-                    strcat(gen, rw_expr);
+                    if (force_simple)
+                    {
+                        if (is_expr)
+                        {
+                            append_to_gen_fmt(&gen, &gen_cap,
+                                              "sprintf(_fs_t_%d, \"%%%s\", %s); "
+                                              "strcat(_fs_buf_%d, _fs_t_%d); ",
+                                              fs_id, format_spec + 1, rw_expr, fs_id, fs_id);
+                        }
+                        else
+                        {
+                            append_to_gen_fmt(&gen, &gen_cap, "fprintf(%s, \"%%%s\", %s); ", target,
+                                              format_spec + 1, rw_expr);
+                        }
+                    }
+                    else
+                    {
+                        if (is_expr)
+                        {
+                            append_to_gen_fmt(
+                                &gen, &gen_cap,
+                                "({ ZC_AUTO_INIT(_z_interp_val, %s); sprintf(_fs_t_%d, "
+                                "\"%%%s\", _z_interp_val); strcat(_fs_buf_%d, _fs_t_%d); "
+                                "_z_drop(_z_interp_val); }); ",
+                                rw_expr, fs_id, format_spec + 1, fs_id, fs_id);
+                        }
+                        else
+                        {
+                            append_to_gen_fmt(
+                                &gen, &gen_cap,
+                                "({ ZC_AUTO_INIT(_z_interp_val, %s); fprintf(%s, \"%%%s\", "
+                                "_z_interp_val); _z_drop(_z_interp_val); }); ",
+                                rw_expr, target, format_spec + 1);
+                        }
+                    }
                 }
-                strcat(gen, "); ");
             }
             else
             {
                 // Fallback to runtime macro
-                char buf[128];
-                sprintf(buf, "fprintf(%s, _z_str(", target);
-                strcat(gen, buf);
-                strcat(gen, rw_expr);
-                strcat(gen, "), _z_arg(");
-                strcat(gen, rw_expr);
-                strcat(gen, ")); ");
+                if (mangled_to_string)
+                {
+                    if (force_simple && !is_temporary)
+                    {
+                        if (is_expr)
+                        {
+                            append_to_gen_fmt(&gen, &gen_cap,
+                                              "sprintf(_fs_t_%d, \"%%s\", (char*)%s(%s%s)); "
+                                              "strcat(_fs_buf_%d, _fs_t_%d); ",
+                                              fs_id, mangled_to_string, to_string_is_ptr ? "" : "&",
+                                              rw_expr, fs_id, fs_id);
+                        }
+                        else
+                        {
+                            append_to_gen_fmt(
+                                &gen, &gen_cap, "fprintf(%s, \"%%s\", (char*)%s(%s%s)); ", target,
+                                mangled_to_string, to_string_is_ptr ? "" : "&", rw_expr);
+                        }
+                    }
+                    else
+                    {
+                        if (is_expr)
+                        {
+                            append_to_gen_fmt(
+                                &gen, &gen_cap,
+                                "({ ZC_AUTO_INIT(_z_interp_val, %s); sprintf(_fs_t_%d, \"%%s\", "
+                                "(char*)%s(%s_z_interp_val)); strcat(_fs_buf_%d, _fs_t_%d); "
+                                "_z_drop(_z_interp_val); }); ",
+                                rw_expr, fs_id, mangled_to_string, to_string_is_ptr ? "" : "&",
+                                fs_id, fs_id);
+                        }
+                        else
+                        {
+                            append_to_gen_fmt(
+                                &gen, &gen_cap,
+                                "({ ZC_AUTO_INIT(_z_interp_val, %s); fprintf(%s, \"%%s\", "
+                                "(char*)%s(%s_z_interp_val)); _z_drop(_z_interp_val); "
+                                "}); ",
+                                rw_expr, target, mangled_to_string, to_string_is_ptr ? "" : "&");
+                        }
+                    }
+                }
+                else
+                {
+                    if (force_simple)
+                    {
+                        if (is_expr)
+                        {
+                            append_to_gen_fmt(&gen, &gen_cap,
+                                              "sprintf(_fs_t_%d, _z_str(%s), _z_arg(%s)); "
+                                              "strcat(_fs_buf_%d, _fs_t_%d); ",
+                                              fs_id, rw_expr, rw_expr, fs_id, fs_id);
+                        }
+                        else
+                        {
+                            append_to_gen_fmt(&gen, &gen_cap,
+                                              "fprintf(%s, _z_str(%s), _z_arg(%s)); ", target,
+                                              rw_expr, rw_expr);
+                        }
+                    }
+                    else
+                    {
+                        if (is_expr)
+                        {
+                            append_to_gen_fmt(
+                                &gen, &gen_cap,
+                                "({ ZC_AUTO_INIT(_z_interp_val, %s); sprintf(_fs_t_%d, "
+                                "_z_str(_z_interp_val), _z_arg(_z_interp_val)); "
+                                "strcat(_fs_buf_%d, _fs_t_%d); "
+                                "_z_drop(_z_interp_val); }); ",
+                                rw_expr, fs_id, fs_id, fs_id);
+                        }
+                        else
+                        {
+                            append_to_gen_fmt(&gen, &gen_cap,
+                                              "({ ZC_AUTO_INIT(_z_interp_val, %s); fprintf(%s, "
+                                              "_z_str(_z_interp_val), _z_arg(_z_interp_val)); "
+                                              "_z_drop(_z_interp_val); }); ",
+                                              rw_expr, target);
+                        }
+                    }
+                }
             }
+        }
+
+    next_segment:
+        if (mangled_to_string)
+        {
+            free(mangled_to_string);
+        }
+        if (to_string_struct_name)
+        {
+            free(to_string_struct_name);
         }
 
         if (rw_expr && used_codegen)
@@ -2017,16 +2800,28 @@ char *process_printf_sugar(ParserContext *ctx, const char *content, int newline,
 
     if (newline)
     {
-        char buf[128];
-        sprintf(buf, "fprintf(%s, \"\\n\"); ", target);
-        strcat(gen, buf);
+        if (is_expr)
+        {
+            append_to_gen_fmt(&gen, &gen_cap, "strcat(_fs_buf_%d, \"\\n\"); ", fs_id);
+        }
+        else
+        {
+            append_to_gen_fmt(&gen, &gen_cap, "fprintf(%s, \"\\n\"); ", target);
+        }
+    }
+    else if (!is_expr)
+    {
+        append_to_gen(&gen, &gen_cap, "fflush(stdout); ");
+    }
+
+    if (is_expr)
+    {
+        append_to_gen_fmt(&gen, &gen_cap, "_fs_buf_%d; })", fs_id);
     }
     else
     {
-        strcat(gen, "fflush(stdout); ");
+        append_to_gen(&gen, &gen_cap, "0; })");
     }
-
-    strcat(gen, "0; })");
 
     free(s);
     ctx->silent_warnings = saved_silent;
@@ -2048,14 +2843,11 @@ ASTNode *parse_macro_call(ParserContext *ctx, Lexer *l, char *macro_name)
         zpanic_at(lexer_peek(l), "Expected { after macro invocation");
     }
     lexer_next(l); // consume {
+    int start_line = l->line;
+    int start_col = l->col;
+    const char *body_start = l->src + l->pos;
 
-    // Collect body until }
-    char *body = xmalloc(8192);
-    body[0] = '\0';
-    int body_len = 0;
     int depth = 1;
-    int last_line = start_tok.line;
-
     while (depth > 0)
     {
         Token t = lexer_peek(l);
@@ -2073,41 +2865,38 @@ ASTNode *parse_macro_call(ParserContext *ctx, Lexer *l, char *macro_name)
             depth--;
         }
 
-        if (depth > 0)
-        {
-            if (body_len + t.len + 2 < 8192)
-            {
-                // Preserve newlines
-                if (t.line > last_line)
-                {
-                    body[body_len] = '\n';
-                    body[body_len + 1] = 0;
-                    body_len++;
-                }
-                else
-                {
-                    body[body_len] = ' ';
-                    body[body_len + 1] = 0;
-                    body_len++;
-                }
-
-                strncat(body, t.start, t.len);
-                body_len += t.len;
-            }
-        }
-
-        last_line = t.line;
         lexer_next(l);
     }
+    int end_line = l->line;
+    int end_col = l->col;
 
-    // Resolve plugin name
+    const char *body_end = l->src + l->pos - 1; // back to the '}'
+    size_t body_len = (size_t)(body_end - body_start);
+    char *body = xmalloc(body_len + 1);
+    memcpy(body, body_start, body_len);
+    body[body_len] = '\0';
+
     const char *plugin_name = resolve_plugin(ctx, macro_name);
     if (!plugin_name)
     {
-        char err[256];
+        char err[MAX_SHORT_MSG_LEN];
         snprintf(err, sizeof(err), "Unknown plugin: %s (did you forget 'import plugin \"%s\"'?)",
                  macro_name, macro_name);
-        zpanic_at(start_tok, err);
+        zpanic_at(start_tok, "%s", err);
+
+        // Fallback for ZLS: Return a dummy plugin node to stay alive
+        if (g_config.mode_lsp)
+        {
+            free(body);
+            ASTNode *n = ast_create(NODE_PLUGIN);
+            n->plugin_stmt.plugin_name = xstrdup(macro_name);
+            n->plugin_stmt.body = xstrdup("");
+            n->plugin_stmt.start_line = start_line;
+            n->plugin_stmt.start_col = start_col;
+            n->plugin_stmt.end_line = end_line;
+            n->plugin_stmt.end_col = end_col;
+            return n;
+        }
     }
 
     // Find Plugin Definition
@@ -2116,9 +2905,23 @@ ASTNode *parse_macro_call(ParserContext *ctx, Lexer *l, char *macro_name)
 
     if (!found)
     {
-        char err[256];
+        char err[MAX_SHORT_MSG_LEN];
         snprintf(err, sizeof(err), "Plugin implementation not found: %s", plugin_name);
-        zpanic_at(start_tok, err);
+        zpanic_at(start_tok, "%s", err);
+
+        // Fallback for ZLS: Return a dummy plugin node to stay alive
+        if (g_config.mode_lsp)
+        {
+            free(body);
+            ASTNode *n = ast_create(NODE_PLUGIN);
+            n->plugin_stmt.plugin_name = xstrdup(plugin_name);
+            n->plugin_stmt.body = xstrdup("");
+            n->plugin_stmt.start_line = start_line;
+            n->plugin_stmt.start_col = start_col;
+            n->plugin_stmt.end_line = end_line;
+            n->plugin_stmt.end_col = end_col;
+            return n;
+        }
     }
 
     // Execute Plugin Immediately (Expansion)
@@ -2126,12 +2929,11 @@ ASTNode *parse_macro_call(ParserContext *ctx, Lexer *l, char *macro_name)
     if (!capture)
     {
         zpanic_at(start_tok, "Failed to create capture buffer for plugin expansion");
+        return NULL;
     }
 
-    ZApi api = {.filename = g_current_filename ? g_current_filename : "input.zc",
-                .current_line = start_tok.line,
-                .out = capture,
-                .hoist_out = ctx->hoist_out};
+    ZApi api;
+    zptr_init_api(&api, g_current_filename, start_tok.line, capture, ctx->hoist_out);
 
     found->fn(body, &api);
 
@@ -2142,10 +2944,26 @@ ASTNode *parse_macro_call(ParserContext *ctx, Lexer *l, char *macro_name)
     fread(expanded_code, 1, len, capture);
     expanded_code[len] = 0;
     fclose(capture);
+    // For LSP: We want to keep the plugin node so we can show hovers
+    if (g_config.mode_lsp)
+    {
+        ASTNode *n = ast_create(NODE_PLUGIN);
+        n->plugin_stmt.plugin_name = xstrdup(plugin_name);
+        n->plugin_stmt.body = body;
+        n->plugin_stmt.start_line = start_line;
+        n->plugin_stmt.start_col = start_col;
+        n->plugin_stmt.end_line = end_line;
+        n->plugin_stmt.end_col = end_col;
+        n->line = start_tok.line;
+        n->token = start_tok;
+        return n;
+    }
+
     free(body);
 
     // Create Raw Statement/Expression Node
     ASTNode *n = ast_create(NODE_RAW_STMT);
+    n->token = start_tok;
     n->line = start_tok.line;
     n->raw_stmt.content = expanded_code;
 
@@ -2187,44 +3005,34 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
 
     if (tk.type == TOK_PREPROC)
     {
-        lexer_next(l); // consume token
+        tk = lexer_next(l); // consume token
         char *content = xmalloc(tk.len + 2);
         strncpy(content, tk.start, tk.len);
         content[tk.len] = '\n'; // Ensure newline
         content[tk.len + 1] = 0;
-        ASTNode *s = ast_create(NODE_RAW_STMT);
-        s->raw_stmt.content = content;
-        return s;
+        ASTNode *raw_s = ast_create(NODE_RAW_STMT);
+        raw_s->token = tk;
+        raw_s->raw_stmt.content = content;
+        return raw_s;
     }
 
-    if (tk.type == TOK_STRING || tk.type == TOK_FSTRING)
+    if (tk.type == TOK_STRING || tk.type == TOK_FSTRING || tk.type == TOK_RAW_STRING)
     {
         Lexer lookahead = *l;
         lexer_next(&lookahead);
-        ZenTokenType next_type = lexer_peek(&lookahead).type;
+        Token next = lexer_peek(&lookahead);
+        ZenTokenType next_type = next.type;
 
         if (next_type == TOK_SEMICOLON || next_type == TOK_DOTDOT || next_type == TOK_RBRACE)
         {
             Token t = lexer_next(l); // consume string
-
-            char *inner = xmalloc(t.len);
-            // Strip quotes
-            if (t.type == TOK_FSTRING)
-            {
-                strncpy(inner, t.start + 2, t.len - 3);
-                inner[t.len - 3] = 0;
-            }
-            else
-            {
-                strncpy(inner, t.start + 1, t.len - 2);
-                inner[t.len - 2] = 0;
-            }
+            char *inner = token_get_string_content(t);
 
             int is_ln = (next_type == TOK_SEMICOLON || next_type == TOK_RBRACE);
             char **used_syms = NULL;
             int used_count = 0;
-            char *code =
-                process_printf_sugar(ctx, inner, is_ln, "stdout", &used_syms, &used_count, 1);
+            char *code = process_printf_sugar(ctx, next, inner, is_ln, "stdout", &used_syms,
+                                              &used_count, 1, (t.type == TOK_RAW_STRING), 0);
 
             if (next_type == TOK_SEMICOLON)
             {
@@ -2241,6 +3049,7 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
             // If TOK_RBRACE, do not consume it, so parse_block can see it and terminate loop.
 
             ASTNode *n = ast_create(NODE_RAW_STMT);
+            n->token = tk;
             // Append semicolon to Statement Expression to make it a valid statement
             char *stmt_code = xmalloc(strlen(code) + 2);
             sprintf(stmt_code, "%s;", code);
@@ -2260,6 +3069,33 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
     }
 
     // Keywords / Special
+    if (tk.type == TOK_DO)
+    {
+        Token do_tok = lexer_next(l); // eat 'do'
+        ASTNode *body = parse_block(ctx, l);
+
+        // Expect 'while'
+        Token while_tok = lexer_peek(l);
+        if (while_tok.type != TOK_IDENT || strncmp(while_tok.start, "while", 5) != 0 ||
+            while_tok.len != 5)
+        {
+            zpanic_at(while_tok, "Expected 'while' after do block");
+        }
+        lexer_next(l); // eat 'while'
+
+        ASTNode *cond = parse_expression(ctx, l);
+        if (lexer_peek(l).type == TOK_SEMICOLON)
+        {
+            lexer_next(l);
+        }
+
+        ASTNode *n = ast_create(NODE_DO_WHILE);
+        n->token = do_tok;
+        n->do_while_stmt.body = body;
+        n->do_while_stmt.condition = cond;
+        n->do_while_stmt.loop_label = NULL;
+        return n;
+    }
     if (tk.type == TOK_TRAIT)
     {
         return parse_trait(ctx, l);
@@ -2275,7 +3111,7 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
         {
             zpanic_at(lexer_peek(l), "Expected 'let' after autofree");
         }
-        s = parse_var_decl(ctx, l);
+        s = parse_var_decl(ctx, l, 0);
         s->var_decl.is_autofree = 1;
         // Mark symbol as autofree to suppress unused variable warning
         ZenSymbol *sym = find_symbol_entry(ctx, s->var_decl.name);
@@ -2298,20 +3134,20 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
 
         while (lexer_peek(&new_l).type != TOK_EOF)
         {
-            ASTNode *s = parse_statement(ctx, &new_l);
-            if (!s)
+            ASTNode *inner_s = parse_statement(ctx, &new_l);
+            if (!inner_s)
             {
                 break;
             }
             if (!head)
             {
-                head = s;
+                head = inner_s;
             }
             else
             {
-                tail->next = s;
+                tail->next = inner_s;
             }
-            tail = s;
+            tail = inner_s;
             while (tail->next)
             {
                 tail = tail->next;
@@ -2341,7 +3177,7 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
     }
     if (tk.type == TOK_DEF)
     {
-        return parse_def(ctx, l);
+        return parse_def(ctx, l, 0);
     }
 
     // Identifiers (Keywords or Expressions)
@@ -2400,28 +3236,28 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
             memcpy(content, start, len);
             content[len] = 0;
 
-            ASTNode *s = ast_create(NODE_RAW_STMT);
-            s->raw_stmt.content = normalize_raw_content(content);
+            ASTNode *raw_s = ast_create(NODE_RAW_STMT);
+            raw_s->token = tk;
+            raw_s->raw_stmt.content = normalize_raw_content(content);
             free(content);
-            return s;
+            return raw_s;
         }
 
         // Check for plugin blocks
         if (strncmp(tk.start, "plugin", 6) == 0 && tk.len == 6)
         {
             lexer_next(l); // consume 'plugin'
-            return parse_plugin(ctx, l);
+            return parse_plugin(ctx, l, tk);
         }
 
         if (strncmp(tk.start, "let", 3) == 0 && tk.len == 3)
         {
-            return parse_var_decl(ctx, l);
+            return parse_var_decl(ctx, l, 0);
         }
 
         if (strncmp(tk.start, "var", 3) == 0 && tk.len == 3)
         {
-            zpanic_at(tk, "'var' is deprecated. Use 'let' instead.");
-            return parse_var_decl(ctx, l);
+            return parse_var_decl(ctx, l, 0);
         }
 
         // Static local variable: static let x = 0;
@@ -2431,7 +3267,7 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
             Token next = lexer_peek(l);
             if (strncmp(next.start, "let", 3) == 0 && next.len == 3)
             {
-                ASTNode *v = parse_var_decl(ctx, l);
+                ASTNode *v = parse_var_decl(ctx, l, 0);
                 v->var_decl.is_static = 1;
                 return v;
             }
@@ -2440,8 +3276,7 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
 
         if (strncmp(tk.start, "const", 5) == 0 && tk.len == 5)
         {
-            zpanic_at(tk, "'const' for declarations is deprecated. Use 'def' for constants or 'let "
-                          "x: const T' for read-only variables.");
+            return parse_var_decl(ctx, l, 0);
         }
         if (strncmp(tk.start, "return", 6) == 0 && tk.len == 6)
         {
@@ -2478,15 +3313,22 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
             ASTNode *n = ast_create(NODE_BREAK);
             n->token = break_token;
             n->break_stmt.target_label = NULL;
-            // Check for 'label
-            if (lexer_peek(l).type == TOK_CHAR)
+            // Check for 'label or label
+            if (lexer_peek(l).type == TOK_CHAR || lexer_peek(l).type == TOK_IDENT)
             {
                 Token label_tok = lexer_next(l);
-                // Extract label name (strip quotes)
-                char *label = xmalloc(label_tok.len);
-                strncpy(label, label_tok.start + 1, label_tok.len - 2);
-                label[label_tok.len - 2] = 0;
-                n->break_stmt.target_label = label;
+                if (label_tok.type == TOK_CHAR)
+                {
+                    // Extract label name (strip quotes)
+                    char *label = xmalloc(label_tok.len);
+                    strncpy(label, label_tok.start + 1, label_tok.len - 2);
+                    label[label_tok.len - 2] = 0;
+                    n->break_stmt.target_label = label;
+                }
+                else
+                {
+                    n->break_stmt.target_label = token_strdup(label_tok);
+                }
             }
             if (lexer_peek(l).type == TOK_SEMICOLON)
             {
@@ -2509,13 +3351,20 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
             ASTNode *n = ast_create(NODE_CONTINUE);
             n->token = continue_token;
             n->continue_stmt.target_label = NULL;
-            if (lexer_peek(l).type == TOK_CHAR)
+            if (lexer_peek(l).type == TOK_CHAR || lexer_peek(l).type == TOK_IDENT)
             {
                 Token label_tok = lexer_next(l);
-                char *label = xmalloc(label_tok.len);
-                strncpy(label, label_tok.start + 1, label_tok.len - 2);
-                label[label_tok.len - 2] = 0;
-                n->continue_stmt.target_label = label;
+                if (label_tok.type == TOK_CHAR)
+                {
+                    char *label = xmalloc(label_tok.len);
+                    strncpy(label, label_tok.start + 1, label_tok.len - 2);
+                    label[label_tok.len - 2] = 0;
+                    n->continue_stmt.target_label = label;
+                }
+                else
+                {
+                    n->continue_stmt.target_label = token_strdup(label_tok);
+                }
             }
             if (lexer_peek(l).type == TOK_SEMICOLON)
             {
@@ -2652,33 +3501,7 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
             return n;
         }
 
-        // Do-while loop: do { body } while condition;
-        if (strncmp(tk.start, "do", 2) == 0 && tk.len == 2)
-        {
-            lexer_next(l); // eat 'do'
-            ASTNode *body = parse_block(ctx, l);
-
-            // Expect 'while'
-            Token while_tok = lexer_peek(l);
-            if (while_tok.type != TOK_IDENT || strncmp(while_tok.start, "while", 5) != 0 ||
-                while_tok.len != 5)
-            {
-                zpanic_at(while_tok, "Expected 'while' after do block");
-            }
-            lexer_next(l); // eat 'while'
-
-            ASTNode *cond = parse_expression(ctx, l);
-            if (lexer_peek(l).type == TOK_SEMICOLON)
-            {
-                lexer_next(l);
-            }
-
-            ASTNode *n = ast_create(NODE_DO_WHILE);
-            n->do_while_stmt.body = body;
-            n->do_while_stmt.condition = cond;
-            n->do_while_stmt.loop_label = NULL;
-            return n;
-        }
+        // Do-while logic was moved.
 
         if (strncmp(tk.start, "defer", 5) == 0 && tk.len == 5)
         {
@@ -2734,22 +3557,61 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
 
         // Label detection: identifier followed by : (but not ::)
         {
-            Lexer lookahead = *l;
-            Token ident = lexer_next(&lookahead);
-            Token maybe_colon = lexer_peek(&lookahead);
+            Lexer inner_lookahead = *l;
+            Token ident = lexer_next(&inner_lookahead);
+            Token maybe_colon = lexer_peek(&inner_lookahead);
             if (maybe_colon.type == TOK_COLON)
             {
                 // Check it's not :: (double colon for namespaces)
-                lexer_next(&lookahead);
-                Token after_colon = lexer_peek(&lookahead);
+                lexer_next(&inner_lookahead);
+                Token after_colon = lexer_peek(&inner_lookahead);
                 if (after_colon.type != TOK_COLON)
                 {
                     // This is a label!
                     lexer_next(l); // eat identifier
                     lexer_next(l); // eat :
+
+                    char *label_name = token_strdup(ident);
+                    ASTNode *next = parse_statement(ctx, l);
+
+                    if (next)
+                    {
+                        if (next->type == NODE_WHILE)
+                        {
+                            next->while_stmt.loop_label = label_name;
+                            return next;
+                        }
+                        else if (next->type == NODE_FOR)
+                        {
+                            next->for_stmt.loop_label = label_name;
+                            return next;
+                        }
+                        else if (next->type == NODE_FOR_RANGE)
+                        {
+                            next->for_range.loop_label = label_name;
+                            return next;
+                        }
+                        else if (next->type == NODE_LOOP)
+                        {
+                            next->loop_stmt.loop_label = label_name;
+                            return next;
+                        }
+                        else if (next->type == NODE_REPEAT)
+                        {
+                            next->repeat_stmt.loop_label = label_name;
+                            return next;
+                        }
+                        else if (next->type == NODE_DO_WHILE)
+                        {
+                            next->do_while_stmt.loop_label = label_name;
+                            return next;
+                        }
+                    }
+
                     ASTNode *n = ast_create(NODE_LABEL);
-                    n->label_stmt.label_name = token_strdup(ident);
+                    n->label_stmt.label_name = label_name;
                     n->token = ident;
+                    n->next = next;
                     return n;
                 }
             }
@@ -2770,27 +3632,23 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
             lexer_next(l); // eat keyword
 
             Token t = lexer_next(l);
-            if (t.type != TOK_STRING && t.type != TOK_FSTRING)
+            if (t.type != TOK_STRING && t.type != TOK_FSTRING && t.type != TOK_RAW_STRING)
             {
+                if (t.type == TOK_LPAREN)
+                {
+                    zpanic_at(t,
+                              "Expected string literal after '%.*s'. Note: '%.*s' is a keyword and "
+                              "does NOT use parentheses ().",
+                              (int)tk.len, tk.start, (int)tk.len, tk.start);
+                }
                 zpanic_at(t, "Expected string literal after print/eprint");
             }
 
-            char *inner = xmalloc(t.len);
-            if (t.type == TOK_FSTRING)
-            {
-                strncpy(inner, t.start + 2, t.len - 3);
-                inner[t.len - 3] = 0;
-            }
-            else
-            {
-                strncpy(inner, t.start + 1, t.len - 2);
-                inner[t.len - 2] = 0;
-            }
-
+            char *inner = token_get_string_content(t);
             char **used_syms = NULL;
             int used_count = 0;
-            char *code =
-                process_printf_sugar(ctx, inner, is_ln, target, &used_syms, &used_count, 1);
+            char *code = process_printf_sugar(ctx, t, inner, is_ln, target, &used_syms, &used_count,
+                                              1, (t.type == TOK_RAW_STRING), 0);
             free(inner);
 
             if (lexer_peek(l).type == TOK_SEMICOLON)
@@ -2799,6 +3657,7 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
             }
 
             ASTNode *n = ast_create(NODE_RAW_STMT);
+            n->token = t;
             // Append semicolon to Statement Expression to make it a valid statement
             char *stmt_code = xmalloc(strlen(code) + 2);
             sprintf(stmt_code, "%s;", code);
@@ -2856,16 +3715,16 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
         s->line = tk.line;
     }
 
-    // Check for discarded must_use result
+    // Check for discarded required result
     if (s && s->type == NODE_EXPR_CALL)
     {
         ASTNode *callee = s->call.callee;
         if (callee && callee->type == NODE_EXPR_VAR)
         {
             FuncSig *sig = find_func(ctx, callee->var_ref.name);
-            if (sig && sig->must_use)
+            if (sig && sig->required)
             {
-                zwarn_at(tk, "Ignoring return value of function marked @must_use");
+                zwarn_at(tk, "Ignoring return value of function marked @required");
                 fprintf(stderr, COLOR_CYAN "   = note: " COLOR_RESET
                                            "Use the result or explicitly discard with `_ = ...`\n");
             }
@@ -2877,14 +3736,33 @@ ASTNode *parse_statement(ParserContext *ctx, Lexer *l)
 
 ASTNode *parse_block(ParserContext *ctx, Lexer *l)
 {
-    lexer_next(l); // eat '{'
+    expect(l, TOK_LBRACE, "Expected '{' to start a block");
     enter_scope(ctx);
     ASTNode *head = 0, *tail = 0;
-
+    Token t = lexer_peek(l);
     int unreachable = 0;
-
     while (1)
     {
+        // Granular resync: if a statement sub-parser failed, skip until ';' or '}'
+        if (ctx->is_fault_tolerant && ctx->had_error)
+        {
+            ctx->had_error = 0;
+            while (1)
+            {
+                Token r = lexer_peek(l);
+                if (r.type == TOK_EOF || r.type == TOK_RBRACE || r.type == TOK_SEMICOLON)
+                {
+                    if (r.type == TOK_SEMICOLON)
+                    {
+                        lexer_next(l); // consume the semicolon
+                    }
+                    break;
+                }
+                lexer_next(l);
+            }
+            continue;
+        }
+
         skip_comments(l);
         Token tk = lexer_peek(l);
         if (tk.type == TOK_RBRACE)
@@ -2931,6 +3809,7 @@ ASTNode *parse_block(ParserContext *ctx, Lexer *l)
             continue;
         }
 
+        Token prev_t = lexer_peek(l);
         ASTNode *s = parse_statement(ctx, l);
         if (s)
         {
@@ -2957,6 +3836,16 @@ ASTNode *parse_block(ParserContext *ctx, Lexer *l)
                 }
             }
         }
+        else
+        {
+            // If we didn't get a statement and didn't consume any tokens, we're stuck.
+            // Consume at least one token to avoid infinite loop.
+            Token cur_t = lexer_peek(l);
+            if (cur_t.start == prev_t.start)
+            {
+                lexer_next(l);
+            }
+        }
     }
 
     // Check for unused variables in this block scope
@@ -2965,9 +3854,9 @@ ASTNode *parse_block(ParserContext *ctx, Lexer *l)
         ZenSymbol *sym = ctx->current_scope->symbols;
         while (sym)
         {
-            // Skip special names and already warned
-            if (!sym->is_used && sym->name[0] != '_' && strcmp(sym->name, "it") != 0 &&
-                strcmp(sym->name, "self") != 0)
+            // Skip special names, non-variables, and already warned
+            if (!sym->is_used && (sym->kind == SYM_VARIABLE) && sym->name[0] != '_' &&
+                strcmp(sym->name, "it") != 0 && strcmp(sym->name, "self") != 0)
             {
                 // Skip autofree variables (used implicitly for cleanup)
                 if (sym->is_autofree)
@@ -2998,6 +3887,7 @@ ASTNode *parse_block(ParserContext *ctx, Lexer *l)
 
     exit_scope(ctx);
     ASTNode *b = ast_create(NODE_BLOCK);
+    b->token = t;
     b->block.statements = head;
     return b;
 }
@@ -3182,7 +4072,7 @@ void try_parse_c_struct_decl(ParserContext *ctx, const char *line)
                 char *name = xmalloc(name_len + 1);
                 strncpy(name, name_start, name_len);
                 name[name_len] = '\0';
-                register_type_alias(ctx, name, name, 1, NULL);
+                register_type_alias(ctx, name, name, NULL, 1, NULL, (Token){0}, 0);
                 register_extern_symbol(ctx, name);
                 free(name);
             }
@@ -3226,7 +4116,7 @@ void try_parse_c_struct_decl(ParserContext *ctx, const char *line)
         const char *c_keyword = is_union ? "union" : "struct";
         char *c_type = xmalloc(strlen(c_keyword) + 1 + tag_len + 1);
         sprintf(c_type, "%s %s", c_keyword, tag_name);
-        register_type_alias(ctx, tag_name, c_type, 1, NULL);
+        register_type_alias(ctx, tag_name, c_type, NULL, 1, NULL, (Token){0}, 0);
         register_extern_symbol(ctx, tag_name);
         free(c_type);
     }
@@ -3275,7 +4165,7 @@ void scan_c_header_contents(ParserContext *ctx, const char *path, int depth)
     }
 
     // Compute directory of the current header for resolving relative includes
-    char header_dir[1024];
+    char header_dir[MAX_PATH_LEN];
     header_dir[0] = 0;
     const char *last_slash = z_path_last_sep(path);
     if (last_slash)
@@ -3349,11 +4239,11 @@ void scan_c_header_contents(ParserContext *ctx, const char *path, int depth)
                             {
                                 inc_len = 255; // Sanity limit for include paths
                             }
-                            char inc_name[256];
+                            char inc_name[MAX_VAR_NAME_LEN];
                             memcpy(inc_name, inc, inc_len);
                             inc_name[inc_len] = '\0';
 
-                            char nested_path[1280];
+                            char nested_path[MAX_PATH_LEN * 2];
                             if (header_dir[0])
                             {
                                 snprintf(nested_path, sizeof(nested_path), "%s/%s", header_dir,
@@ -3398,7 +4288,7 @@ ASTNode *parse_include(ParserContext *ctx, Lexer *l)
     {
         // System include: include <raylib.h>
         is_system = 1;
-        char buf[256];
+        char buf[MAX_SHORT_MSG_LEN];
         buf[0] = 0;
         while (1)
         {
@@ -3418,10 +4308,7 @@ ASTNode *parse_include(ParserContext *ctx, Lexer *l)
     {
         // Local include: include "file.h"
         is_system = 0;
-        int len = t.len - 2;
-        path = xmalloc(len + 1);
-        strncpy(path, t.start + 1, len);
-        path[len] = 0;
+        path = token_get_string_content(t);
     }
 
     ASTNode *n = ast_create(NODE_INCLUDE);
@@ -3453,10 +4340,7 @@ ASTNode *parse_import(ParserContext *ctx, Lexer *l)
         }
 
         // Extract plugin name (strip quotes)
-        int name_len = plugin_tok.len - 2;
-        char *plugin_name = xmalloc(name_len + 1);
-        strncpy(plugin_name, plugin_tok.start + 1, name_len);
-        plugin_name[name_len] = '\0';
+        char *plugin_name = token_get_string_content(plugin_tok);
 
         if (plugin_name[0] == '.' &&
             (plugin_name[1] == '/' || (plugin_name[1] == '.' && plugin_name[2] == '/')))
@@ -3466,7 +4350,7 @@ ASTNode *parse_import(ParserContext *ctx, Lexer *l)
             if (last_slash)
             {
                 *last_slash = 0;
-                char resolved_path[1024];
+                char resolved_path[MAX_PATH_LEN];
                 snprintf(resolved_path, sizeof(resolved_path), "%s/%s", current_dir, plugin_name);
                 free(plugin_name);
                 plugin_name = xstrdup(resolved_path);
@@ -3532,8 +4416,9 @@ ASTNode *parse_import(ParserContext *ctx, Lexer *l)
             symbols[symbol_count][sym_tok.len] = 0;
 
             // Check for 'as alias'
-            Token next = lexer_peek(l);
-            if (next.type == TOK_IDENT && next.len == 2 && strncmp(next.start, "as", 2) == 0)
+            Token inner_next = lexer_peek(l);
+            if (inner_next.type == TOK_IDENT && inner_next.len == 2 &&
+                strncmp(inner_next.start, "as", 2) == 0)
             {
                 lexer_next(l); // eat 'as'
                 Token alias_tok = lexer_next(l);
@@ -3568,94 +4453,44 @@ ASTNode *parse_import(ParserContext *ctx, Lexer *l)
 
     // Parse filename
     Token t = lexer_next(l);
-    if (t.type != TOK_STRING)
+    if (t.type != TOK_STRING && t.type != TOK_RAW_STRING)
     {
         zpanic_at(t,
                   "Expected string (filename) after 'from' in selective import, got "
                   "type %d",
                   t.type);
     }
-    int ln = t.len - 2; // Remove quotes
-    char *fn = xmalloc(ln + 1);
-    strncpy(fn, t.start + 1, ln);
-    fn[ln] = 0;
+    char *fn = token_get_string_content(t);
 
-    // Resolve paths relative to current file
-    char resolved_path[1024];
-    int is_explicit_relative = (fn[0] == '.' && (fn[1] == '/' || (fn[1] == '.' && fn[2] == '/')));
-
-    // Try to resolve relative to current file if not absolute
-    // On Windows, absolute paths can start with drive letter (C:\) or backslash
-    int is_abs = z_is_abs_path(fn);
-
-    if (!is_abs)
+    // Resolve paths
+    char *resolved = z_resolve_path(fn, g_current_filename);
+    if (!resolved)
     {
-        char *current_dir = xstrdup(g_current_filename);
-        char *last_slash = z_path_last_sep(current_dir);
-
-        if (last_slash)
+        // Fallback for C headers: allow them to be "not found" locally (they might be system
+        // headers)
+        if (strlen(fn) > 2 && strcmp(fn + strlen(fn) - 2, ".h") == 0)
         {
-            *last_slash = 0; // Truncate to directory
-
-            // Handles explicit relative AND implicit relative lookups
-            snprintf(resolved_path, sizeof(resolved_path), "%s/%s", current_dir, fn);
-
-            // If it's an explicit relative path, OR if the file exists at this relative location
-            if (is_explicit_relative || access(resolved_path, R_OK) == 0)
-            {
-                free(fn);
-                fn = xstrdup(resolved_path);
-            }
+            resolved = xstrdup(fn);
         }
-        free(current_dir);
-    }
-
-    // Check if file exists, if not try system-wide paths
-    if (access(fn, R_OK) != 0)
-    {
-        // Try system-wide standard library location
-        const char *system_paths[] = {getenv("ZC_ROOT"), "/usr/local/share/zenc",
-                                      "/usr/share/zenc"};
-        size_t system_paths_count = sizeof(system_paths) / sizeof(*system_paths);
-
-        char system_path[1024];
-        int found = 0;
-
-        for (size_t i = 0; i < system_paths_count && !found; i++)
+        else
         {
-            if (!system_paths[i])
-            {
-                continue;
-            }
-            snprintf(system_path, sizeof(system_path), "%s/%s", system_paths[i], fn);
-            if (access(system_path, R_OK) == 0)
-            {
-                free(fn);
-                fn = xstrdup(system_path);
-                found = 1;
-            }
-        }
-
-        if (!found)
-        {
-            // File not found anywhere - will error later when trying to open
-        }
-    }
-
-    // Canonicalize path to avoid duplicates (for example: "./std/io.zc" vs "std/io.zc")
-    // Only resolve if file exists! On Windows, realpath (_fullpath) resolves non-existent files to
-    // CWD.
-    if (access(fn, R_OK) == 0)
-    {
-        char *real_fn = realpath(fn, NULL);
-        if (real_fn)
-        {
+            zpanic_at(t, "Could not find module: %s", fn);
             free(fn);
-            fn = real_fn;
+            return NULL; // In fault-tolerant mode (LSP), zpanic_at returns.
         }
     }
+    free(fn);
+    fn = resolved;
 
-    // Check if file already imported
+    // In fault-tolerant LSP mode zpanic_at reports the diagnostic and returns.
+    // Bail out here instead of dereferencing a NULL path below.
+    if (!fn)
+    {
+        ASTNode *dummy = ast_create(NODE_BLOCK);
+        dummy->block.statements = NULL;
+        return dummy;
+    }
+
     if (is_file_imported(ctx, fn))
     {
         free(fn);
@@ -3799,7 +4634,8 @@ ASTNode *parse_import(ParserContext *ctx, Lexer *l)
         free(module_base_name);
     }
 
-    free(fn);
+    // Do not free(fn) here, because the Lexer tokens generated during
+    // parse_program_nodes hold a direct pointer (t.file) to this string!
     return r;
 }
 
@@ -3844,8 +4680,12 @@ char *run_comptime_block(ParserContext *ctx, Lexer *l)
     lexer_init(&cl, wrapped_code);
     ParserContext cctx;
     memset(&cctx, 0, sizeof(cctx));
-    enter_scope(&cctx); // Global scope
+    cctx.global_scope = symbol_scope_create(NULL, "Global");
+    cctx.current_scope = cctx.global_scope;
     register_builtins(&cctx);
+    register_comptime_builtins(&cctx);
+    cctx.has_external_includes = 1; // Suppress undefined warnings for comptime helpers
+    cctx.is_comptime = 1;
 
     ASTNode *block = parse_block(&cctx, &cl);
     ASTNode *nodes = block ? block->block.statements : NULL;
@@ -3858,6 +4698,7 @@ char *run_comptime_block(ParserContext *ctx, Lexer *l)
     if (!f)
     {
         zpanic_at(lexer_peek(l), "Could not create temp file %s", filename);
+        return NULL; // Prevent crash in LSP mode
     }
 
     emit_preamble(ctx, f);
@@ -3897,7 +4738,7 @@ char *run_comptime_block(ParserContext *ctx, Lexer *l)
         }
         else if (curr->type == NODE_ENUM)
         {
-            emit_enum_protos(curr, f);
+            emit_enum_protos(&cctx, curr, f);
         }
         else if (curr->type == NODE_CONST)
         {
@@ -3960,14 +4801,23 @@ char *run_comptime_block(ParserContext *ctx, Lexer *l)
     fprintf(f, "return 0;\n}\n");
     fclose(f);
 
-    char cmdbuf[4096];
-    char bin[1024];
+    char cmdbuf[MAX_PATH_LEN * 3];
+    char bin[MAX_PATH_LEN];
 
     sprintf(bin, "%s%s", filename, z_get_exe_ext());
 
-    // Construct compilation command
-    sprintf(cmdbuf, "%s %s -o %s -Istd -Istd/third-party/tre/include%s", g_config.cc, filename, bin,
-            z_get_comptime_link_flags());
+    // Use quotes for paths to prevent injection/errors with spaces
+#if ZC_OS_WINDOWS
+    // On Windows, system() uses cmd.exe /c. If the command starts with a quote and has multiple
+    // quotes, cmd.exe strips the first and last quote. Wrapping the whole thing in another pair of
+    // quotes fixes this.
+    snprintf(cmdbuf, sizeof(cmdbuf),
+             "\"%s \"%s\" -o \"%s\" -Istd -Istd/third-party/tre/include %s\"", g_config.cc,
+             filename, bin, z_get_comptime_link_flags());
+#else
+    snprintf(cmdbuf, sizeof(cmdbuf), "%s \"%s\" -o \"%s\" -Istd -Istd/third-party/tre/include %s",
+             g_config.cc, filename, bin, z_get_comptime_link_flags());
+#endif
 
     if (!g_config.verbose)
     {
@@ -3980,11 +4830,15 @@ char *run_comptime_block(ParserContext *ctx, Lexer *l)
         zpanic_at(lexer_peek(l), "Comptime compilation failed for:\n%s", code);
     }
 
-    char out_file[1024];
+    char out_file[MAX_PATH_LEN];
     sprintf(out_file, "%s.out", filename);
 
     // Execution command
-    sprintf(cmdbuf, "%s%s > %s", z_get_run_prefix(), bin, out_file);
+#if ZC_OS_WINDOWS
+    snprintf(cmdbuf, sizeof(cmdbuf), "\"%s\"%s\" > \"%s\"\"", z_get_run_prefix(), bin, out_file);
+#else
+    snprintf(cmdbuf, sizeof(cmdbuf), "%s\"%s\" > \"%s\"", z_get_run_prefix(), bin, out_file);
+#endif
 
     if (system(cmdbuf) != 0)
     {
@@ -4015,7 +4869,7 @@ ASTNode *parse_comptime(ParserContext *ctx, Lexer *l)
 }
 
 // Parse plugin block: plugin name ... end
-ASTNode *parse_plugin(ParserContext *ctx, Lexer *l)
+ASTNode *parse_plugin(ParserContext *ctx, Lexer *l, Token tok)
 {
     (void)ctx;
 
@@ -4066,6 +4920,7 @@ ASTNode *parse_plugin(ParserContext *ctx, Lexer *l)
 
     // Create plugin node
     ASTNode *n = ast_create(NODE_PLUGIN);
+    n->token = tok;
     n->plugin_stmt.plugin_name = plugin_name;
     n->plugin_stmt.body = body;
 

@@ -1,5 +1,6 @@
 
 #include "../ast/ast.h"
+#include "../constants.h"
 #include "../zprep.h"
 #include "codegen.h"
 #include <stdio.h>
@@ -7,7 +8,7 @@
 #include <string.h>
 
 // Helper: Check if a struct depends on another struct/enum by-value.
-static int struct_depends_on(ASTNode *s1, const char *target_name)
+static int struct_depends_on(ParserContext *ctx, ASTNode *s1, const char *target_name)
 {
     if (!s1)
     {
@@ -46,15 +47,25 @@ static int struct_depends_on(ASTNode *s1, const char *target_name)
                     clean += 6;
                 }
 
+                if (ctx)
+                {
+                    const char *alias = find_type_alias(ctx, clean);
+                    if (alias)
+                    {
+                        clean = alias;
+                    }
+                }
+
+                char *mangled_clean = replace_string_type(clean);
+
                 // Check for match
                 size_t len = strlen(target_name);
-                if (strncmp(clean, target_name, len) == 0)
+                int is_match = (strncmp(mangled_clean, target_name, len) == 0);
+                free(mangled_clean);
+
+                if (is_match)
                 {
-                    char next = clean[len];
-                    if (next == 0 || next == '[' || isspace(next))
-                    {
-                        return 1;
-                    }
+                    return 1;
                 }
             }
             field = field->next;
@@ -68,7 +79,7 @@ static int struct_depends_on(ASTNode *s1, const char *target_name)
         {
             if (variant->type == NODE_ENUM_VARIANT && variant->variant.payload)
             {
-                char *type_str = type_to_string(variant->variant.payload);
+                char *type_str = type_to_c_string(variant->variant.payload);
                 if (type_str)
                 {
                     if (strchr(type_str, '*'))
@@ -92,8 +103,22 @@ static int struct_depends_on(ASTNode *s1, const char *target_name)
                         clean += 6;
                     }
 
+                    if (ctx)
+                    {
+                        const char *alias = find_type_alias(ctx, clean);
+                        if (alias)
+                        {
+                            clean = alias;
+                        }
+                    }
+                    char *mangled_clean = replace_string_type(clean);
+
+                    // Check for match
                     size_t len = strlen(target_name);
-                    if (strncmp(clean, target_name, len) == 0)
+                    int is_match = (strncmp(mangled_clean, target_name, len) == 0);
+                    free(mangled_clean);
+
+                    if (is_match)
                     {
                         char next = clean[len];
                         if (next == 0 || next == '[' || isspace(next))
@@ -113,7 +138,7 @@ static int struct_depends_on(ASTNode *s1, const char *target_name)
 }
 
 // Topologically sort a list of struct/enum nodes.
-static ASTNode *topo_sort_structs(ASTNode *head)
+static ASTNode *topo_sort_structs(ParserContext *ctx, ASTNode *head)
 {
     if (!head)
     {
@@ -199,7 +224,7 @@ static ASTNode *topo_sort_structs(ASTNode *head)
                     dep_name = nodes[j]->enm.name;
                 }
 
-                if (dep_name && struct_depends_on(nodes[i], dep_name))
+                if (dep_name && struct_depends_on(ctx, nodes[i], dep_name))
                 {
                     can_emit = 0;
                     break;
@@ -303,14 +328,20 @@ static void emit_auto_drop_glues(ParserContext *ctx, ASTNode *structs, FILE *out
         if (s->type == NODE_STRUCT && s->type_info && s->type_info->traits.has_drop &&
             !s->strct.is_template)
         {
+            if (s->cfg_condition)
+            {
+                fprintf(out, "#if %s\n", s->cfg_condition);
+            }
+
             char *sname = s->strct.name;
             fprintf(out, "// Auto-Generated RAII Glue for %s\n", sname);
-            fprintf(out, "void %s__Drop_glue(%s *self) {\n", sname, sname);
+            fprintf(out, "void %s__Drop__glue(%s *self) {\n", sname, sname);
 
-            int has_manual_drop = check_impl(ctx, "Drop", sname);
-            if (has_manual_drop)
+            char glue_mangled[MAX_MANGLED_NAME_LEN];
+            snprintf(glue_mangled, sizeof(glue_mangled), "%s__Drop__drop", sname);
+            if (find_func(ctx, glue_mangled))
             {
-                fprintf(out, "    %s__Drop_drop(self);\n", sname);
+                fprintf(out, "    %s__Drop__drop(self);\n", sname);
             }
 
             ASTNode *field = s->strct.fields;
@@ -319,20 +350,45 @@ static void emit_auto_drop_glues(ParserContext *ctx, ASTNode *structs, FILE *out
                 Type *ft = field->type_info;
                 if (ft && ft->kind == TYPE_STRUCT && ft->name)
                 {
-                    ASTNode *fdef = find_struct_def_codegen(ctx, ft->name);
+                    ASTNode *fdef = find_struct_def(ctx, ft->name);
                     if (fdef && fdef->type_info && fdef->type_info->traits.has_drop)
                     {
-                        fprintf(out, "    %s__Drop_glue(&self->%s);\n", ft->name,
+                        fprintf(out, "    %s__Drop__glue(&self->%s);\n", ft->name,
                                 field->field.name);
                     }
                 }
                 field = field->next;
             }
-
             fprintf(out, "}\n\n");
+            if (s->cfg_condition)
+            {
+                fprintf(out, "#endif\n");
+            }
+            fprintf(out, "\n");
         }
         s = s->next;
     }
+}
+
+static void emit_generic_drop_macro(ParserContext *ctx, ASTNode *structs, FILE *out)
+{
+    (void)ctx;
+    fprintf(out, "// Global Generic Drop Dispatch\n");
+    fprintf(out, "#define _z_drop(x) _Generic((x)");
+
+    ASTNode *s = structs;
+    while (s)
+    {
+        if (s->type == NODE_STRUCT && s->type_info && s->type_info->traits.has_drop &&
+            !s->strct.is_template)
+        {
+            char *sname = s->strct.name;
+            fprintf(out, ", \\\n    %s: %s__Drop__glue((void*)&(x))", sname, sname);
+        }
+        s = s->next;
+    }
+
+    fprintf(out, ", \\\n    default: (void)0)\n\n");
 }
 
 // Main entry point for code generation.
@@ -340,12 +396,15 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
 {
     if (node->type == NODE_ROOT)
     {
+        ctx->current_scope = ctx->global_scope;
         ASTNode *kids = node->root.children;
         while (kids && kids->type == NODE_ROOT)
         {
             kids = kids->root.children;
         }
 
+        g_current_func_ret_type = NULL;
+        g_current_lambda = NULL;
         global_user_structs = kids;
 
         if (!ctx->skip_preamble)
@@ -356,11 +415,15 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
 
         for (int i = 0; i < g_config.cfg_define_count; i++)
         {
-            fprintf(out, "#ifndef %s\n#define %s 1\n#endif\n", g_config.cfg_defines[i],
-                    g_config.cfg_defines[i]);
+            fprintf(out, "#ifndef ZC_CFG_%s\n#define ZC_CFG_%s 1\n#endif\n",
+                    g_config.cfg_defines[i], g_config.cfg_defines[i]);
         }
 
         emit_includes_and_aliases(kids, out);
+        if (g_config.use_cpp)
+        {
+            fprintf(out, "\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n");
+        }
 
         if (ctx->hoist_out)
         {
@@ -368,7 +431,7 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
             rewind(ctx->hoist_out);
             char buf[4096];
             size_t n;
-            while ((n = fread(buf, 1, sizeof(buf), ctx->hoist_out)) > 0)
+            while (ctx->hoist_out && (n = fread(buf, 1, sizeof(buf), ctx->hoist_out)) > 0)
             {
                 fwrite(buf, 1, n, out);
             }
@@ -485,16 +548,17 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
         }
 
         // Topologically sort.
-        ASTNode *sorted = topo_sort_structs(merged);
+        ASTNode *sorted = topo_sort_structs(ctx, merged);
 
         print_type_defs(ctx, out, sorted);
-        emit_enum_protos(sorted, out);
-        emit_global_aliases(ctx, out); // Emit ALL aliases (including imports)
-        emit_type_aliases(kids, out);  // Emit local aliases (redundant but safe)
+        if (!g_config.use_cpp)
+        {
+            emit_enum_protos(ctx, sorted, out);
+        }
+        emit_global_aliases(ctx, out);
+        emit_type_aliases(kids, out);
         emit_trait_defs(kids, out);
 
-        // Also emit traits from parsed_globals_list (from auto-imported files like std/mem.zc)
-        // but only if they weren't already emitted from kids
         StructRef *trait_ref = ctx->parsed_globals_list;
         while (trait_ref)
         {
@@ -502,16 +566,17 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
             {
                 // Check if this trait was already in kids (explicitly imported)
                 int already_in_kids = 0;
-                ASTNode *k = kids;
-                while (k)
+                ASTNode *k_inner = kids;
+                while (k_inner)
                 {
-                    if (k->type == NODE_TRAIT && k->trait.name && trait_ref->node->trait.name &&
-                        strcmp(k->trait.name, trait_ref->node->trait.name) == 0)
+                    if (k_inner->type == NODE_TRAIT && k_inner->trait.name &&
+                        trait_ref->node->trait.name &&
+                        strcmp(k_inner->trait.name, trait_ref->node->trait.name) == 0)
                     {
                         already_in_kids = 1;
                         break;
                     }
-                    k = k->next;
+                    k_inner = k_inner->next;
                 }
 
                 if (!already_in_kids)
@@ -533,7 +598,8 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
         ASTNode *raw_iter = kids;
         while (raw_iter)
         {
-            if (raw_iter->type == NODE_RAW_STMT && raw_iter->raw_stmt.content)
+            if ((raw_iter->type == NODE_RAW_STMT || raw_iter->type == NODE_PREPROC_DIRECTIVE) &&
+                raw_iter->raw_stmt.content)
             {
                 const char *content = raw_iter->raw_stmt.content;
                 // Skip leading whitespace
@@ -563,7 +629,8 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
         raw_iter = kids;
         while (raw_iter)
         {
-            if (raw_iter->type == NODE_RAW_STMT && raw_iter->raw_stmt.content)
+            if ((raw_iter->type == NODE_RAW_STMT || raw_iter->type == NODE_PREPROC_DIRECTIVE) &&
+                raw_iter->raw_stmt.content)
             {
                 const char *content = raw_iter->raw_stmt.content;
                 while (*content == ' ' || *content == '\t' || *content == '\n')
@@ -610,7 +677,7 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
                     }
                 }
 
-                if (!is_duplicate)
+                if (!is_duplicate && struct_ref->node)
                 {
                     ASTNode *copy = xmalloc(sizeof(ASTNode));
                     *copy = *struct_ref->node;
@@ -621,8 +688,6 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
                 struct_ref = struct_ref->next;
             }
         }
-
-        emit_globals(ctx, merged_globals, out);
 
         ASTNode *merged_funcs = NULL;
         ASTNode *merged_funcs_tail = NULL;
@@ -693,10 +758,48 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
             }
         }
 
+        emit_trait_wrappers(kids, out);
+
+        if (ctx->parsed_globals_list)
+        {
+            StructRef *trait_ref_wrappers = ctx->parsed_globals_list;
+            while (trait_ref_wrappers)
+            {
+                if (trait_ref_wrappers->node && trait_ref_wrappers->node->type == NODE_TRAIT)
+                {
+                    // Check if this trait was already in kids (explicitly imported)
+                    int already_in_kids = 0;
+                    ASTNode *k_inner = kids;
+                    while (k_inner)
+                    {
+                        if (k_inner->type == NODE_TRAIT && k_inner->trait.name &&
+                            trait_ref_wrappers->node->trait.name &&
+                            strcmp(k_inner->trait.name, trait_ref_wrappers->node->trait.name) == 0)
+                        {
+                            already_in_kids = 1;
+                            break;
+                        }
+                        k_inner = k_inner->next;
+                    }
+
+                    if (!already_in_kids)
+                    {
+                        ASTNode *saved_next = trait_ref_wrappers->node->next;
+                        trait_ref_wrappers->node->next = NULL;
+                        emit_trait_wrappers(trait_ref_wrappers->node, out);
+                        trait_ref_wrappers->node->next = saved_next;
+                    }
+                }
+                trait_ref_wrappers = trait_ref_wrappers->next;
+            }
+        }
+
         emit_protos(ctx, merged_funcs, out);
+        emit_globals(ctx, merged_globals, out);
 
         emit_impl_vtables(ctx, out);
         emit_auto_drop_glues(ctx, sorted, out);
+        emit_generic_drop_macro(ctx, sorted, out);
 
         emit_lambda_defs(ctx, out);
 
@@ -714,8 +817,17 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
                     continue;
                 }
 
+                // Resolve opaque alias
+                const char *resolved = find_type_alias(ctx, sname);
+
                 char *mangled = replace_string_type(sname);
-                ASTNode *def = find_struct_def_codegen(ctx, mangled);
+                ASTNode *def = find_struct_def(ctx, mangled);
+                if (!def && resolved)
+                {
+                    free(mangled);
+                    mangled = replace_string_type(resolved);
+                    def = find_struct_def(ctx, mangled);
+                }
                 int skip = 0;
                 if (def)
                 {
@@ -733,7 +845,7 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
                     char *buf = strip_template_suffix(sname);
                     if (buf)
                     {
-                        def = find_struct_def_codegen(ctx, buf);
+                        def = find_struct_def(ctx, buf);
                         if (def && def->strct.is_template)
                         {
                             skip = 1;
@@ -761,7 +873,7 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
                 }
 
                 char *mangled = replace_string_type(sname);
-                ASTNode *def = find_struct_def_codegen(ctx, mangled);
+                ASTNode *def = find_struct_def(ctx, mangled);
                 int skip = 0;
                 if (def)
                 {
@@ -775,7 +887,7 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
                     char *buf = strip_template_suffix(sname);
                     if (buf)
                     {
-                        def = find_struct_def_codegen(ctx, buf);
+                        def = find_struct_def(ctx, buf);
                         if (def && def->strct.is_template)
                         {
                             skip = 1;
@@ -820,6 +932,11 @@ void codegen_node(ParserContext *ctx, ASTNode *node, FILE *out)
         if (!has_user_main && test_count > 0)
         {
             fprintf(out, "\nint main() { _z_run_tests(); return 0; }\n");
+        }
+
+        if (g_config.use_cpp)
+        {
+            fprintf(out, "\n#ifdef __cplusplus\n}\n#endif\n");
         }
 
         // Clean up emitted content tracking list

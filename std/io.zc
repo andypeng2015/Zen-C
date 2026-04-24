@@ -1,40 +1,20 @@
 
 import "./core.zc"
+import "./mem.zc"
 import "./string.zc"
 
 include <stdio.h>
 include <stdarg.h>
 
-// These work directly with const char* in extern declarations
-extern fn vprintf(fmt: const char*, ap: va_list) -> c_int;
-
-// vsnprintf is problematic on macOS because it's a macro that expands to a builtin with a different signature
-// so we wrap it in a C function to avoid the conflict
-extern fn _z_vsnprintf(str: char*, size: usize, fmt: const char*, ap: va_list) -> c_int;
+// EOF is typically -1, but we define it for portability
 
 // EOF is typically -1, but we define it for portability
-def Z_EOF = -1;
-
-// Minimal raw block: only for truly opaque FILE* types that can't be
-// represented in Zen-C extern declarations without type conflicts.
-// These wrappers use void* to avoid FILE* declaration conflicts.
-raw {
-    void* _z_get_stdin(void) { return stdin; }
-    int _z_fgetc(void* stream) { return fgetc((FILE*)stream); }
-    int _z_vsnprintf(char* str, size_t size, const char* fmt, va_list ap) {
-        return vsnprintf(str, size, fmt, ap);
-    }
-}
-
-extern fn _z_get_stdin() -> void*;
-extern fn _z_fgetc(stream: void*) -> c_int;
-
 fn format(fmt: char*, ...) -> char* {
     static let buffer: char[1024];
     let ap: va_list;
     va_start(ap, fmt);
 
-    _z_vsnprintf(buffer, 1024, fmt, ap);
+    vsnprintf(buffer, 1024, fmt, ap);
     va_end(ap);
 
     return (char*)buffer;
@@ -44,20 +24,20 @@ fn format_into(buffer: char*, size: usize, fmt: char*, ...) -> c_int {
     let ap: va_list;
     va_start(ap, fmt);
 
-    let ret = _z_vsnprintf(buffer, size, fmt, ap);
+    let ret = vsnprintf(buffer, size, fmt, ap);
     va_end(ap);
 
     return ret;
 }
 
 fn format_new(fmt: char*, ...) -> char* {
-    let buffer: char* = malloc(1024);
+    let buffer: char* = alloc_n<char>(1024);
     if buffer == NULL return NULL;
     
     let ap: va_list;
     va_start(ap, fmt);
 
-    _z_vsnprintf(buffer, 1024, fmt, ap);
+    vsnprintf(buffer, 1024, fmt, ap);
     va_end(ap);
 
     return buffer;
@@ -83,25 +63,31 @@ fn println(fmt: char*, ...) -> c_int {
 fn readln() -> char* {
     let cap: usize = 64;
     let len: usize = 0;
-    let line: char* = malloc(cap);
-    if (line == NULL) return NULL;
+    let line: char* = alloc_n<char>(cap);
+    if (line == NULL) {
+        return NULL;
+    }
     
     let c: c_int;
-    let std_in = _z_get_stdin();
+    let std_in = stdin;
 
     while (true) {
-        c = _z_fgetc(std_in);
+        c = fgetc(std_in);
         // Explicit cast to avoid -1 becoming UINT64_MAX in some contexts if treated as unsigned
         let eof_c: c_int = -1; 
-        if (c == eof_c) break;
+        if (c == eof_c) {
+            break;
+        }
         let nl_c: c_int = 10;
-        if (c == nl_c) break; // '\n'
+        if (c == nl_c) {
+             break; // '\n'
+        }
 
         if (len + 1 >= cap) {
             cap = cap * 2;
-            let n = realloc(line, cap);
+            let n = realloc_n<char>(line, cap / 2, cap);
             if (n == NULL) {
-                free(line);
+                dealloc<char>(line);
                 return NULL;
             }
             line = n;
@@ -111,14 +97,53 @@ fn readln() -> char* {
         len = len + 1;
     }
     
-    let eof_final: c_int = Z_EOF;
+    let eof_final: int = -1;
     if (len == 0 && c == eof_final) {
-        free(line);
+        dealloc<char>(line);
         return NULL;
     }
     
     line[len] = 0;
     return line;
+}
+
+fn _utf8_seq_len(first_byte: byte) -> usize {
+    let b = (int)first_byte;
+    if ((b & 0x80) == 0) { return 1; } // 0xxxxxxx
+    if ((b & 0xE0) == 0xC0) { return 2; } // 110xxxxx
+    if ((b & 0xF0) == 0xE0) { return 3; } // 1110xxxx
+    if ((b & 0xF8) == 0xF0) { return 4; } // 11110xxx
+    return 1; // Fallback
+}
+
+fn read_rune() -> rune {
+    let std_in = stdin;
+    let c1 = fgetc(std_in);
+    if (c1 == -1) {
+        return (rune)0;
+    }
+    
+    let first = (byte)c1;
+    let len = _utf8_seq_len(first);
+    if (len == 1) {
+        return (rune)first;
+    }
+    
+    let val: uint32_t = 0;
+    if (len == 2) {
+        val = (uint32_t)(first & 0x1F) << 6;
+        val = val | (uint32_t)((byte)fgetc(std_in) & 0x3F);
+    } else if (len == 3) {
+        val = (uint32_t)(first & 0x0F) << 12;
+        val = val | ((uint32_t)((byte)fgetc(std_in) & 0x3F) << 6);
+        val = val | (uint32_t)((byte)fgetc(std_in) & 0x3F);
+    } else if (len == 4) {
+        val = (uint32_t)(first & 0x07) << 18;
+        val = val | ((uint32_t)((byte)fgetc(std_in) & 0x3F) << 12);
+        val = val | ((uint32_t)((byte)fgetc(std_in) & 0x3F) << 6);
+        val = val | (uint32_t)((byte)fgetc(std_in) & 0x3F);
+    }
+    return (rune)val;
 }
 
 // Integer to string conversion
@@ -131,8 +156,10 @@ fn itos(n: int) -> char* {
 
 // Heap-allocated integer to string - caller must free
 fn itos_new(n: int) -> char* {
-    let buffer: char* = malloc(32);
-    if (buffer == NULL) return NULL;
+    let buffer: char* = alloc_n<char>(32);
+    if (buffer == NULL) {
+        return NULL;
+    }
     sprintf(buffer, "%d", n);
     return buffer;
 }
@@ -141,5 +168,31 @@ fn itos_new(n: int) -> char* {
 fn utos(n: uint) -> char* {
     static let buffer: char[32];
     sprintf((char*)buffer, "%u", n);
+    return (char*)buffer;
+}
+
+// Rune to string (UTF-8)
+fn _z_str_rune(r: rune) -> char* {
+    static let buffer: char[5];
+    let val = (uint32_t)r;
+    if (val < 0x80) {
+        buffer[0] = (char)val;
+        buffer[1] = 0;
+    } else if (val < 0x800) {
+        buffer[0] = (char)(0xC0 | (val >> 6));
+        buffer[1] = (char)(0x80 | (val & 0x3F));
+        buffer[2] = 0;
+    } else if (val < 0x10000) {
+        buffer[0] = (char)(0xE0 | (val >> 12));
+        buffer[1] = (char)(0x80 | ((val >> 6) & 0x3F));
+        buffer[2] = (char)(0x80 | (val & 0x3F));
+        buffer[3] = 0;
+    } else {
+        buffer[0] = (char)(0xF0 | (val >> 18));
+        buffer[1] = (char)(0x80 | ((val >> 12) & 0x3F));
+        buffer[2] = (char)(0x80 | ((val >> 6) & 0x3F));
+        buffer[3] = (char)(0x80 | (val & 0x3F));
+        buffer[4] = 0;
+    }
     return (char*)buffer;
 }

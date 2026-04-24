@@ -25,6 +25,8 @@ set SRCS=src\main.c ^
  src\parser\parser_decl.c ^
  src\parser\parser_struct.c ^
  src\ast\ast.c ^
+ src\ast\primitives.c ^
+ src\ast\symbols.c ^
  src\codegen\codegen.c ^
  src\codegen\codegen_stmt.c ^
  src\codegen\codegen_decl.c ^
@@ -36,6 +38,7 @@ set SRCS=src\main.c ^
  src\platform\os.c ^
  src\platform\console.c ^
  src\platform\dylib.c ^
+ src\platform\misra.c ^
  src\utils\config.c ^
  src\diagnostics\diagnostics.c ^
  src\lexer\token.c ^
@@ -44,6 +47,7 @@ set SRCS=src\main.c ^
  src\analysis\const_fold.c ^
  src\lsp\json_rpc.c ^
  src\lsp\lsp_main.c ^
+ src\lsp\lsp_formatter.c ^
  src\lsp\lsp_analysis.c ^
  src\lsp\lsp_semantic.c ^
  src\lsp\lsp_index.c ^
@@ -79,7 +83,7 @@ echo Build success! zc.exe created.
 rem Build plugins
 echo Building plugins...
 if not exist plugins mkdir plugins
-for %%f in (plugins\*.c) do (
-    echo Compiling plugin %%f...
-    %CC% %CFLAGS% -shared -o %%~dpnf.dll %%f
+for %%f in (plugins\*.zc) do (
+    echo Compiling native plugin %%f...
+    .\zc.exe build %%f -shared -o %%~dpnf.dll
 )

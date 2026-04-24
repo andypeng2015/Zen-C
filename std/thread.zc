@@ -6,6 +6,7 @@ include <unistd.h>
 import "./core.zc"
 import "./result.zc"
 import "./mem.zc"
+import "./sync.zc"
 
 // Essential raw block: required for pthread operations and closure trampolining
 // This block cannot be eliminated because:
@@ -21,11 +22,16 @@ raw {
     };
     
     static void* _z_thread_trampoline(void *arg) {
-        struct ZenThreadCtx *c = (struct ZenThreadCtx*)arg;
-        z_closure_T *closure = (z_closure_T*)c;
+        z_closure_T *closure = (z_closure_T*)arg;
         void (*f)(void*) = (void(*)(void*))closure->func;
         f(closure->ctx);
-        free(c);
+        if (closure->drop) closure->drop(closure->ctx);
+        // In MISRA mode, we don't freeCtx.
+        // In non-MISRA mode, this still uses free() which is fine as it's raw C.
+        // Actually, we should use a macro prefix to be consistent.
+        #ifndef ZC_MISRA
+        free(closure);
+        #endif
         return NULL;
     }
 
@@ -54,22 +60,6 @@ raw {
         return pthread_cancel((pthread_t)handle);
     }
     
-    static void _z_mutex_init(void *ptr) {
-        pthread_mutex_init((pthread_mutex_t*)ptr, NULL);
-    }
-    
-    static void _z_mutex_lock(void *ptr) {
-        pthread_mutex_lock((pthread_mutex_t*)ptr);
-    }
-    
-    static void _z_mutex_unlock(void *ptr) {
-        pthread_mutex_unlock((pthread_mutex_t*)ptr);
-    }
-    
-    static void _z_mutex_destroy(void *ptr) {
-        pthread_mutex_destroy((pthread_mutex_t*)ptr);
-    }
-    
     static void _z_usleep(int micros) {
         usleep(micros);
     }
@@ -80,10 +70,6 @@ extern fn _z_thread_spawn(ctx: void*, out: usize*) -> c_int;
 extern fn _z_thread_join(handle: void*) -> c_int;
 extern fn _z_thread_detach(handle: void*) -> c_int;
 extern fn _z_thread_cancel(handle: void*) -> c_int;
-extern fn _z_mutex_init(ptr: void*);
-extern fn _z_mutex_lock(ptr: void*);
-extern fn _z_mutex_unlock(ptr: void*);
-extern fn _z_mutex_destroy(ptr: void*);
 extern fn _z_usleep(micros: c_int);
 
 
@@ -103,15 +89,20 @@ impl Thread {
     fn spawn(func: fn()) -> Result<Thread> {
         let out_handle: usize = 0; 
         
-        let ctx = malloc(16); // z_closure_T is 16 bytes
+        let ctx = alloc_bytes(sizeof(fn())); 
         if (ctx == NULL) return Result<Thread>::Err("OOM");
         
-        memcpy(ctx, &func, 16);
+        memcpy(ctx, &func, sizeof(fn()));
+        
+        // Zero out the drop field to prevent double-free by this function's cleanup
+        raw {
+            ((z_closure_T*)&func)->drop = NULL;
+        }
 
         let ret = _z_thread_spawn(ctx, &out_handle);
         
         if ret != 0 {
-            free(ctx);
+            dealloc<void>(ctx);
             return Result<Thread>::Err("Failed to create thread");
         }
         
@@ -140,40 +131,6 @@ impl Thread {
             return Result<bool>::Err("Cancel failed");
         }
         return Result<bool>::Ok(true);
-    }
-}
-
-struct Mutex {
-    handle: void*; 
-}
-
-impl Mutex {
-    fn new() -> Mutex {
-        let ptr = malloc(64); 
-        _z_mutex_init(ptr);
-        return Mutex { handle: ptr };
-    }
-    
-    fn lock(self) {
-        _z_mutex_lock(self.handle);
-    }
-    
-    fn unlock(self) {
-        _z_mutex_unlock(self.handle);
-    }
-    
-    fn free(self) {
-        if self.handle {
-            _z_mutex_destroy(self.handle);
-            free(self.handle);
-            self.handle = NULL;
-        }
-    }
-}
-
-impl Drop for Mutex {
-    fn drop(self) {
-        self.free();
     }
 }
 

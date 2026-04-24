@@ -1,4 +1,5 @@
 #include "lsp_project.h"
+#include "../constants.h"
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,8 +7,15 @@
 #include <sys/stat.h>
 
 LSPProject *g_project = NULL;
+int g_is_indexing = 0;
 
 static void scan_dir(const char *dir_path);
+
+// Initialize the project with a root directory
+void lsp_project_init(const char *root_path);
+
+// Perform full project indexing
+void lsp_project_index_workspace();
 
 void lsp_project_init(const char *root_path)
 {
@@ -24,14 +32,54 @@ void lsp_project_init(const char *root_path)
     // Create a persistent global context
     g_project->ctx = xcalloc(1, sizeof(ParserContext));
     g_project->ctx->is_fault_tolerant = 1;
+    g_project->ctx->hoist_out = tmpfile(); // Support hoisting in LSP
+    if (!g_project->ctx->hoist_out)
+    {
+        fprintf(stderr, "zls: Warning: Failed to create hoist_out temporary file. Hoisting will be "
+                        "disabled.\n");
+    }
 
     // Set a default error handler that just logs to stderr (or ignores)
     // to prevent exit(1) during initial scan.
     void lsp_default_on_error(void *data, Token t, const char *msg);
     g_project->ctx->on_error = lsp_default_on_error;
 
+    // Add root path and std/ to include paths to resolve 'std.zc' etc.
+    // Ensure we don't overflow the include_paths array (limit is 64)
+    if (g_config.include_path_count < 62)
+    {
+        g_config.include_paths[g_config.include_path_count++] = xstrdup(root_path);
+
+        // In LSP mode, the workspace root should also be considered the root path for stdlib
+        // resolution
+        if (root_path)
+        {
+            g_config.root_path = xstrdup(root_path);
+        }
+
+        if (g_config.root_path)
+        {
+            char std_path[MAX_PATH_LEN];
+            snprintf(std_path, sizeof(std_path), "%s/std", g_config.root_path);
+            g_config.include_paths[g_config.include_path_count++] = xstrdup(std_path);
+        }
+    }
+
+    fprintf(stderr, "zls: Project initialized at %s\n", root_path);
+}
+
+void lsp_project_index_workspace()
+{
+    if (!g_project || !g_project->root_path)
+    {
+        return;
+    }
+
     // Scan workspace
-    scan_dir(root_path);
+    g_is_indexing = 1;
+    scan_dir(g_project->root_path);
+    g_is_indexing = 0;
+    fprintf(stderr, "zls: Project indexing complete\n");
 }
 
 // Default error handler for indexing phase
@@ -55,7 +103,14 @@ static void scan_file(const char *path)
         return;
     }
 
-    fprintf(stderr, "zls: Indexing %s\n", path);
+    char uri[MAX_PATH_LEN + 16];
+    snprintf(uri, sizeof(uri), "file://%s", path);
+
+    // Deduplicate indexing
+    if (lsp_project_get_file(uri))
+    {
+        return;
+    }
 
     char *src = load_file(path);
     if (!src)
@@ -63,9 +118,7 @@ static void scan_file(const char *path)
         return;
     }
 
-    char uri[2048];
-    sprintf(uri, "file://%s", path);
-
+    fprintf(stderr, "zls: Indexing %s\n", path);
     lsp_project_update_file(uri, src);
     free(src);
 }
@@ -86,7 +139,16 @@ static void scan_dir(const char *dir_path)
             continue;
         }
 
-        char path[1024];
+        // Project filters: skip known noise directories
+        if (strcmp(dir->d_name, "node_modules") == 0 || strcmp(dir->d_name, "obj") == 0 ||
+            strcmp(dir->d_name, ".git") == 0 ||
+            strcmp(dir->d_name, "vhdl") == 0 || // Often contains large vendor dirs
+            strcmp(dir->d_name, "vivado") == 0)
+        {
+            continue;
+        }
+
+        char path[MAX_PATH_LEN];
         snprintf(path, sizeof(path), "%s/%s", dir_path, dir->d_name);
 
         struct stat st;
@@ -98,6 +160,7 @@ static void scan_dir(const char *dir_path)
             }
             else if (S_ISREG(st.st_mode))
             {
+                fprintf(stderr, "zls: Indexing %s\n", path);
                 scan_file(path);
             }
         }
@@ -149,14 +212,16 @@ void lsp_project_update_file(const char *uri, const char *src)
         return;
     }
 
-    extern char *g_current_filename;
-    g_current_filename = (char *)uri;
-
     ProjectFile *pf = lsp_project_get_file(uri);
     if (!pf)
     {
         pf = add_project_file(uri);
     }
+
+    // Use the plain path for internal compiler state, not the URI.
+    // This ensures z_resolve_path can use access() correctly.
+    extern char *g_current_filename;
+    g_current_filename = pf->path;
 
     if (pf->index)
     {
@@ -170,19 +235,55 @@ void lsp_project_update_file(const char *uri, const char *src)
     }
     pf->source = xstrdup(src);
 
+    // Use the plain path for internal compiler state.
+    // This allows z_resolve_path and is_file_imported to work correctly.
+    extern char *g_current_filename;
+    char *saved_filename = g_current_filename;
+    g_current_filename = pf->path;
+
     Lexer l;
     lexer_init(&l, src);
 
+    // Reset parser context globals only for fresh manual updates.
+    // During workspace indexing, we want to accumulate definitions.
+    // Initialize built-ins if it's the first time
+    if (!g_project->ctx->global_scope)
+    {
+        void register_builtins(ParserContext * ctx);
+        register_builtins(g_project->ctx);
+    }
+
+    g_project->ctx->had_error = 0;
+
+    if (!is_file_imported(g_project->ctx, pf->path))
+    {
+        mark_file_imported(g_project->ctx, pf->path);
+    }
+
+    fprintf(stderr, "zls: Parsing %s\n", pf->path);
     ASTNode *root = parse_program(g_project->ctx, &l);
-
-    pf->ast = root;
-
-    pf->index = lsp_index_new();
     if (root)
     {
+        pf->ast = root;
+        fprintf(stderr, "zls: Building index for %s\n", pf->path);
+        pf->index = lsp_index_new();
         lsp_build_index(pf->index, root);
-        validate_types(g_project->ctx);
+        fprintf(stderr, "zls: Index built for %s\n", pf->path);
+
+        if (!g_is_indexing)
+        {
+            fprintf(stderr, "zls: Validating types for %s\n", pf->path);
+            validate_types(g_project->ctx);
+            fprintf(stderr, "zls: Validation complete for %s\n", pf->path);
+        }
     }
+    else
+    {
+        fprintf(stderr, "zls: Parse failed for %s (returned NULL)\n", pf->path);
+    }
+    fprintf(stderr, "zls: Finished handling %s\n", pf->path);
+
+    g_current_filename = saved_filename;
 }
 
 DefinitionResult lsp_project_find_definition(const char *name)
@@ -219,6 +320,22 @@ DefinitionResult lsp_project_find_definition(const char *name)
                     else if (r->node->type == NODE_STRUCT)
                     {
                         found_name = r->node->strct.name;
+                    }
+                    else if (r->node->type == NODE_ENUM)
+                    {
+                        found_name = r->node->enm.name;
+                    }
+                    else if (r->node->type == NODE_ENUM_VARIANT)
+                    {
+                        found_name = r->node->variant.name;
+                    }
+                    else if (r->node->type == NODE_TRAIT)
+                    {
+                        found_name = r->node->trait.name;
+                    }
+                    else if (r->node->type == NODE_TYPE_ALIAS)
+                    {
+                        found_name = r->node->type_alias.alias;
                     }
 
                     if (found_name && strcmp(found_name, name) == 0)
@@ -278,11 +395,27 @@ ReferenceResult *lsp_project_find_references(const char *name)
                     {
                         scan_name = r->node->strct.name;
                     }
+                    else if (r->node->type == NODE_ENUM)
+                    {
+                        scan_name = r->node->enm.name;
+                    }
+                    else if (r->node->type == NODE_ENUM_VARIANT)
+                    {
+                        scan_name = r->node->variant.name;
+                    }
+                    else if (r->node->type == NODE_TRAIT)
+                    {
+                        scan_name = r->node->trait.name;
+                    }
+                    else if (r->node->type == NODE_TYPE_ALIAS)
+                    {
+                        scan_name = r->node->type_alias.alias;
+                    }
                     else if (r->node->type == NODE_EXPR_VAR)
                     {
                         scan_name = r->node->var_ref.name;
                     }
-                    else if (r->node->type == NODE_EXPR_CALL &&
+                    else if (r->node->type == NODE_EXPR_CALL && r->node->call.callee &&
                              r->node->call.callee->type == NODE_EXPR_VAR)
                     {
                         scan_name = r->node->call.callee->var_ref.name;

@@ -18,17 +18,17 @@ Comunica tramite input/output standard (stdio).
 
 Per Visual Studio Code, usa l'estensione ufficiale di Zen C:
 
-- **Repository**: [z-libs/zenc-vscode](https://github.com/z-libs/zenc-vscode)
+- **Repository**: [zenc-lang/vscode-zenc](https://github.com/zenc-lang/vscode-zenc)
 
-Installa l'estensione direttamente dal **[Visual Studio Code Marketplace](https://marketplace.visualstudio.com/items?itemName=z-libs.zenc)**.
+Installa l'estensione direttamente dal **[Visual Studio Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Z-libs.zenc)**.
 
 In alternativa, puoi compilare il `.vsix` dal codice sorgente.
 
 ### Vim / Neovim
 
-Il supporto per Vim e Neovim è fornito tramite il plugin `Zen-C.vim`, che include evidenziazione della sintassi e helper di configurazione LSP.
+Il supporto per Vim e Neovim è fornito tramite il plugin `zenc.vim`, che include evidenziazione della sintassi e helper di configurazione LSP.
 
-- **Repository**: [davidscholberg/Zen-C.vim](https://github.com/davidscholberg/Zen-C.vim)
+- **Repository**: [zenc-lang/zenc.vim](https://github.com/zenc-lang/zenc.vim)
 
 #### Neovim (esempio con `lazy.nvim`)
 

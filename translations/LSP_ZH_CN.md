@@ -18,17 +18,17 @@ zc lsp
 
 对于 Visual Studio Code，请使用官方的 Zen C 扩展：
 
-- **仓库**: [z-libs/zenc-vscode](https://github.com/z-libs/zenc-vscode)
+- **仓库**: [zenc-lang/vscode-zenc](https://github.com/zenc-lang/vscode-zenc)
 
-直接从 **[Visual Studio Code Marketplace](https://marketplace.visualstudio.com/items?itemName=z-libs.zenc)** 安装扩展。
+直接从 **[Visual Studio Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Z-libs.zenc)** 安装扩展。
 
 或者，您可以从源代码构建 `.vsix`。
 
 ### Vim / Neovim
 
-通过 `Zen-C.vim` 插件提供对 Vim 和 Neovim 的支持，其中包括语法高亮和 LSP 配置助手。
+通过 `zenc.vim` 插件提供对 Vim 和 Neovim 的支持，其中包括语法高亮和 LSP 配置助手。
 
-- **仓库**: [davidscholberg/Zen-C.vim](https://github.com/davidscholberg/Zen-C.vim)
+- **仓库**: [zenc-lang/zenc.vim](https://github.com/zenc-lang/zenc.vim)
 
 #### Neovim (`lazy.nvim` 示例)
 

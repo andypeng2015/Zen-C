@@ -1,5 +1,6 @@
 #include "codegen/codegen.h"
 #include "parser/parser.h"
+#include "constants.h"
 #include "plugins/plugin_manager.h"
 #include "repl/repl.h"
 #include "zen/zen_facts.h"
@@ -8,57 +9,98 @@
 #include "codegen/compat.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include "utils/cmd.h"
+#include "diagnostics/diagnostics.h"
+#include <signal.h>
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#endif
+
+static void handle_crash(int sig)
+{
+    fprintf(stderr, "\n------------------------------------------------\n");
+    fprintf(stderr, "CRITICAL: Compiler crashed with signal %d\n", sig);
+    fprintf(stderr, "This is likely a bug in the Zen compiler.\n");
+    fprintf(stderr, "Flushing all output files before exit...\n");
+    fprintf(stderr, "------------------------------------------------\n");
+    fflush(NULL);
+    _exit(139);
+}
 
 // Forward decl for LSP
 int lsp_main(int argc, char **argv);
-
-static void main_append_flag(char *dest, size_t max_size, const char *prefix, const char *val)
-{
-    size_t cur_len = strlen(dest);
-    int has_space = val && strchr(val, ' ') != NULL;
-
-    if (cur_len > 0 && dest[cur_len - 1] != ' ')
-    {
-        strncat(dest, " ", max_size - cur_len - 1);
-        cur_len++;
-    }
-
-    if (prefix)
-    {
-        strncat(dest, prefix, max_size - cur_len - 1);
-        cur_len = strlen(dest);
-    }
-
-    if (val)
-    {
-        if (has_space)
-        {
-            strncat(dest, "\"", max_size - cur_len - 1);
-            cur_len++;
-        }
-        strncat(dest, val, max_size - cur_len - 1);
-        cur_len = strlen(dest);
-        if (has_space)
-        {
-            strncat(dest, "\"", max_size - cur_len - 1);
-        }
-    }
-}
-
 int main(int argc, char **argv)
 {
+    signal(SIGSEGV, handle_crash);
+    signal(SIGABRT, handle_crash);
+    signal(SIGFPE, handle_crash);
+
+    int i, ef;
+    size_t k;
+    const char *optimization_level = NULL;
+    char *env_root;
+    char *input_file_copy;
+    double start_time;
+    char *primary_real;
+    char temp_source_buf[MAX_PATH_LEN];
+    const char *ext_p;
+    FILE *out_f;
+    ArgList compile_args;
+    char self_path[MAX_PATH_SIZE];
+    char *outfile;
+
+    z_setup_terminal();
     memset(&g_config, 0, sizeof(g_config));
+    g_config.mode_debug = 1;
     if (z_is_windows())
     {
-        strcpy(g_config.cc, "gcc.exe");
+        strncpy(g_config.cc, "gcc.exe", sizeof(g_config.cc) - 1);
+        g_config.cc[sizeof(g_config.cc) - 1] = '\0';
     }
     else
     {
-        strcpy(g_config.cc, "gcc");
+        strncpy(g_config.cc, "gcc", sizeof(g_config.cc) - 1);
+        g_config.cc[sizeof(g_config.cc) - 1] = '\0';
+    }
+
+    // Default diagnostics: Enable standard Zen C diagnostics
+    set_diag_by_name("unused", 1);
+    set_diag_by_name("safety", 1);
+    set_diag_by_name("logic", 1);
+    set_diag_by_name("conversion", 1);
+    set_diag_by_name("style", 1);
+
+    z_get_executable_path(self_path, sizeof(self_path));
+
+    if (self_path[0])
+    {
+        g_config.root_path = xstrdup(self_path);
+    }
+    else
+    {
+        g_config.root_path = NULL;
+    }
+
+    env_root = getenv("ZC_ROOT");
+    if (env_root && env_root[0])
+    {
+        g_config.root_path = xstrdup(env_root);
+    }
+
+    if (ZC_OS_WINDOWS)
+    {
+        g_config.cfg_defines[g_config.cfg_define_count++] = xstrdup("windows");
+    }
+    else if (ZC_OS_LINUX)
+    {
+        g_config.cfg_defines[g_config.cfg_define_count++] = xstrdup("linux");
+    }
+    else if (ZC_OS_MACOS)
+    {
+        g_config.cfg_defines[g_config.cfg_define_count++] = xstrdup("apple");
+        g_config.cfg_defines[g_config.cfg_define_count++] = xstrdup("macos");
     }
 
     if (argc < 2)
@@ -80,13 +122,18 @@ int main(int argc, char **argv)
         run_repl(argv[0]); // Pass self path for recursive calls
         return 0;
     }
-    else if (strcmp(command, "transpile") == 0)
+    else if (strcmp(command, "transpile") == 0 || strcmp(command, "-c") == 0)
     {
         g_config.mode_transpile = 1;
         g_config.emit_c = 1; // Transpile implies emitting C
     }
     else if (strcmp(command, "run") == 0)
     {
+        g_config.mode_run = 1;
+    }
+    else if (strcmp(command, "debug") == 0)
+    {
+        g_config.mode_debug = 1;
         g_config.mode_run = 1;
     }
     else if (strcmp(command, "check") == 0)
@@ -96,6 +143,18 @@ int main(int argc, char **argv)
     else if (strcmp(command, "build") == 0)
     {
         // default mode
+    }
+    else if (strcmp(command, "help") == 0)
+    {
+        if (argc > 2)
+        {
+            print_command_help(argv[2]);
+        }
+        else
+        {
+            print_usage();
+        }
+        return 0;
     }
     else if (strcmp(command, "--help") == 0 || strcmp(command, "-h") == 0)
     {
@@ -129,7 +188,7 @@ int main(int argc, char **argv)
     }
 
     // Parse args
-    for (int i = arg_start; i < argc; i++)
+    for (i = arg_start; i < argc; i++)
     {
         char *arg = argv[i];
         if (strcmp(arg, "--emit-c") == 0)
@@ -146,13 +205,11 @@ int main(int argc, char **argv)
         }
         else if (strcmp(arg, "--version") == 0 || strcmp(arg, "-V") == 0)
         {
-            print_version();
-            return 0;
+            // Handled later
         }
         else if (strcmp(arg, "--paths") == 0)
         {
-            print_search_paths();
-            return 0;
+            // Handled later
         }
         else if (strcmp(arg, "--verbose") == 0 || strcmp(arg, "-v") == 0)
         {
@@ -162,27 +219,53 @@ int main(int argc, char **argv)
         {
             g_config.quiet = 1;
         }
-        else if (strcmp(arg, "--no-zen") == 0)
+        else if (strcmp(arg, "--zen") == 0)
         {
-            g_config.no_zen = 1;
+            g_config.zen_mode = 1;
         }
-        else if (strcmp(arg, "--typecheck") == 0)
+        else if (strcmp(arg, "--check") == 0 || strcmp(arg, "-c") == 0)
         {
+            g_config.mode_check = 1;
             g_config.use_typecheck = 1;
+        }
+        else if (strcmp(arg, "--misra") == 0)
+        {
+            g_config.misra_mode = 1;
+            g_config.use_typecheck = 1;
+            if (g_config.cfg_define_count < 64)
+            {
+                g_config.cfg_defines[g_config.cfg_define_count++] = xstrdup("misra");
+                g_config.cfg_defines[g_config.cfg_define_count++] = xstrdup("ZC_MISRA");
+            }
         }
         else if (strcmp(arg, "--freestanding") == 0)
         {
             g_config.is_freestanding = 1;
+            if (g_config.cfg_define_count < 64)
+            {
+                g_config.cfg_defines[g_config.cfg_define_count++] = xstrdup("freestanding");
+                g_config.cfg_defines[g_config.cfg_define_count++] = xstrdup("ZC_FREESTANDING");
+            }
+        }
+        else if (strcmp(arg, "--warn-errors") == 0)
+        {
+            g_config.warn_as_errors = 1;
+        }
+        else if (strcmp(arg, "--no-suppress-warnings") == 0)
+        {
+            g_config.no_suppress_warnings = 1;
         }
         else if (strcmp(arg, "--cpp") == 0)
         {
             if (z_is_windows())
             {
-                strcpy(g_config.cc, "g++.exe");
+                strncpy(g_config.cc, "g++.exe", sizeof(g_config.cc) - 1);
+                g_config.cc[sizeof(g_config.cc) - 1] = '\0';
             }
             else
             {
-                strcpy(g_config.cc, "g++");
+                strncpy(g_config.cc, "g++", sizeof(g_config.cc) - 1);
+                g_config.cc[sizeof(g_config.cc) - 1] = '\0';
             }
             g_config.use_cpp = 1;
         }
@@ -190,11 +273,13 @@ int main(int argc, char **argv)
         {
             if (z_is_windows())
             {
-                strcpy(g_config.cc, "nvcc.exe");
+                strncpy(g_config.cc, "nvcc.exe", sizeof(g_config.cc) - 1);
+                g_config.cc[sizeof(g_config.cc) - 1] = '\0';
             }
             else
             {
-                strcpy(g_config.cc, "nvcc");
+                strncpy(g_config.cc, "nvcc", sizeof(g_config.cc) - 1);
+                g_config.cc[sizeof(g_config.cc) - 1] = '\0';
             }
             g_config.use_cuda = 1;
             g_config.use_cpp = 1; // CUDA implies C++ mode.
@@ -202,10 +287,6 @@ int main(int argc, char **argv)
         else if (strcmp(arg, "--objc") == 0 || strcmp(arg, "--objective-c") == 0)
         {
             g_config.use_objc = 1;
-        }
-        else if (strcmp(arg, "--check") == 0)
-        {
-            g_config.mode_check = 1;
         }
         else if (strcmp(arg, "--cc") == 0)
         {
@@ -217,17 +298,19 @@ int main(int argc, char **argv)
                 {
                     if (z_is_windows())
                     {
-                        strcpy(g_config.cc, "zig.exe cc");
+                        strncpy(g_config.cc, "zig.exe cc", sizeof(g_config.cc) - 1);
+                        g_config.cc[sizeof(g_config.cc) - 1] = '\0';
                     }
                     else
                     {
-                        strcpy(g_config.cc, "zig cc");
+                        strncpy(g_config.cc, "zig cc", sizeof(g_config.cc) - 1);
+                        g_config.cc[sizeof(g_config.cc) - 1] = '\0';
                     }
                 }
                 else
                 {
                     snprintf(g_config.cc, sizeof(g_config.cc), "%s", cc_arg);
-                    if (z_is_windows() && !strstr(g_config.cc, ".exe"))
+                    if (z_is_windows() && !z_path_has_extension(g_config.cc, ".exe"))
                     {
                         strcat(g_config.cc, ".exe");
                     }
@@ -253,13 +336,26 @@ int main(int argc, char **argv)
         }
         else if (strncmp(arg, "-I", 2) == 0)
         {
+            char *i_path = NULL;
             if (strlen(arg) > 2)
             {
-                main_append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), "-I", arg + 2);
+                i_path = arg + 2;
             }
             else if (i + 1 < argc)
             {
-                main_append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), "-I", argv[++i]);
+                i_path = argv[++i];
+            }
+            if (i_path)
+            {
+                append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), arg, NULL);
+                if (g_config.include_path_count < 64)
+                {
+                    g_config.include_paths[g_config.include_path_count++] = xstrdup(i_path);
+                }
+                else
+                {
+                    zwarn("maximum include paths (64) exceeded, ignoring '%s'", i_path);
+                }
             }
         }
         else if (strncmp(arg, "-L", 2) == 0 || strncmp(arg, "-l", 2) == 0)
@@ -267,27 +363,40 @@ int main(int argc, char **argv)
             char prefix[3] = {arg[0], arg[1], '\0'};
             if (strlen(arg) > 2)
             {
-                main_append_flag(g_link_flags, MAX_FLAGS_SIZE, prefix, arg + 2);
+                append_flag(g_link_flags, MAX_FLAGS_SIZE, prefix, arg + 2);
             }
             else if (i + 1 < argc)
             {
-                main_append_flag(g_link_flags, MAX_FLAGS_SIZE, prefix, argv[++i]);
+                append_flag(g_link_flags, MAX_FLAGS_SIZE, prefix, argv[++i]);
             }
         }
         else if (strncmp(arg, "-O", 2) == 0)
         {
             if (strlen(arg) > 2)
             {
-                main_append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), "-O", arg + 2);
+                optimization_level = arg + 2;
+                append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), "-O",
+                            optimization_level);
             }
             else if (i + 1 < argc)
             {
-                main_append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), "-O", argv[++i]);
+                optimization_level = argv[++i];
+                append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), "-O",
+                            optimization_level);
             }
         }
         else if (strcmp(arg, "-g") == 0)
         {
-            main_append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), "-g", NULL);
+            g_config.mode_debug = 1;
+        }
+        else if (strcmp(arg, "-g0") == 0 || strcmp(arg, "--no-debug") == 0)
+        {
+            g_config.mode_debug = 0;
+        }
+        else if (strcmp(arg, "--release") == 0)
+        {
+            g_config.mode_debug = 0;
+            append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), "-O3", NULL);
         }
         else if (strncmp(arg, "-D", 2) == 0)
         {
@@ -297,22 +406,58 @@ int main(int argc, char **argv)
                 i++;
                 def = argv[i];
             }
-            if (def && g_config.cfg_define_count < 64)
+            if (def)
             {
-                char *name = xstrdup(def);
-                char *eq = strchr(name, '=');
-                if (eq)
+                if (g_config.cfg_define_count < 64)
                 {
-                    *eq = '\0';
+                    char *name = xstrdup(def);
+                    char *eq = strchr(name, '=');
+                    if (eq)
+                    {
+                        *eq = '\0';
+                    }
+                    g_config.cfg_defines[g_config.cfg_define_count++] = name;
                 }
-                g_config.cfg_defines[g_config.cfg_define_count++] = name;
+                else
+                {
+                    zwarn("maximum defined macros (64) exceeded, ignoring '%s'", def);
+                }
             }
-            main_append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), "-D", def);
+            append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), "-D", def);
+        }
+        else if (strncmp(arg, "-Wno-", 5) == 0)
+        {
+            if (!set_diag_by_name(arg + 5, 0))
+            {
+                append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), arg, NULL);
+            }
+        }
+        else if (strncmp(arg, "-W", 2) == 0)
+        {
+            if (!set_diag_by_name(arg + 2, 1))
+            {
+                append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), arg, NULL);
+                if (!g_config.warn_as_errors && strcmp(arg, "-Werror") == 0)
+                {
+                    g_config.warn_as_errors = 1;
+                }
+            }
+        }
+        else if (strncmp(arg, "-f", 2) == 0 || strncmp(arg, "-m", 2) == 0 ||
+                 strncmp(arg, "-x", 2) == 0 || strcmp(arg, "-S") == 0 || strcmp(arg, "-E") == 0 ||
+                 strcmp(arg, "-shared") == 0 || strcmp(arg, "--shared") == 0)
+        {
+            // Standard C compiler flags that we want to pass directly to the backend
+            append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), arg, NULL);
+            if (strcmp(arg, "-shared") == 0 || strcmp(arg, "--shared") == 0)
+            {
+                append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), "-fPIC", NULL);
+            }
         }
         else if (arg[0] == '-')
         {
-            // Unknown flag or C flag
-            main_append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), arg, NULL);
+            // Unknown flag, pass to C compiler just in case
+            append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), arg, NULL);
         }
         else
         {
@@ -320,10 +465,32 @@ int main(int argc, char **argv)
             {
                 g_config.input_file = arg;
             }
-            else if (g_config.extra_file_count < 64)
+            else
             {
-                g_config.extra_files[g_config.extra_file_count++] = arg;
+                if (g_config.extra_file_count < 64)
+                {
+                    g_config.extra_files[g_config.extra_file_count++] = arg;
+                }
+                else
+                {
+                    zwarn("maximum extra source files (64) exceeded, ignoring '%s'", arg);
+                }
             }
+        }
+    }
+
+    for (i = arg_start; i < argc; i++)
+    {
+        char *arg = argv[i];
+        if (arg && (strcmp(arg, "--version") == 0 || strcmp(arg, "-V") == 0))
+        {
+            print_version();
+            return 0;
+        }
+        else if (strcmp(arg, "--paths") == 0)
+        {
+            print_search_paths();
+            return 0;
         }
     }
 
@@ -332,6 +499,20 @@ int main(int argc, char **argv)
         fprintf(stderr, COLOR_BOLD COLOR_RED "error" COLOR_RESET ": no input file specified\n");
         return 1;
     }
+
+    // Compute input directory
+    input_file_copy = xstrdup(g_config.input_file);
+    char *last_slash = z_path_last_sep(input_file_copy);
+    if (last_slash)
+    {
+        *last_slash = 0;
+        g_config.input_dir = xstrdup(input_file_copy);
+    }
+    else
+    {
+        g_config.input_dir = xstrdup(".");
+    }
+    free(input_file_copy);
 
     g_current_filename = g_config.input_file;
 
@@ -342,6 +523,29 @@ int main(int argc, char **argv)
         fprintf(stderr, COLOR_BOLD COLOR_RED "error" COLOR_RESET ": could not read file '%s'\n",
                 g_config.input_file);
         return 1;
+    }
+
+    // Backend detection for @cfg purposes
+    if (z_path_match_compiler(g_config.cc, "tcc"))
+    {
+        if (g_config.cfg_define_count < 64)
+        {
+            g_config.cfg_defines[g_config.cfg_define_count++] = xstrdup("__TINYC__");
+        }
+    }
+    else if (z_path_match_compiler(g_config.cc, "clang"))
+    {
+        if (g_config.cfg_define_count < 64)
+        {
+            g_config.cfg_defines[g_config.cfg_define_count++] = xstrdup("__clang__");
+        }
+    }
+    else if (z_path_match_compiler(g_config.cc, "zig"))
+    {
+        if (g_config.cfg_define_count < 64)
+        {
+            g_config.cfg_defines[g_config.cfg_define_count++] = xstrdup("__ZIG__");
+        }
     }
 
     init_builtins();
@@ -371,13 +575,11 @@ int main(int argc, char **argv)
     }
     g_parser_ctx = &ctx;
 
-    z_setup_terminal();
-
-    double start_time = z_get_monotonic_time();
+    start_time = z_get_monotonic_time();
 
     if (!g_config.quiet)
     {
-        printf(COLOR_BOLD COLOR_GREEN "   Compiling" COLOR_RESET " %s\n", g_config.input_file);
+        printf(COLOR_BOLD COLOR_GREEN "   Compiling" COLOR_RESET " %s...\n", g_config.input_file);
         fflush(stdout);
     }
 
@@ -393,14 +595,14 @@ int main(int argc, char **argv)
     if (g_config.extra_file_count > 0)
     {
         // Mark primary file as imported to prevent re-parsing
-        char *primary_real = realpath(g_config.input_file, NULL);
+        primary_real = realpath(g_config.input_file, NULL);
         if (primary_real)
         {
             mark_file_imported(&ctx, primary_real);
             free(primary_real);
         }
 
-        for (int ef = 0; ef < g_config.extra_file_count; ef++)
+        for (ef = 0; ef < g_config.extra_file_count; ef++)
         {
             const char *extra_path = g_config.extra_files[ef];
             char *real_path = realpath(extra_path, NULL);
@@ -412,7 +614,11 @@ int main(int argc, char **argv)
                 if (g_config.c_file_count < 64)
                 {
                     g_config.c_files[g_config.c_file_count++] =
-                        real_path ? strdup(real_path) : strdup(extra_path);
+                        real_path ? xstrdup(real_path) : xstrdup(extra_path);
+                }
+                else
+                {
+                    zwarn("maximum C files (64) exceeded, ignoring '%s'", extra_path);
                 }
                 if (real_path)
                 {
@@ -440,7 +646,7 @@ int main(int argc, char **argv)
                 return 1;
             }
 
-            if (!g_config.quiet)
+            if (g_config.verbose)
             {
                 printf(COLOR_BOLD COLOR_GREEN "   Compiling" COLOR_RESET " %s\n", extra_path);
                 fflush(stdout);
@@ -502,6 +708,11 @@ int main(int argc, char **argv)
     int tc_result = 0;
     if (g_config.use_typecheck || g_config.mode_check)
     {
+        if (g_config.verbose)
+        {
+            printf(COLOR_BOLD COLOR_GREEN "   Analyzing" COLOR_RESET " %s\n", g_config.input_file);
+            fflush(stdout);
+        }
         tc_result = check_program(&ctx, root);
         if (tc_result != 0 && !g_config.mode_check)
         {
@@ -512,70 +723,128 @@ int main(int argc, char **argv)
     // In check mode, exit after type checking
     if (g_config.mode_check)
     {
-        if (tc_result != 0)
+        if (tc_result != 0 || g_error_count > 0)
         {
+            fprintf(stderr,
+                    COLOR_BOLD COLOR_RED "       Check" COLOR_RESET
+                                         " failed with %d error%s and %d warning%s\n",
+                    g_error_count, g_error_count == 1 ? "" : "s", g_warning_count,
+                    g_warning_count == 1 ? "" : "s");
             return 1;
         }
-        printf(COLOR_BOLD COLOR_GREEN "       Check" COLOR_RESET " passed\n");
+        if (g_config.verbose)
+        {
+            printf(COLOR_BOLD COLOR_GREEN "       Check" COLOR_RESET " passed\n");
+        }
         return 0;
     }
 
     // Determine temporary filename based on mode
-    char temp_source_buf[1024];
-    const char *ext = ".c";
+    ext_p = ".c";
     if (g_config.use_cuda)
     {
-        ext = ".cu";
+        ext_p = ".cu";
     }
     else if (g_config.use_cpp)
     {
-        ext = ".cpp";
+        ext_p = ".cpp";
     }
     else if (g_config.use_objc)
     {
-        ext = ".m";
+        ext_p = ".m";
+    }
+
+    if (!g_config.output_file && g_config.input_file)
+    {
+        char *base = z_basename(g_config.input_file);
+        char *stripped = z_strip_ext(base);
+        free(base);
+
+        if (strlen(stripped) > 0)
+        {
+            if (g_config.mode_transpile)
+            {
+                char *with_ext = xmalloc(strlen(stripped) + strlen(ext_p) + 1);
+                sprintf(with_ext, "%s%s", stripped, ext_p);
+                g_config.output_file = with_ext;
+                free(stripped);
+            }
+            else
+            {
+                g_config.output_file = stripped;
+            }
+        }
+        else
+        {
+            free(stripped);
+        }
     }
 
     if (g_config.output_file)
     {
-        snprintf(temp_source_buf, sizeof(temp_source_buf), "%s%s", g_config.output_file, ext);
+        size_t out_len = strlen(g_config.output_file);
+        size_t ext_len = strlen(ext_p);
+        if (out_len >= ext_len && strcmp(g_config.output_file + out_len - ext_len, ext_p) == 0)
+        {
+            // Already has extension, but we need a unique temp file to avoid clobbering
+            // the output file before codegen is successfully completed.
+            snprintf(temp_source_buf, sizeof(temp_source_buf), "%s.tmp%s", g_config.output_file,
+                     ext_p);
+        }
+        else
+        {
+            snprintf(temp_source_buf, sizeof(temp_source_buf), "%s%s", g_config.output_file, ext_p);
+        }
     }
     else
     {
-        snprintf(temp_source_buf, sizeof(temp_source_buf), "out%s", ext);
+        snprintf(temp_source_buf, sizeof(temp_source_buf), "out%s", ext_p);
     }
     const char *temp_source_file = temp_source_buf;
 
     // Codegen to C/C++/CUDA
-    FILE *out = fopen(temp_source_file, "w");
-    if (!out)
+    if (g_config.verbose)
+    {
+        printf(COLOR_BOLD COLOR_GREEN " Transpiling" COLOR_RESET " %s\n", g_config.input_file);
+        fflush(stdout);
+    }
+    out_f = fopen(temp_source_file, "w");
+    if (!out_f)
     {
         perror("fopen temp output");
         return 1;
     }
 
-    codegen_node(&ctx, root, out);
-    fclose(out);
+    codegen_node(&ctx, root, out_f);
+    fclose(out_f);
+
+    if (g_config.mode_transpile && g_config.output_file)
+    {
+        // If user specified -o, rename temp file to that
+        if (rename(temp_source_file, g_config.output_file) != 0)
+        {
+            perror("rename output");
+            return 1;
+        }
+    }
+
+    if (g_config.warn_as_errors && g_warning_count != 0)
+    {
+        fprintf(stderr, COLOR_BOLD COLOR_RED "    Failed" COLOR_RESET " build with %d warning%s\n",
+                g_warning_count, g_warning_count == 1 ? "" : "s");
+        return 1;
+    }
 
     if (g_config.mode_transpile)
     {
-        if (g_config.output_file)
+        if (g_config.verbose && !g_config.quiet)
         {
-            // If user specified -o, rename temp file to that
-            if (rename(temp_source_file, g_config.output_file) != 0)
-            {
-                perror("rename output");
-                return 1;
-            }
-            if (!g_config.quiet)
+            if (g_config.output_file)
             {
                 printf(COLOR_BOLD COLOR_CYAN "  Transpiled" COLOR_RESET " to %s\n",
                        g_config.output_file);
             }
-        }
-        else
-        {
-            if (!g_config.quiet)
+            else
             {
                 printf(COLOR_BOLD COLOR_CYAN "  Transpiled" COLOR_RESET " to %s\n",
                        temp_source_file);
@@ -586,10 +855,13 @@ int main(int argc, char **argv)
     }
 
     // Compile C
-    char *outfile =
-        g_config.output_file ? g_config.output_file : (z_is_windows() ? "a.exe" : "a.out");
+    outfile = g_config.output_file ? g_config.output_file : (z_is_windows() ? "a.exe" : "a.out");
 
-    ArgList compile_args;
+    if (g_config.mode_debug)
+    {
+        append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), "-g", NULL);
+    }
+
     arg_list_init(&compile_args);
 
     // Build command
@@ -598,11 +870,32 @@ int main(int argc, char **argv)
     if (g_config.verbose)
     {
         printf(COLOR_BOLD COLOR_BLUE "     Command" COLOR_RESET);
-        for (size_t i = 0; i < compile_args.count; i++)
+        for (k = 0; k < compile_args.count; k++)
         {
-            printf(" %s", compile_args.args[i]);
+            printf(" %s", compile_args.args[k]);
         }
         printf("\n");
+    }
+
+    if (g_config.mode_debug && g_config.mode_run)
+    {
+        // Debug requires -g
+        append_flag(g_config.gcc_flags, sizeof(g_config.gcc_flags), "-g", NULL);
+
+        if (!optimization_level)
+        {
+            // Check for //> cflags: -O...
+            const char *substr = strstr(g_cflags, "-O");
+            if (substr && *(substr + 2) != '0')
+            {
+                optimization_level = substr;
+            }
+        }
+
+        if (optimization_level)
+        {
+            zwarn("You are debugging an optimized program!");
+        }
     }
 
     int ret = arg_run(&compile_args);
@@ -630,7 +923,7 @@ int main(int argc, char **argv)
 
         if (z_is_windows())
         {
-            char exe_out[1024];
+            char exe_out[MAX_PATH_LEN];
             const char *dot = strrchr(outfile, '.');
             const char *slash = strrchr(outfile, '/');
             const char *bslash = strrchr(outfile, '\\');
@@ -648,7 +941,7 @@ int main(int argc, char **argv)
         }
         else
         {
-            char exe_out[1024];
+            char exe_out[MAX_PATH_LEN];
             snprintf(exe_out, sizeof(exe_out), "./%s", outfile);
             arg_list_add(&run_args, exe_out);
         }
@@ -671,12 +964,23 @@ int main(int argc, char **argv)
             const char *last_sep = slash > bslash ? slash : bslash;
             if (!(dot && dot > last_sep))
             {
-                char exe_out[1024];
+                char exe_out[MAX_PATH_LEN];
                 snprintf(exe_out, sizeof(exe_out), "%s.exe", outfile);
                 remove(exe_out);
             }
         }
+        if (g_config.verbose)
+        {
+            printf(COLOR_BOLD COLOR_CYAN "   Cleaning up" COLOR_RESET " plugins...\n");
+            fflush(stdout);
+        }
         zptr_plugin_mgr_cleanup();
+
+        if (g_config.verbose)
+        {
+            printf(COLOR_BOLD COLOR_CYAN "   Evaluating" COLOR_RESET " Zen facts...\n");
+            fflush(stdout);
+        }
         zen_trigger_global();
 #if defined(WIFEXITED) && defined(WEXITSTATUS)
         return WIFEXITED(run_ret) ? WEXITSTATUS(run_ret) : run_ret;
@@ -685,19 +989,31 @@ int main(int argc, char **argv)
 #endif
     }
 
+    if (g_config.verbose)
+    {
+        printf(COLOR_BOLD COLOR_CYAN "   Cleaning up" COLOR_RESET " plugins...\n");
+        fflush(stdout);
+    }
     zptr_plugin_mgr_cleanup();
+
+    if (g_config.verbose)
+    {
+        printf(COLOR_BOLD COLOR_CYAN "   Evaluating" COLOR_RESET " Zen facts...\n");
+        fflush(stdout);
+    }
     zen_trigger_global();
 
     double end_time = z_get_monotonic_time();
     double time_taken = end_time - start_time;
 
-    if (!g_config.quiet && !g_config.mode_run && !g_config.mode_check)
+    if (!g_config.quiet)
     {
-        if (g_warning_count > 0)
+        if (g_error_count > 0 || g_warning_count > 0)
         {
             printf(COLOR_BOLD COLOR_GREEN "    Finished" COLOR_RESET
-                                          " build in %.2fs with %d warning%s\n",
-                   time_taken, g_warning_count, g_warning_count == 1 ? "" : "s");
+                                          " build in %.2fs with %d error%s and %d warning%s\n",
+                   time_taken, g_error_count, g_error_count == 1 ? "" : "s", g_warning_count,
+                   g_warning_count == 1 ? "" : "s");
         }
         else
         {

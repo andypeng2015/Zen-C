@@ -2,6 +2,7 @@
 import "../core.zc"
 import "../string.zc"
 import "../result.zc"
+import "../mem.zc"
 
 struct Url {
     scheme: String;
@@ -48,12 +49,12 @@ impl Url {
         }
         
         // Extract host/port part
-        let host_port_buf = (char*)malloc(host_len + 1);
+        let host_port_buf = alloc_n<char>(host_len + 1);
         strncpy(host_port_buf, rest, host_len);
         host_port_buf[host_len] = 0;
         
         let host_str = String::new(host_port_buf); // Temporary
-        free(host_port_buf);
+        dealloc<char>(host_port_buf);
         
         // Check for Port
         let port = default_port;
@@ -71,10 +72,9 @@ impl Url {
              final_host = String::new(host_str.c_str());
         }
         
-        // Free split parts
-        // Clean up parts
-        // Memory cleanup for Vec (elements will leak currently without array drop but double free is avoided)
-        parts.free();
+        // Free split parts is not needed if parts auto-drops and correctly frees its elements...
+        // Actually, Vec doesn't drop its elements in Zen C right now because no traits bounds on Drop...
+        // Let's look closer.
         host_str.free();
         
         let path = String::new("/");

@@ -7,14 +7,8 @@ import "./option.zc";
 
 import "sys/process.zc";
 
-// system() can be externed directly with const char*
-extern fn system(command: const char*) -> c_int;
-
-
-
 extern fn _z_popen(command: const char*, type: const char*) -> void*;
 extern fn _z_pclose(stream: void*) -> c_int;
-extern fn _z_fgets(s: char*, size: c_int, stream: void*) -> char*;
 
 struct Output {
     std_out: String;
@@ -36,7 +30,7 @@ impl Command {
     
     fn arg(self, arg: char*) -> Command* {
         self.args.push(String::from(arg));
-        return self;
+        return &self;
     }
     
     fn _build_cmd(self) -> String {
@@ -59,7 +53,7 @@ impl Command {
         
         let fp = _z_popen(cmd_c, "r");
         
-        if (fp == 0) {
+        if (fp == NULL) {
             cmd_str.free();
             // TODO: Better error handling...
             return Output { 
@@ -70,11 +64,11 @@ impl Command {
         
         let out = String::from("");
         let buf_size: usize = 1024;
-        let buf = (char*)malloc(buf_size);
+        let buf = alloc_n<char>(buf_size);
         
         while (true) {
-            let res = _z_fgets(buf, (c_int)buf_size, fp);
-            if (res == 0) break;
+            let fgets_res = fgets(buf, (c_int)buf_size, fp);
+            if (fgets_res == NULL) break;
             
             let chunk = String::from(buf);
             out.append(&chunk);
@@ -82,7 +76,7 @@ impl Command {
         }
         
         let code = _z_pclose(fp);
-        free(buf);
+        dealloc<char>(buf);
         cmd_str.free();
         
         return Output {
@@ -108,10 +102,3 @@ impl Command {
     }
 }
 
-impl Drop for Command {
-    fn drop(self) {
-        for s in &self.args {
-            s.free();
-        }
-    }
-}

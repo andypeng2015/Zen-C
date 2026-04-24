@@ -8,6 +8,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "cJSON.h"
+#include "constants.h"
 
 ASTNode *parse_program(ParserContext *ctx, Lexer *l);
 
@@ -423,7 +424,7 @@ static void repl_highlight(const char *buf, int cursor_pos)
                 p++;
             }
             int len = p - start;
-            char word[256];
+            char word[MAX_VAR_NAME_LEN];
             if (len < 256)
             {
                 strncpy(word, start, len);
@@ -536,7 +537,7 @@ static char *repl_complete(const char *buf, int pos)
         return NULL;
     }
 
-    char prefix[256];
+    char prefix[MAX_VAR_NAME_LEN];
     if (len >= 255)
     {
         return NULL;
@@ -610,7 +611,7 @@ static char *repl_readline(const char *prompt, char **history, int history_len, 
     char *saved_current_line = NULL;
 
     int in_search_mode = 0;
-    char search_buf[256];
+    char search_buf[MAX_VAR_NAME_LEN];
     search_buf[0] = 0;
     int search_match_idx = -1;
 
@@ -1058,7 +1059,7 @@ void run_repl(const char *self_path)
     int history_len = 0;
     char **history = xmalloc(history_cap * sizeof(char *));
 
-    char history_path[512];
+    char history_path[MAX_PATH_LEN];
     const char *home = getenv("HOME");
     if (z_is_windows() && !home)
     {
@@ -1070,7 +1071,7 @@ void run_repl(const char *self_path)
         FILE *hf = fopen(history_path, "r");
         if (hf)
         {
-            char buf[1024];
+            char buf[MAX_ERROR_MSG_LEN];
             while (fgets(buf, sizeof(buf), hf))
             {
                 size_t l = strlen(buf);
@@ -1110,12 +1111,12 @@ void run_repl(const char *self_path)
 
     if (home)
     {
-        char init_path[512];
+        char init_path[MAX_PATH_LEN];
         snprintf(init_path, sizeof(init_path), "%s/.zprep_init.zc", home);
         FILE *init_f = fopen(init_path, "r");
         if (init_f)
         {
-            char buf[1024];
+            char buf[MAX_ERROR_MSG_LEN];
             int init_count = 0;
             while (fgets(buf, sizeof(buf), init_f))
             {
@@ -1149,7 +1150,7 @@ void run_repl(const char *self_path)
         }
     }
 
-    char line_buf[1024];
+    char line_buf[MAX_ERROR_MSG_LEN];
 
     char *input_buffer = NULL;
     size_t input_len = 0;
@@ -1158,8 +1159,8 @@ void run_repl(const char *self_path)
 
     while (1)
     {
-        char cwd[1024];
-        char prompt_text[1280];
+        char cwd[MAX_PATH_LEN];
+        char prompt_text[MAX_PATH_LEN + 64];
         if (getcwd(cwd, sizeof(cwd)))
         {
             char *base = strrchr(cwd, '/');
@@ -1175,7 +1176,7 @@ void run_repl(const char *self_path)
         }
         else
         {
-            strcpy(prompt_text, "\033[1;32m>>>\033[0m ");
+            snprintf(prompt_text, sizeof(prompt_text), "\033[1;32m>>>\033[0m ");
         }
 
         const char *prompt = (brace_depth > 0 || paren_depth > 0) ? "... " : prompt_text;
@@ -1194,8 +1195,8 @@ void run_repl(const char *self_path)
         if (NULL == input_buffer)
         {
             size_t cmd_len = strlen(line_buf);
-            char cmd_buf[1024];
-            strcpy(cmd_buf, line_buf);
+            char cmd_buf[MAX_ERROR_MSG_LEN];
+            snprintf(cmd_buf, sizeof(cmd_buf), "%s", line_buf);
             if (cmd_len > 0 && cmd_buf[cmd_len - 1] == '\n')
             {
                 cmd_buf[--cmd_len] = 0;
@@ -1304,7 +1305,7 @@ void run_repl(const char *self_path)
                         show_code_size += strlen(history[i]) + 2;
                     }
                     char *show_code = malloc(show_code_size);
-                    strcpy(show_code, "");
+                    show_code[0] = '\0';
                     for (int i = 0; i < history_len; i++)
                     {
                         strcat(show_code, history[i]);
@@ -1431,9 +1432,14 @@ void run_repl(const char *self_path)
                             {
                                 fclose(f);
 
-                                char cmd[4096];
-                                snprintf(cmd, sizeof(cmd), "%s %s", editor, edit_path);
-                                int status = system(cmd);
+                                char cmdbuf[4096];
+#if ZC_OS_WINDOWS
+                                snprintf(cmdbuf, sizeof(cmdbuf), "\"%s \"%s\"\"", editor,
+                                         edit_path);
+#else
+                                snprintf(cmdbuf, sizeof(cmdbuf), "%s \"%s\"", editor, edit_path);
+#endif
+                                int status = system(cmdbuf);
 
                                 if (0 == status)
                                 {
@@ -1501,9 +1507,13 @@ void run_repl(const char *self_path)
                             editor = "nano";
                         }
 
-                        char cmd[4096];
-                        sprintf(cmd, "%s %s", editor, edit_path);
-                        int status = system(cmd);
+                        char cmdbuf[4096];
+#if ZC_OS_WINDOWS
+                        snprintf(cmdbuf, sizeof(cmdbuf), "\"%s \"%s\"\"", editor, edit_path);
+#else
+                        snprintf(cmdbuf, sizeof(cmdbuf), "%s \"%s\"", editor, edit_path);
+#endif
+                        int status = system(cmdbuf);
 
                         if (0 == status)
                         {
@@ -1646,7 +1656,7 @@ void run_repl(const char *self_path)
                     FILE *f = fopen(filename, "r");
                     if (f)
                     {
-                        char buf[1024];
+                        char buf[MAX_ERROR_MSG_LEN];
                         int count = 0;
                         while (fgets(buf, sizeof(buf), f))
                         {
@@ -1739,20 +1749,21 @@ void run_repl(const char *self_path)
                         }
 
                         // Generate probe code to print values
-                        char *global_code = NULL;
-                        char *main_code = NULL;
-                        repl_get_code(history, history_len, &global_code, &main_code);
+                        char *probe_global_code = NULL;
+                        char *probe_main_code = NULL;
+                        repl_get_code(history, history_len, &probe_global_code, &probe_main_code);
 
                         // Generate probe code to print values
-                        size_t probe_size = strlen(global_code) + strlen(main_code) + 4096;
+                        size_t probe_size =
+                            strlen(probe_global_code) + strlen(probe_main_code) + 4096;
                         char *probe_code = malloc(probe_size);
 
                         sprintf(probe_code,
                                 "%s\nfn main() { _z_suppress_stdout(); %s _z_restore_stdout(); "
                                 "printf(\"Variables:\\n\"); ",
-                                global_code, main_code);
-                        free(global_code);
-                        free(main_code);
+                                probe_global_code, probe_main_code);
+                        free(probe_global_code);
+                        free(probe_main_code);
 
                         int found_vars = 0;
                         if (main_func && main_func->func.body &&
@@ -1852,7 +1863,7 @@ void run_repl(const char *self_path)
                                         sprintf(val_expr, "(void*)&%s", s->var_decl.name);
                                     }
 
-                                    char print_stmt[512];
+                                    char print_stmt[MAX_ERROR_MSG_LEN];
                                     snprintf(print_stmt, sizeof(print_stmt),
                                              "printf(\"  %s (%s): %s\\n\", %s); ", s->var_decl.name,
                                              t, fmt, val_expr);
@@ -1878,9 +1889,15 @@ void run_repl(const char *self_path)
                         {
                             fprintf(f, "%s", probe_code);
                             fclose(f);
-                            char cmd[4096];
-                            snprintf(cmd, sizeof(cmd), "%s run -q %s", self_path, tmp_path);
-                            system(cmd);
+                            char cmdbuf[4096];
+#if ZC_OS_WINDOWS
+                            snprintf(cmdbuf, sizeof(cmdbuf), "\"\"%s\" run -q \"%s\"\"", self_path,
+                                     tmp_path);
+#else
+                            snprintf(cmdbuf, sizeof(cmdbuf), "\"%s\" run -q \"%s\"", self_path,
+                                     tmp_path);
+#endif
+                            system(cmdbuf);
                             remove(tmp_path);
                         }
                         free(probe_code);
@@ -1955,13 +1972,19 @@ void run_repl(const char *self_path)
                         fprintf(f, "%s", probe_code);
                         fclose(f);
 
-                        char cmd[2048];
-                        sprintf(cmd, "%s run -q %s 2>&1", self_path, tmp_path);
+                        char cmdbuf[2048];
+#if ZC_OS_WINDOWS
+                        snprintf(cmdbuf, sizeof(cmdbuf), "\"\"%s\" run -q \"%s\" 2>&1\"", self_path,
+                                 tmp_path);
+#else
+                        snprintf(cmdbuf, sizeof(cmdbuf), "\"%s\" run -q \"%s\" 2>&1", self_path,
+                                 tmp_path);
+#endif
 
-                        FILE *p = popen(cmd, "r");
+                        FILE *p = popen(cmdbuf, "r");
                         if (p)
                         {
-                            char buf[1024];
+                            char buf[MAX_ERROR_MSG_LEN];
                             int found = 0;
                             while (fgets(buf, sizeof(buf), p))
                             {
@@ -2067,9 +2090,15 @@ void run_repl(const char *self_path)
                     {
                         fprintf(f, "%s", code);
                         fclose(f);
-                        char cmd[2048];
-                        sprintf(cmd, "%s run -q %s", self_path, tmp_path);
-                        system(cmd);
+                        char cmdbuf[2048];
+#if ZC_OS_WINDOWS
+                        snprintf(cmdbuf, sizeof(cmdbuf), "\"\"%s\" run -q \"%s\"\"", self_path,
+                                 tmp_path);
+#else
+                        snprintf(cmdbuf, sizeof(cmdbuf), "\"%s\" run -q \"%s\"", self_path,
+                                 tmp_path);
+#endif
+                        system(cmdbuf);
                     }
                     free(code);
                     continue;
@@ -2083,24 +2112,24 @@ void run_repl(const char *self_path)
                         continue;
                     }
                     char *expr_buf = malloc(8192);
-                    strcpy(expr_buf, cmd_buf + 3);
+                    snprintf(expr_buf, 8192, "%s", cmd_buf + 3);
 
-                    int brace_depth = 0;
+                    int cmd_brace_depth = 0;
                     for (char *p = expr_buf; *p; p++)
                     {
                         if (*p == '{')
                         {
-                            brace_depth++;
+                            cmd_brace_depth++;
                         }
                         else if (*p == '}')
                         {
-                            brace_depth--;
+                            cmd_brace_depth--;
                         }
                     }
 
-                    while (brace_depth > 0)
+                    while (cmd_brace_depth > 0)
                     {
-                        char *more = repl_readline("... ", history, history_len, brace_depth);
+                        char *more = repl_readline("... ", history, history_len, cmd_brace_depth);
                         if (!more)
                         {
                             break;
@@ -2111,11 +2140,11 @@ void run_repl(const char *self_path)
                         {
                             if (*p == '{')
                             {
-                                brace_depth++;
+                                cmd_brace_depth++;
                             }
                             else if (*p == '}')
                             {
-                                brace_depth--;
+                                cmd_brace_depth--;
                             }
                         }
                         free(more);
@@ -2141,15 +2170,15 @@ void run_repl(const char *self_path)
                     {
                         fprintf(f, "%s", code);
                         fclose(f);
-                        char cmd[2048];
-                        sprintf(cmd,
-                                "%s build -q --emit-c -o /tmp/zprep_repl_out %s "
-                                "2>/dev/null; sed "
-                                "-n '/^int main() {$/,/^}$/p' /tmp/zprep_repl_out.c "
-                                "2>/dev/null | "
-                                "tail -n +3 | head -n -2 | sed 's/^    //'",
-                                self_path, tmp_path);
-                        system(cmd);
+                        char cmdbuf[2048];
+                        snprintf(cmdbuf, sizeof(cmdbuf),
+                                 "\"%s\" build -q --emit-c -o /tmp/zprep_repl_out \"%s\" "
+                                 "2>/dev/null; sed "
+                                 "-n '/^int main() {$/,/^}$/p' /tmp/zprep_repl_out.c "
+                                 "2>/dev/null | "
+                                 "tail -n +3 | head -n -2 | sed 's/^    //'",
+                                 self_path, tmp_path);
+                        system(cmdbuf);
                     }
                     free(code);
                     continue;
@@ -2174,9 +2203,14 @@ void run_repl(const char *self_path)
                     {
                         fprintf(f, "%s", code);
                         fclose(f);
-                        char cmd[2048];
-                        sprintf(cmd, "%s run %s", self_path, tmp_path);
-                        system(cmd);
+                        char cmdbuf[2048];
+#if ZC_OS_WINDOWS
+                        snprintf(cmdbuf, sizeof(cmdbuf), "\"\"%s\" run \"%s\"\"", self_path,
+                                 tmp_path);
+#else
+                        snprintf(cmdbuf, sizeof(cmdbuf), "\"%s\" run \"%s\"", self_path, tmp_path);
+#endif
+                        system(cmdbuf);
                     }
                     free(code);
                     continue;
@@ -2224,15 +2258,33 @@ void run_repl(const char *self_path)
                         }
                         else
                         {
-                            char man_cmd[256];
-                            sprintf(man_cmd,
-                                    "man 3 %s 2>/dev/null | sed -n '/^SYNOPSIS/,/^[A-Z]/p' | "
-                                    "head -10",
-                                    sym);
+                            char man_cmd[MAX_MANGLED_NAME_LEN];
+                            // Sanitize symbol name to only allow alphanumeric, underscore, colon,
+                            // dot
+                            char safe_sym[MAX_VAR_NAME_LEN];
+                            size_t slen = strlen(sym);
+                            if (slen > 255)
+                            {
+                                slen = 255;
+                            }
+                            strncpy(safe_sym, sym, slen);
+                            safe_sym[slen] = 0;
+                            for (int i = 0; safe_sym[i]; i++)
+                            {
+                                if (!isalnum((unsigned char)safe_sym[i]) && safe_sym[i] != '_' &&
+                                    safe_sym[i] != ':' && safe_sym[i] != '.')
+                                {
+                                    safe_sym[i] = '_';
+                                }
+                            }
+                            snprintf(man_cmd, sizeof(man_cmd),
+                                     "man 3 %s 2>/dev/null | sed -n '/^SYNOPSIS/,/^[A-Z]/p' | "
+                                     "head -10",
+                                     safe_sym);
                             FILE *mp = popen(man_cmd, "r");
                             if (mp)
                             {
-                                char buf[256];
+                                char buf[MAX_SHORT_MSG_LEN];
                                 int lines = 0;
                                 while (fgets(buf, sizeof(buf), mp) && lines < 8)
                                 {
@@ -2305,7 +2357,7 @@ void run_repl(const char *self_path)
 
             size_t len = strlen(line_buf);
             input_buffer = realloc(input_buffer, input_len + len + 1);
-            strcpy(input_buffer + input_len, line_buf);
+            snprintf(input_buffer + input_len, input_len + sizeof(line_buf), "%s", line_buf);
             input_len += len;
 
             if (brace_depth > 0 || paren_depth > 0)
@@ -2363,7 +2415,7 @@ void run_repl(const char *self_path)
                 char *last_line = history[history_len - 1];
 
                 char *check_buf = malloc(strlen(last_line) + 2);
-                strcpy(check_buf, last_line);
+                snprintf(check_buf, strlen(last_line) + 2, "%s", last_line);
                 strcat(check_buf, ";");
 
                 ParserContext ctx = {0};
@@ -2394,18 +2446,18 @@ void run_repl(const char *self_path)
 
                 if (is_expr)
                 {
-                    char *global_code = NULL;
-                    char *main_code = NULL;
-                    repl_get_code(history, history_len - 1, &global_code, &main_code);
+                    char *probe_global_code = NULL;
+                    char *probe_main_code = NULL;
+                    repl_get_code(history, history_len - 1, &probe_global_code, &probe_main_code);
 
-                    size_t probesz =
-                        strlen(global_code) + strlen(main_code) + strlen(last_line) + 4096;
+                    size_t probesz = strlen(probe_global_code) + strlen(probe_main_code) +
+                                     strlen(last_line) + 4096;
                     char *probe_code = malloc(probesz);
 
-                    sprintf(probe_code, "%s\nfn main() { _z_suppress_stdout(); %s", global_code,
-                            main_code);
-                    free(global_code);
-                    free(main_code);
+                    sprintf(probe_code, "%s\nfn main() { _z_suppress_stdout(); %s",
+                            probe_global_code, probe_main_code);
+                    free(probe_global_code);
+                    free(probe_main_code);
 
                     strcat(probe_code, " raw { typedef struct { int _u; } __REVEAL_TYPE__; } ");
                     strcat(probe_code, " var _z_type_probe: __REVEAL_TYPE__; _z_type_probe = (");
@@ -2427,7 +2479,7 @@ void run_repl(const char *self_path)
                         int is_void = 0;
                         if (pp)
                         {
-                            char buf[1024];
+                            char buf[MAX_ERROR_MSG_LEN];
                             while (fgets(buf, sizeof(buf), pp))
                             {
                                 if (strstr(buf, "void") && strstr(buf, "expression"))
@@ -2466,7 +2518,7 @@ void run_repl(const char *self_path)
                 strcat(full_code, "; ");
                 for (int i = 0; i < watches_len; i++)
                 {
-                    char wbuf[1024];
+                    char wbuf[MAX_ERROR_MSG_LEN];
                     sprintf(wbuf,
                             "printf(\"\\033[90mwatch:%s = \\033[0m\"); print \"{%s}\"; "
                             "printf(\"\\n\"); ",
@@ -2490,7 +2542,7 @@ void run_repl(const char *self_path)
             fclose(f);
             free(full_code);
 
-            char cmd[2048];
+            char cmd[MAX_PATH_LEN];
             sprintf(cmd, "%s run -q %s", self_path, tmp_path);
 
             int ret = system(cmd);

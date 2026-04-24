@@ -1,5 +1,6 @@
 
 #include "parser.h"
+#include "../constants.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,83 +29,27 @@ static void auto_import_std_mem(ParserContext *ctx)
         // Let's check if we can find any indicator that mem.zc was loaded
     }
 
-    // Try to find and import std/mem.zc
-    static const char *std_paths[] = {"std/mem.zc", "./std/mem.zc", NULL};
-    static const char *system_paths[] = {"/usr/local/share/zenc", "/usr/share/zenc", NULL};
-
-    char resolved_path[1024];
-    int found = 0;
-
-    // First, try relative to current file
-    if (g_current_filename)
+    // Resolve path to std/mem.zc
+    char *resolved = z_resolve_path("std/mem.zc", g_current_filename);
+    if (!resolved)
     {
-        char *current_dir = xstrdup(g_current_filename);
-        char *last_slash = strrchr(current_dir, '/');
-        if (last_slash)
-        {
-            *last_slash = 0;
-            snprintf(resolved_path, sizeof(resolved_path), "%s/std/mem.zc", current_dir);
-            if (access(resolved_path, R_OK) == 0)
-            {
-                found = 1;
-            }
-        }
-        free(current_dir);
+        return; // Could not find mem.zc
     }
 
-    // Try relative paths
-    if (!found)
+    // Check if already imported by path
+    if (is_file_imported(ctx, resolved))
     {
-        for (int i = 0; std_paths[i] && !found; i++)
-        {
-            if (access(std_paths[i], R_OK) == 0)
-            {
-                strncpy(resolved_path, std_paths[i], sizeof(resolved_path) - 1);
-                resolved_path[sizeof(resolved_path) - 1] = '\0';
-                found = 1;
-            }
-        }
-    }
-
-    // Try system paths
-    if (!found)
-    {
-        for (int i = 0; system_paths[i] && !found; i++)
-        {
-            snprintf(resolved_path, sizeof(resolved_path), "%s/std/mem.zc", system_paths[i]);
-            if (access(resolved_path, R_OK) == 0)
-            {
-                found = 1;
-            }
-        }
-    }
-
-    if (!found)
-    {
-        return; // Could not find std/mem.zc
-    }
-
-    // Canonicalize path
-    char *real_fn = realpath(resolved_path, NULL);
-    if (real_fn)
-    {
-        strncpy(resolved_path, real_fn, sizeof(resolved_path) - 1);
-        resolved_path[sizeof(resolved_path) - 1] = '\0';
-        free(real_fn);
-    }
-
-    // Check if already imported
-    if (is_file_imported(ctx, resolved_path))
-    {
+        free(resolved);
         return;
     }
-    mark_file_imported(ctx, resolved_path);
+    mark_file_imported(ctx, resolved);
 
     // Load and parse the file
-    char *src = load_file(resolved_path);
+    char *src = load_file(resolved);
     if (!src)
     {
-        return; // Could not load file
+        free(resolved);
+        return;
     }
 
     Lexer i;
@@ -112,12 +57,13 @@ static void auto_import_std_mem(ParserContext *ctx)
 
     // Save and restore filename context
     char *saved_fn = g_current_filename;
-    g_current_filename = resolved_path;
+    g_current_filename = resolved;
 
     // Parse the mem module contents
     parse_program_nodes(ctx, &i);
 
     g_current_filename = saved_fn;
+    free(resolved);
 }
 
 // Trait Parsing
@@ -125,6 +71,7 @@ ASTNode *parse_trait(ParserContext *ctx, Lexer *l)
 {
     lexer_next(l); // eat trait
     Token n = lexer_next(l);
+    check_identifier(ctx, n);
     if (n.type != TOK_IDENT)
     {
         zpanic_at(n, "Expected trait name");
@@ -143,6 +90,7 @@ ASTNode *parse_trait(ParserContext *ctx, Lexer *l)
         while (1)
         {
             Token p = lexer_next(l);
+            check_identifier(ctx, p);
             if (p.type != TOK_IDENT)
             {
                 zpanic_at(p, "Expected generic parameter name");
@@ -190,6 +138,12 @@ ASTNode *parse_trait(ParserContext *ctx, Lexer *l)
             break;
         }
 
+        DeclarationAttributes attrs = {0};
+        if (lexer_peek(l).type == TOK_AT)
+        {
+            attrs = parse_attributes(ctx, l);
+        }
+
         // Parse method signature: fn name(args...) -> ret;
         Token ft = lexer_next(l);
         if (ft.type != TOK_IDENT || strncmp(ft.start, "fn", 2) != 0)
@@ -198,6 +152,7 @@ ASTNode *parse_trait(ParserContext *ctx, Lexer *l)
         }
 
         Token mn = lexer_next(l);
+        check_identifier(ctx, mn);
         char *mname = xmalloc(mn.len + 1);
         strncpy(mname, mn.start, mn.len);
         mname[mn.len] = 0;
@@ -212,18 +167,20 @@ ASTNode *parse_trait(ParserContext *ctx, Lexer *l)
                                             &arg_types, &param_names, &is_varargs, NULL);
 
         char *ret = xstrdup("void");
+        Type *ret_type_obj = type_new(TYPE_VOID);
         if (lexer_peek(l).type == TOK_ARROW)
         {
             lexer_next(l);
-            char *rt = parse_type(ctx, l);
+            ret_type_obj = parse_type_formal(ctx, l);
             free(ret);
-            ret = rt;
+            ret = type_to_string(ret_type_obj);
         }
 
         if (lexer_peek(l).type == TOK_SEMICOLON)
         {
             lexer_next(l);
             ASTNode *m = ast_create(NODE_FUNCTION);
+            m->token = ft;
             m->func.param_names = param_names;
             m->func.name = mname;
             m->func.args = args;
@@ -232,7 +189,11 @@ ASTNode *parse_trait(ParserContext *ctx, Lexer *l)
             m->func.arg_count = arg_count;
             m->func.arg_types = arg_types;
             m->func.ret_type = ret;
+            m->func.ret_type_info = ret_type_obj;
             m->func.body = NULL;
+            m->link_name = attrs.link_name;
+            m->cfg_condition = attrs.cfg_condition;
+            m->func.pure = attrs.is_pure;
             if (!methods)
             {
                 methods = m;
@@ -270,18 +231,9 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
 {
 
     lexer_next(l); // eat impl
-    Token t1 = lexer_next(l);
-    char *name1 = token_strdup(t1);
 
-    // Map primitive types to their C representation for correct mangling
-    // Normalize type name (e.g. int -> int32_t)
-    const char *normalized = normalize_type_name(name1);
-    char *final_name = strdup(normalized);
-    free(name1);
-    name1 = final_name;
-
+    // Handle impl<T> Struct<T> syntax: generic param declared before struct name
     char *gen_param = NULL;
-    // Check for <T> on the struct name
     if (lexer_peek(l).type == TOK_LANGLE)
     {
         lexer_next(l); // eat <
@@ -291,11 +243,41 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
         {
             zpanic_at(lexer_peek(l), "Expected >");
         }
+        register_generic(ctx, gen_param);
     }
 
-    if (gen_param)
+    Token t1 = lexer_next(l);
+    char *name1 = token_strdup(t1);
+
+    // Map primitive types to their C representation for correct mangling
+    // Normalize type name (e.g. int -> int32_t)
+    const char *normalized = normalize_type_name(name1);
+    char *final_name = xstrdup(normalized);
+    free(name1);
+    name1 = final_name;
+
+    // Check for <T> on the struct name
+    if (!gen_param && lexer_peek(l).type == TOK_LANGLE)
     {
+        // impl Struct<T> syntax: parse and register generic param
+        lexer_next(l); // eat <
+        Token gt = lexer_next(l);
+        gen_param = token_strdup(gt);
+        if (lexer_next(l).type != TOK_RANGLE)
+        {
+            zpanic_at(lexer_peek(l), "Expected >");
+        }
         register_generic(ctx, gen_param);
+    }
+    else if (gen_param && lexer_peek(l).type == TOK_LANGLE)
+    {
+        // impl<T> Struct<T> syntax: skip redundant <T> on struct name
+        lexer_next(l); // eat <
+        lexer_next(l); // eat T
+        if (lexer_next(l).type != TOK_RANGLE)
+        {
+            zpanic_at(lexer_peek(l), "Expected >");
+        }
     }
 
     // Check for "for" (Trait impl)
@@ -392,7 +374,8 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
         if (target_gen_param)
         {
             full_target_name = xmalloc(strlen(name2) + strlen(target_gen_param) + 3);
-            sprintf(full_target_name, "%s<%s>", name2, target_gen_param);
+            snprintf(full_target_name, strlen(name2) + strlen(target_gen_param) + 3, "%s<%s>",
+                     name2, target_gen_param);
         }
         else
         {
@@ -401,36 +384,53 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
 
         while (1)
         {
+            ctx->current_impl_methods = h;
             skip_comments(l);
             if (lexer_peek(l).type == TOK_RBRACE)
             {
                 lexer_next(l);
                 break;
             }
+            DeclarationAttributes attrs = {0};
+            if (lexer_peek(l).type == TOK_AT)
+            {
+                attrs = parse_attributes(ctx, l);
+            }
+
             if (lexer_peek(l).type == TOK_IDENT && strncmp(lexer_peek(l).start, "fn", 2) == 0)
             {
-                ASTNode *f = parse_function(ctx, l, 0);
+                ASTNode *f = parse_function(ctx, l, 0, 0, attrs.link_name, 0);
                 // Mangle: Type_Trait_Method
-                char *mangled = xmalloc(strlen(name2) + strlen(name1) + strlen(f->func.name) + 4);
-                sprintf(mangled, "%s__%s_%s", name2, name1, f->func.name);
-                free(f->func.name);
-                f->func.name = mangled;
+                {
+                    char tmp[MAX_MANGLED_NAME_LEN];
+                    snprintf(tmp, sizeof(tmp), "%s__%s__%s", name2, name1, f->func.name);
+                    free(f->func.name);
+                    f->func.name = merge_underscores(tmp);
+                }
 
                 // Use full_target_name (Vec<T>) for self patching
                 char *na = patch_self_args(f->func.args, full_target_name);
                 free(f->func.args);
                 f->func.args = na;
 
+                if (attrs.cfg_condition)
+                {
+                    f->cfg_condition = attrs.cfg_condition;
+                }
+                f->func.pure = attrs.is_pure;
+                f->link_name = attrs.link_name;
+
                 // Register function for lookup
                 if (f->func.generic_params)
                 {
-                    register_func_template(ctx, mangled, f->func.generic_params, f);
+                    register_func_template(ctx, f->func.name, f->func.generic_params, f);
                 }
                 else
                 {
-                    register_func(ctx, mangled, f->func.arg_count, f->func.defaults,
-                                  f->func.arg_types, f->func.ret_type_info, f->func.is_varargs,
-                                  f->func.is_async, f->token);
+                    register_func(ctx, ctx->current_scope, f->func.name, f->func.arg_count,
+                                  f->func.defaults, f->func.arg_types, f->func.ret_type_info,
+                                  f->func.is_varargs, f->func.is_async, f->func.pure, f->link_name,
+                                  f->token, 0);
                 }
 
                 if (!h)
@@ -448,29 +448,33 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
                 lexer_next(l); // eat async
                 if (lexer_peek(l).type == TOK_IDENT && strncmp(lexer_peek(l).start, "fn", 2) == 0)
                 {
-                    ASTNode *f = parse_function(ctx, l, 1);
+                    ASTNode *f = parse_function(ctx, l, 1, 0, attrs.link_name, 0);
                     f->func.is_async = 1;
                     // Mangle: Type_Trait_Method
-                    char *mangled =
-                        xmalloc(strlen(name2) + strlen(name1) + strlen(f->func.name) + 5);
-                    sprintf(mangled, "%s__%s_%s", name2, name1, f->func.name);
-                    free(f->func.name);
-                    f->func.name = mangled;
+                    {
+                        char tmp[MAX_MANGLED_NAME_LEN];
+                        snprintf(tmp, sizeof(tmp), "%s__%s__%s", name2, name1, f->func.name);
+                        free(f->func.name);
+                        f->func.name = merge_underscores(tmp);
+                    }
 
                     char *na = patch_self_args(f->func.args, full_target_name);
-                    free(f->func.args);
                     f->func.args = na;
+                    f->link_name = attrs.link_name;
+                    f->cfg_condition = attrs.cfg_condition;
+                    f->func.pure = attrs.is_pure;
 
                     // Register function for lookup
                     if (f->func.generic_params)
                     {
-                        register_func_template(ctx, mangled, f->func.generic_params, f);
+                        register_func_template(ctx, f->func.name, f->func.generic_params, f);
                     }
                     else
                     {
-                        register_func(ctx, mangled, f->func.arg_count, f->func.defaults,
-                                      f->func.arg_types, f->func.ret_type_info, f->func.is_varargs,
-                                      f->func.is_async, f->token);
+                        register_func(ctx, ctx->current_scope, f->func.name, f->func.arg_count,
+                                      f->func.defaults, f->func.arg_types, f->func.ret_type_info,
+                                      f->func.is_varargs, f->func.is_async, f->func.pure,
+                                      f->link_name, f->token, 0);
                     }
 
                     if (!h)
@@ -524,7 +528,10 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
             {
                 gp = def->strct.generic_params[0];
             }
-            // TODO: Enum generic params support if needed
+            else if (def && def->type == NODE_ENUM && def->enm.is_template)
+            {
+                gp = def->enm.generic_param;
+            }
             register_impl_template(ctx, name2, gp, n);
         }
 
@@ -543,12 +550,25 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
         // Regular impl Struct (impl Box or impl Box<T>)
 
         // Auto-prefix struct name if in module context
-        if (ctx->current_module_prefix && !gen_param)
+        if (ctx->current_module_prefix && !gen_param && !is_extern_symbol(ctx, name1))
         {
-            char *prefixed_name = xmalloc(strlen(ctx->current_module_prefix) + strlen(name1) + 2);
-            sprintf(prefixed_name, "%s_%s", ctx->current_module_prefix, name1);
+            char *prefixed_name = xmalloc(strlen(ctx->current_module_prefix) + strlen(name1) + 3);
+            snprintf(prefixed_name, strlen(ctx->current_module_prefix) + strlen(name1) + 3,
+                     "%s__%s", ctx->current_module_prefix, name1);
             free(name1);
             name1 = prefixed_name;
+        }
+
+        // Resolve opaque alias (e.g. StringView -> Slice__char)
+        TypeAlias *ta = find_type_alias_node(ctx, name1);
+        if (ta && !ta->is_opaque)
+        {
+            const char *alias_resolved = ta->original_type;
+            if (alias_resolved)
+            {
+                free(name1);
+                name1 = xstrdup(alias_resolved);
+            }
         }
 
         ctx->current_impl_struct = name1; // For patch_self_args inside parse_function
@@ -561,7 +581,8 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
                 zpanic_at(lexer_peek(l), "Expected {");
             }
             char *full_struct_name = xmalloc(strlen(name1) + strlen(gen_param) + 3);
-            sprintf(full_struct_name, "%s<%s>", name1, gen_param);
+            snprintf(full_struct_name, strlen(name1) + strlen(gen_param) + 3, "%s<%s>", name1,
+                     gen_param);
 
             ASTNode *h = 0, *tl = 0;
             ctx->current_impl_methods = NULL;
@@ -574,14 +595,24 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
                     lexer_next(l);
                     break;
                 }
+                DeclarationAttributes attrs = {0};
+                if (lexer_peek(l).type == TOK_AT)
+                {
+                    attrs = parse_attributes(ctx, l);
+                }
+
                 if (lexer_peek(l).type == TOK_IDENT && strncmp(lexer_peek(l).start, "fn", 2) == 0)
                 {
-                    ASTNode *f = parse_function(ctx, l, 0);
+                    ASTNode *f = parse_function(ctx, l, 0, 0, attrs.link_name, 0);
                     // Standard Mangle for template: Box_method
-                    char *mangled = xmalloc(strlen(name1) + strlen(f->func.name) + 3);
-                    sprintf(mangled, "%s__%s", name1, f->func.name);
-                    free(f->func.name);
-                    f->func.name = mangled;
+                    {
+                        char *tmp = xmalloc(strlen(name1) + strlen(f->func.name) + 3);
+                        snprintf(tmp, strlen(name1) + strlen(f->func.name) + 3, "%s__%s", name1,
+                                 f->func.name);
+                        free(f->func.name);
+                        f->func.name = merge_underscores(tmp);
+                        free(tmp);
+                    }
 
                     // Update args string
                     char *na = patch_self_args(f->func.args, full_struct_name);
@@ -621,12 +652,16 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
                     if (lexer_peek(l).type == TOK_IDENT &&
                         strncmp(lexer_peek(l).start, "fn", 2) == 0)
                     {
-                        ASTNode *f = parse_function(ctx, l, 1);
+                        ASTNode *f = parse_function(ctx, l, 1, 0, attrs.link_name, 0);
                         f->func.is_async = 1;
-                        char *mangled = xmalloc(strlen(name1) + strlen(f->func.name) + 3);
-                        sprintf(mangled, "%s__%s", name1, f->func.name);
-                        free(f->func.name);
-                        f->func.name = mangled;
+                        {
+                            char *tmp = xmalloc(strlen(name1) + strlen(f->func.name) + 3);
+                            snprintf(tmp, strlen(name1) + strlen(f->func.name) + 3, "%s__%s", name1,
+                                     f->func.name);
+                            free(f->func.name);
+                            f->func.name = merge_underscores(tmp);
+                            free(tmp);
+                        }
 
                         char *na = patch_self_args(f->func.args, full_struct_name);
                         free(f->func.args);
@@ -671,6 +706,7 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
             free(full_struct_name);
             // Register Template
             ASTNode *n = ast_create(NODE_IMPL);
+            n->token = t1;
             n->impl.struct_name = name1;
             n->impl.methods = h;
             register_impl_template(ctx, name1, gen_param, n);
@@ -688,35 +724,55 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
             ASTNode *h = 0, *tl = 0;
             while (1)
             {
+                ctx->current_impl_methods = h;
                 skip_comments(l);
                 if (lexer_peek(l).type == TOK_RBRACE)
                 {
                     lexer_next(l);
                     break;
                 }
+
+                DeclarationAttributes attrs = {0};
+                if (lexer_peek(l).type == TOK_AT)
+                {
+                    attrs = parse_attributes(ctx, l);
+                }
+
                 if (lexer_peek(l).type == TOK_IDENT && strncmp(lexer_peek(l).start, "fn", 2) == 0)
                 {
-                    ASTNode *f = parse_function(ctx, l, 0);
+                    ASTNode *f = parse_function(ctx, l, 0, 0, attrs.link_name, 0);
 
                     // Standard Mangle: Struct_method
-                    char *mangled = xmalloc(strlen(name1) + strlen(f->func.name) + 3);
-                    sprintf(mangled, "%s__%s", name1, f->func.name);
-                    free(f->func.name);
-                    f->func.name = mangled;
+                    {
+                        size_t tmp_len = strlen(name1) + strlen(f->func.name) + 3;
+                        char *tmp = xmalloc(tmp_len);
+                        snprintf(tmp, tmp_len, "%s__%s", name1, f->func.name);
+                        free(f->func.name);
+                        f->func.name = merge_underscores(tmp);
+                        free(tmp);
+                    }
 
                     char *na = patch_self_args(f->func.args, name1);
                     free(f->func.args);
                     f->func.args = na;
 
+                    if (attrs.cfg_condition)
+                    {
+                        f->cfg_condition = attrs.cfg_condition;
+                    }
+                    f->func.pure = attrs.is_pure;
+                    f->link_name = attrs.link_name;
+
                     if (f->func.generic_params)
                     {
-                        register_func_template(ctx, mangled, f->func.generic_params, f);
+                        register_func_template(ctx, f->func.name, f->func.generic_params, f);
                     }
                     else
                     {
-                        register_func(ctx, mangled, f->func.arg_count, f->func.defaults,
-                                      f->func.arg_types, f->func.ret_type_info, f->func.is_varargs,
-                                      0, f->token);
+                        register_func(ctx, ctx->current_scope, f->func.name, f->func.arg_count,
+                                      f->func.defaults, f->func.arg_types, f->func.ret_type_info,
+                                      f->func.is_varargs, 0, f->func.pure, f->link_name, f->token,
+                                      0);
                     }
 
                     if (!h)
@@ -735,24 +791,37 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
                     if (lexer_peek(l).type == TOK_IDENT &&
                         strncmp(lexer_peek(l).start, "fn", 2) == 0)
                     {
-                        ASTNode *f = parse_function(ctx, l, 1);
+                        ASTNode *f = parse_function(ctx, l, 1, 0, attrs.link_name, 0);
                         f->func.is_async = 1;
-                        char *mangled = xmalloc(strlen(name1) + strlen(f->func.name) + 3);
-                        sprintf(mangled, "%s__%s", name1, f->func.name);
-                        free(f->func.name);
-                        f->func.name = mangled;
+                        {
+                            size_t tmp_len = strlen(name1) + strlen(f->func.name) + 3;
+                            char *tmp = xmalloc(tmp_len);
+                            snprintf(tmp, tmp_len, "%s__%s", name1, f->func.name);
+                            free(f->func.name);
+                            f->func.name = merge_underscores(tmp);
+                            free(tmp);
+                        }
                         char *na = patch_self_args(f->func.args, name1);
                         free(f->func.args);
                         f->func.args = na;
+
+                        if (attrs.cfg_condition)
+                        {
+                            f->cfg_condition = attrs.cfg_condition;
+                        }
+                        f->func.pure = attrs.is_pure;
+                        f->link_name = attrs.link_name;
+
                         if (f->func.generic_params)
                         {
-                            register_func_template(ctx, mangled, f->func.generic_params, f);
+                            register_func_template(ctx, f->func.name, f->func.generic_params, f);
                         }
                         else
                         {
-                            register_func(ctx, mangled, f->func.arg_count, f->func.defaults,
-                                          f->func.arg_types, f->func.ret_type_info,
-                                          f->func.is_varargs, 1, f->token);
+                            register_func(ctx, ctx->current_scope, f->func.name, f->func.arg_count,
+                                          f->func.defaults, f->func.arg_types,
+                                          f->func.ret_type_info, f->func.is_varargs, 1,
+                                          f->func.pure, f->link_name, f->token, 0);
                         }
                         if (!h)
                         {
@@ -763,10 +832,6 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
                             tl->next = f;
                         }
                         tl = f;
-                    }
-                    else
-                    {
-                        zpanic_at(lexer_peek(l), "Expected 'fn' after 'async'");
                     }
                 }
                 else
@@ -789,12 +854,15 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l)
     }
 }
 
-ASTNode *parse_struct(ParserContext *ctx, Lexer *l, int is_union, int is_opaque)
+ASTNode *parse_struct(ParserContext *ctx, Lexer *l, int is_union, int is_opaque, int is_extern,
+                      const char *link_name, int is_export)
 {
 
     lexer_next(l); // eat struct or union
     Token n = lexer_next(l);
+    check_identifier(ctx, n);
     char *name = token_strdup(n);
+    Token name_token = n;
 
     // Generic Params <T> or <K, V>
     char **gps = NULL;
@@ -805,6 +873,7 @@ ASTNode *parse_struct(ParserContext *ctx, Lexer *l, int is_union, int is_opaque)
         while (1)
         {
             Token g = lexer_next(l);
+            check_identifier(ctx, g);
             gps = realloc(gps, sizeof(char *) * (gp_count + 1));
             gps[gp_count++] = token_strdup(g);
 
@@ -834,17 +903,19 @@ ASTNode *parse_struct(ParserContext *ctx, Lexer *l, int is_union, int is_opaque)
     if (lexer_peek(l).type == TOK_SEMICOLON)
     {
         lexer_next(l);
-        ASTNode *n = ast_create(NODE_STRUCT);
-        n->strct.name = name;
-        n->strct.is_template = (gp_count > 0);
-        n->strct.generic_params = gps;
-        n->strct.generic_param_count = gp_count;
-        n->strct.is_union = is_union;
-        n->strct.fields = NULL;
-        n->strct.is_incomplete = 1;
-        n->strct.is_opaque = is_opaque;
+        ASTNode *node = ast_create(NODE_STRUCT);
+        node->strct.name = name;
+        node->link_name = link_name ? xstrdup(link_name) : NULL;
+        node->strct.is_template = (gp_count > 0);
+        node->strct.generic_params = gps;
+        node->strct.generic_param_count = gp_count;
+        node->strct.is_union = is_union;
+        node->strct.fields = NULL;
+        node->strct.is_incomplete = 1;
+        node->strct.is_opaque = is_opaque;
+        node->strct.is_export = is_export;
 
-        return n;
+        return node;
     }
 
     lexer_next(l); // eat {
@@ -856,6 +927,26 @@ ASTNode *parse_struct(ParserContext *ctx, Lexer *l, int is_union, int is_opaque)
 
     while (1)
     {
+        // Fault-tolerant recovery for struct fields
+        if (ctx->is_fault_tolerant && ctx->had_error)
+        {
+            ctx->had_error = 0;
+            while (1)
+            {
+                Token r = lexer_peek(l);
+                if (r.type == TOK_EOF || r.type == TOK_RBRACE || r.type == TOK_SEMICOLON)
+                {
+                    if (r.type == TOK_SEMICOLON)
+                    {
+                        lexer_next(l);
+                    }
+                    break;
+                }
+                lexer_next(l);
+            }
+            continue;
+        }
+
         skip_comments(l);
         Token t = lexer_peek(l);
 
@@ -883,6 +974,7 @@ ASTNode *parse_struct(ParserContext *ctx, Lexer *l, int is_union, int is_opaque)
             {
                 // Named use -> Composition (Add field, don't flatten)
                 Token field_name = lexer_next(l);
+                check_identifier(ctx, field_name);
                 lexer_next(l); // eat :
                 Type *ft = parse_type_formal(ctx, l);
                 char *field_type_str = type_to_c_string(ft);
@@ -952,14 +1044,6 @@ ASTNode *parse_struct(ParserContext *ctx, Lexer *l, int is_union, int is_opaque)
                     f = f->next;
                 }
             }
-            else
-            {
-                // If definition not found (e.g. user struct defined later), we can't
-                // embed fields yet. Compiler limitation: 'use' requires struct to be
-                // defined before. Fallback: Emit a placeholder field so compilation
-                // doesn't crash, but layout will be wrong. printf("Warning: Could not
-                // find struct '%s' for embedding.\n", use_name);
-            }
             free(use_name);
             continue;
         }
@@ -967,6 +1051,7 @@ ASTNode *parse_struct(ParserContext *ctx, Lexer *l, int is_union, int is_opaque)
         if (t.type == TOK_IDENT)
         {
             Token f_name = lexer_next(l);
+            check_identifier(ctx, f_name);
             expect(l, TOK_COLON, "Expected :");
             Type *ft = parse_type_formal(ctx, l);
             char *f_type = type_to_c_string(ft);
@@ -1010,27 +1095,50 @@ ASTNode *parse_struct(ParserContext *ctx, Lexer *l, int is_union, int is_opaque)
         }
     }
 
-    ASTNode *node = ast_create(NODE_STRUCT);
-    add_to_struct_list(ctx, node);
-
     // Auto-prefix struct name if in module context
-    if (ctx->current_module_prefix && gp_count == 0)
+    if (ctx->current_module_prefix && gp_count == 0 && !is_extern && !is_extern_symbol(ctx, name))
     { // Don't prefix generic templates
-        char *prefixed_name = xmalloc(strlen(ctx->current_module_prefix) + strlen(name) + 2);
-        sprintf(prefixed_name, "%s_%s", ctx->current_module_prefix, name);
+        size_t pref_len = strlen(ctx->current_module_prefix) + strlen(name) + 3;
+        char *prefixed_name = xmalloc(pref_len);
+        snprintf(prefixed_name, pref_len, "%s__%s", ctx->current_module_prefix, name);
         free(name);
         name = prefixed_name;
     }
+
+    // Generic templates are registered separately and may share the base name.
+    if (gp_count == 0 && !g_config.mode_lsp)
+    {
+        ASTNode *existing = find_concrete_struct_def(ctx, name);
+        if (existing)
+        {
+            zerror_at(name_token, "Redefinition of %s '%s'", is_union ? "union" : "struct", name);
+        }
+    }
+
+    ASTNode *node = ast_create(NODE_STRUCT);
+    node->token = name_token;
+    node->link_name = link_name ? xstrdup(link_name) : NULL;
+    add_to_struct_list(ctx, node);
 
     node->strct.name = name;
 
     // Initialize Type Info so we can track traits (like Drop)
     node->type_info = type_new(TYPE_STRUCT);
     node->type_info->name = xstrdup(name);
+    if (node->link_name)
+    {
+        node->type_info->link_name = xstrdup(node->link_name);
+    }
     if (gp_count > 0)
     {
         node->type_info->kind = TYPE_GENERIC;
-        // TODO: track generic params
+        node->type_info->arg_count = gp_count;
+        node->type_info->args = xmalloc(sizeof(Type *) * gp_count);
+        for (int i = 0; i < gp_count; i++)
+        {
+            node->type_info->args[i] = type_new(TYPE_GENERIC);
+            node->type_info->args[i]->name = xstrdup(gps[i]);
+        }
     }
 
     node->strct.fields = h;
@@ -1038,6 +1146,7 @@ ASTNode *parse_struct(ParserContext *ctx, Lexer *l, int is_union, int is_opaque)
     node->strct.generic_param_count = gp_count;
     node->strct.is_union = is_union;
     node->strct.is_opaque = is_opaque;
+    node->strct.is_export = is_export;
     node->strct.used_structs = temp_used_structs;
     node->strct.used_struct_count = temp_used_count;
     node->strct.defined_in_file = g_current_filename ? xstrdup(g_current_filename) : NULL;
@@ -1076,17 +1185,18 @@ Type *parse_type_obj(ParserContext *ctx, Lexer *l)
     return t;
 }
 
-ASTNode *parse_enum(ParserContext *ctx, Lexer *l)
+ASTNode *parse_enum(ParserContext *ctx, Lexer *l, const char *link_name, int is_export)
 {
     lexer_next(l);
     Token n = lexer_next(l);
+    check_identifier(ctx, n);
 
-    // 1. Check for Generic <T>
     char *gp = NULL;
     if (lexer_peek(l).type == TOK_LANGLE)
     {
         lexer_next(l); // eat <
         Token g = lexer_next(l);
+        check_identifier(ctx, g);
         gp = token_strdup(g);
         lexer_next(l); // eat >
         register_generic(ctx, gp);
@@ -1116,10 +1226,12 @@ ASTNode *parse_enum(ParserContext *ctx, Lexer *l)
         if (t.type == TOK_IDENT)
         {
             Token vt = lexer_next(l);
+            check_identifier(ctx, vt);
             char *vname = token_strdup(vt);
 
-            // 2. Parse Payload Type (Ok(int))
             Type *payload = NULL;
+            Type **tuple_types = NULL;
+            int tuple_count = 0;
             if (lexer_peek(l).type == TOK_LPAREN)
             {
                 lexer_next(l); // eat (
@@ -1128,7 +1240,7 @@ ASTNode *parse_enum(ParserContext *ctx, Lexer *l)
                 if (lexer_peek(l).type == TOK_COMMA)
                 {
                     // Multi-arg variant -> Tuple
-                    char sig[512];
+                    char sig[MAX_MANGLED_NAME_LEN];
                     sig[0] = 0;
 
                     char *s = type_to_string(first_t);
@@ -1139,11 +1251,15 @@ ASTNode *parse_enum(ParserContext *ctx, Lexer *l)
                     strcpy(sig, s);
                     free(s);
 
+                    tuple_types = xmalloc(sizeof(Type *) * 32);
+                    tuple_types[tuple_count++] = first_t;
+
                     while (lexer_peek(l).type == TOK_COMMA)
                     {
                         lexer_next(l); // eat ,
                         strcat(sig, "__");
                         Type *next_t = parse_type_obj(ctx, l);
+                        tuple_types[tuple_count++] = next_t;
                         char *ns = type_to_string(next_t);
                         if (strlen(sig) + strlen(ns) + 2 > 510)
                         {
@@ -1154,9 +1270,10 @@ ASTNode *parse_enum(ParserContext *ctx, Lexer *l)
                     }
 
                     register_tuple(ctx, sig);
-
-                    char *tuple_name = xmalloc(strlen(sig) + 7);
-                    sprintf(tuple_name, "Tuple_%s", sig);
+                    char *clean_sig = sanitize_mangled_name(sig);
+                    char *tuple_name = xmalloc(strlen(clean_sig) + 8);
+                    sprintf(tuple_name, "Tuple__%s", clean_sig);
+                    free(clean_sig);
 
                     payload = type_new(TYPE_STRUCT);
                     payload->name = tuple_name;
@@ -1178,27 +1295,52 @@ ASTNode *parse_enum(ParserContext *ctx, Lexer *l)
             va->variant.payload = payload; // Store Type*
 
             // Register Variant (Mangled name to avoid collisions: Result_Ok)
-            char mangled[256];
-            sprintf(mangled, "%s_%s", ename, vname);
-            register_enum_variant(ctx, ename, mangled, va->variant.tag_id);
+            size_t mangled_sz = strlen(ename) + strlen(vname) + 3;
+            char *base_for_mangling = link_name ? (char *)link_name : ename;
+            mangled_sz = strlen(base_for_mangling) + strlen(vname) + 3;
+
+            char *mangled_tmp = xmalloc(mangled_sz);
+            snprintf(mangled_tmp, mangled_sz, "%s__%s", base_for_mangling, vname);
+            char *mangled = merge_underscores(mangled_tmp);
+            free(mangled_tmp);
+            register_enum_variant(ctx, vname, ename, va->variant.tag_id);
 
             // Register Constructor Function Signature
             if (payload && !gp) // Only for non-generic enums for now
             {
-                Type **at = xmalloc(sizeof(Type *));
-                at[0] = payload;
-                Type *ret_t = type_new(TYPE_ENUM);
-                ret_t->name = xstrdup(ename);
+                if (payload->kind == TYPE_STRUCT && strncmp(payload->name, "Tuple__", 7) == 0)
+                {
+                    Type *ret_t = type_new(TYPE_ENUM);
+                    ret_t->name = xstrdup(ename);
+                    if (link_name)
+                    {
+                        ret_t->link_name = xstrdup(link_name);
+                    }
 
-                register_func(ctx, mangled, 1, NULL, at, ret_t, 0, 0, vt);
+                    // We can reuse the tuple_types collected during parsing!
+                    register_func(ctx, ctx->current_scope, mangled, tuple_count, NULL, tuple_types,
+                                  ret_t, 0, 0, 0, mangled, vt, is_export);
+                }
+                else
+                {
+                    Type **at = xmalloc(sizeof(Type *));
+                    at[0] = payload;
+                    Type *ret_t = type_new(TYPE_ENUM);
+                    ret_t->name = xstrdup(ename);
+                    if (link_name)
+                    {
+                        ret_t->link_name = xstrdup(link_name);
+                    }
+                    register_func(ctx, ctx->current_scope, mangled, 1, NULL, at, ret_t, 0, 0, 0,
+                                  mangled, vt, is_export);
+                }
             }
             else if (!gp)
             {
-                // No payload: fn Name() -> Enum
-                Type *ret_t = type_new(TYPE_ENUM);
-                ret_t->name = xstrdup(ename);
-                register_func(ctx, mangled, 0, NULL, NULL, ret_t, 0, 0, vt);
+                // No payload: don't register as function.
+                // Codegen handles calling the constructor via codegen_var_expr.
             }
+            free(mangled);
 
             // Handle explicit assignment: Ok = 5
             if (lexer_peek(l).type == TOK_OP && *lexer_peek(l).start == '=')
@@ -1227,17 +1369,27 @@ ASTNode *parse_enum(ParserContext *ctx, Lexer *l)
     // Auto-prefix enum name if in module context
     if (ctx->current_module_prefix && !gp)
     { // Don't prefix generic templates
-        char *prefixed_name = xmalloc(strlen(ctx->current_module_prefix) + strlen(ename) + 2);
-        sprintf(prefixed_name, "%s_%s", ctx->current_module_prefix, ename);
+        size_t pref_len = strlen(ctx->current_module_prefix) + strlen(ename) + 3;
+        char *prefixed_name = xmalloc(pref_len);
+        snprintf(prefixed_name, pref_len, "%s__%s", ctx->current_module_prefix, ename);
         free(ename);
         ename = prefixed_name;
     }
 
     ASTNode *node = ast_create(NODE_ENUM);
+    node->token = n;
     node->enm.name = ename;
+    node->link_name = link_name ? xstrdup(link_name) : NULL;
+    node->type_info = type_new(TYPE_ENUM);
+    node->type_info->name = xstrdup(ename);
+    if (node->link_name)
+    {
+        node->type_info->link_name = xstrdup(node->link_name);
+    }
 
     node->enm.variants = h;
     node->enm.generic_param = gp; // Store generic param
+    node->enm.is_export = is_export;
 
     if (gp)
     {
@@ -1245,6 +1397,8 @@ ASTNode *parse_enum(ParserContext *ctx, Lexer *l)
         ctx->known_generics_count--;
         register_template(ctx, node->enm.name, node);
     }
+
+    register_struct_def(ctx, node->enm.name, node);
 
     add_to_enum_list(ctx, node); // Register globally
 

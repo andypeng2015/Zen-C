@@ -1,5 +1,6 @@
 
 #include "../ast/ast.h"
+#include "../constants.h"
 #include "../parser/parser.h"
 #include "../zprep.h"
 #include "codegen.h"
@@ -7,11 +8,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../platform/misra.h"
 
 static void emit_freestanding_preamble(FILE *out)
 {
     fputs("#include <stddef.h>\n#include <stdint.h>\n#include "
           "<stdbool.h>\n#include <stdarg.h>\n",
+          out);
+    fputs("#ifdef __has_builtin\n"
+          "#if __has_builtin(__builtin_pow)\n"
+          "#define _zc_pow __builtin_pow\n"
+          "#endif\n"
+          "#endif\n"
+          "#ifndef _zc_pow\n"
+          "extern double pow(double, double);\n"
+          "#define _zc_pow pow\n"
+          "#endif\n",
           out);
     fputs(ZC_TCC_COMPAT_STR, out);
     fputs("typedef size_t usize;\ntypedef char* string;\n", out);
@@ -25,15 +37,50 @@ static void emit_freestanding_preamble(FILE *out)
     fputs("#define F32 float\n#define F64 double\n", out);
     fputs("static inline const char* _z_bool_str(_Bool b) { return b ? \"true\" : \"false\"; }\n",
           out);
+    fputs("#ifdef __SIZEOF_INT128__\n", out);
+    fputs("static inline const char *_z_u128_str(unsigned __int128 val) {\n"
+          "    static _Thread_local char buf[40];\n"
+          "    if (val == 0) return \"0\";\n"
+          "    int i = 38;\n"
+          "    buf[39] = 0;\n"
+          "    while (val > 0) { buf[i--] = (char)((val % 10) + '0'); val /= 10; }\n"
+          "    return &buf[i + 1];\n"
+          "}\n"
+          "static inline const char *_z_i128_str(__int128 val) {\n"
+          "    static _Thread_local char buf[41];\n"
+          "    if (val == 0) return \"0\";\n"
+          "    int neg = val < 0;\n"
+          "    unsigned __int128 uval = neg ? -val : val;\n"
+          "    int i = 39;\n"
+          "    buf[40] = 0;\n"
+          "    while (uval > 0) { buf[i--] = (char)((uval % 10) + '0'); uval /= 10; }\n"
+          "    if (neg) buf[i--] = '-';\n"
+          "    return &buf[i + 1];\n"
+          "}\n"
+          "#define _z_128_map ,__int128: \"%s\", unsigned __int128: \"%s\"\n"
+          "#define _z_safe_i128(x) _Generic((x), __int128: (x), default: (__int128)0)\n"
+          "#define _z_safe_u128(x) _Generic((x), unsigned __int128: (x), default: (unsigned "
+          "__int128)0)\n"
+          "#define _z_128_arg_map(x) ,__int128: _z_i128_str(_z_safe_i128(x)), unsigned __int128: "
+          "_z_u128_str(_z_safe_u128(x))\n",
+          out);
+    fputs("#else\n", out);
+    fputs("#define _z_128_map\n", out);
+    fputs("#define _z_128_arg_map(x)\n", out);
+    fputs("#endif\n", out);
     fputs("#define _z_str(x) _Generic((x), _Bool: \"%s\", char: \"%c\", "
           "signed char: \"%c\", unsigned char: \"%u\", short: \"%d\", "
           "unsigned short: \"%u\", int: \"%d\", unsigned int: \"%u\", "
           "long: \"%ld\", unsigned long: \"%lu\", long long: \"%lld\", "
           "unsigned long long: \"%llu\", float: \"%f\", double: \"%f\", "
-          "char*: \"%s\", const char*: \"%s\", void*: \"%p\")\n",
+          "char*: \"%s\", const char*: \"%s\", void*: \"%p\" _z_128_map)\n",
           out);
-    fputs("#define _z_arg(x) _Generic((x), _Bool: _z_bool_str(x), default: (x))\n", out);
-    fputs("typedef struct { void *func; void *ctx; } z_closure_T;\n", out);
+    fputs("#define _z_safe_bool(x) _Generic((x), _Bool: (x), default: (_Bool)0)\n"
+          "#define _z_arg(x) _Generic((x), _Bool: _z_bool_str(_z_safe_bool(x)) _z_128_arg_map(x), "
+          "default: (x))\n",
+          out);
+    fputs("typedef struct { void *func; void *ctx; void (*drop)(void*); } z_closure_T;\n", out);
+    fputs("static void *_z_closure_ctx_stash[256];\n", out);
 
     // In true freestanding, explicit definitions of z_malloc/etc are removed.
     // The user must implement them if they use features requiring them.
@@ -42,6 +89,11 @@ static void emit_freestanding_preamble(FILE *out)
 
 void emit_preamble(ParserContext *ctx, FILE *out)
 {
+    if (g_config.misra_mode)
+    {
+        emit_misra_preamble(out);
+        return;
+    }
     if (g_config.is_freestanding)
     {
         emit_freestanding_preamble(out);
@@ -50,11 +102,21 @@ void emit_preamble(ParserContext *ctx, FILE *out)
     else
     {
         // Standard hosted preamble.
-        fputs("#define _GNU_SOURCE\n", out);
+        fputs("#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n", out);
         fputs("#include <stdio.h>\n#include <stdlib.h>\n#include "
               "<stddef.h>\n#include <string.h>\n",
               out);
         fputs("#include <stdarg.h>\n#include <stdint.h>\n#include <stdbool.h>\n", out);
+        fputs("#ifdef __has_builtin\n"
+              "#if __has_builtin(__builtin_pow)\n"
+              "#define _zc_pow __builtin_pow\n"
+              "#endif\n"
+              "#endif\n"
+              "#ifndef _zc_pow\n"
+              "extern double pow(double, double);\n"
+              "#define _zc_pow pow\n"
+              "#endif\n",
+              out);
         fputs("#include <unistd.h>\n#include <fcntl.h>\n", out); // POSIX functions
         fputs("#define ZC_SIMD(T, N) T __attribute__((vector_size(N * sizeof(T))))\n", out);
 
@@ -65,6 +127,7 @@ void emit_preamble(ParserContext *ctx, FILE *out)
             fputs("#define ZC_AUTO auto\n", out);
             fputs("#define ZC_AUTO_INIT(var, init) auto var = (init)\n", out);
             fputs("#define ZC_CAST(T, x) static_cast<T>(x)\n", out);
+            fputs("#define null nullptr\n", out);
             // C++ _z_str via overloads
             fputs("inline const char* _z_bool_str(bool b) { return b ? \"true\" : \"false\"; }\n",
                   out);
@@ -110,7 +173,8 @@ void emit_preamble(ParserContext *ctx, FILE *out)
             fputs("#include <pthread.h>\n", out);
             fputs("typedef struct { pthread_t thread; void *result; } Async;\n", out);
         }
-        fputs("typedef struct { void *func; void *ctx; } z_closure_T;\n", out);
+        fputs("typedef struct { void *func; void *ctx; void (*drop)(void*); } z_closure_T;\n", out);
+        fputs("static void *_z_closure_ctx_stash[256];\n", out);
         fputs("typedef void U0;\ntypedef int8_t I8;\ntypedef uint8_t U8;\ntypedef "
               "int16_t I16;\ntypedef uint16_t U16;\n",
               out);
@@ -131,7 +195,7 @@ void emit_preamble(ParserContext *ctx, FILE *out)
             fputs("#define z_malloc malloc\n#define z_realloc realloc\n", out);
         }
         fputs("#define z_free free\n#define z_print printf\n", out);
-        fputs("void z_panic(const char* msg) { fprintf(stderr, \"Panic: %s\\n\", "
+        fputs("void __zenc_panic(const char* msg) { fprintf(stderr, \"Panic: %s\\n\", "
               "msg); exit(1); }\n",
               out);
         fputs("#if defined(__APPLE__)\n"
@@ -153,8 +217,8 @@ void emit_preamble(ParserContext *ctx, FILE *out)
               "z_free(*pp); *pp "
               "= NULL; } }\n",
               out);
-        fputs("#define assert(cond, ...) if (!(cond)) { fprintf(stderr, "
-              "\"Assertion failed: \" "
+        fputs("#define __zenc_assert(cond, ...) if (!(cond)) { fprintf(stderr, "
+              "\"\\\"Assertion failed: \\\" \" "
               "__VA_ARGS__); exit(1); }\n",
               out);
 
@@ -254,8 +318,31 @@ void emit_type_aliases(ASTNode *node, FILE *out)
             {
                 fprintf(out, "#if %s\n", node->cfg_condition);
             }
-            fprintf(out, "typedef %s %s;\n", node->type_alias.original_type,
-                    node->type_alias.alias);
+            char *c_type_str = type_to_c_string(node->type_info);
+            // Quick fix for raw function pointers and arrays in typedefs:
+            // Since type_to_c_string returns `int (*)(int)`, simple replacement isn't valid
+            // C. But Zen C doesn't officially support raw function pointer aliases. We'll just
+            // print it.
+            if (c_type_str)
+            {
+                if (strstr(c_type_str, "(*)"))
+                {
+                    char *ptr = strstr(c_type_str, "(*)");
+                    int prefix_len = ptr - c_type_str;
+                    fprintf(out, "typedef %.*s (*%s)%s;\n", prefix_len, c_type_str,
+                            node->type_alias.alias, ptr + 3);
+                }
+                else
+                {
+                    fprintf(out, "typedef %s %s;\n", c_type_str, node->type_alias.alias);
+                }
+                free(c_type_str);
+            }
+            else
+            {
+                fprintf(out, "typedef %s %s;\n", node->type_alias.original_type,
+                        node->type_alias.alias);
+            }
             if (node->cfg_condition)
             {
                 fprintf(out, "#endif\n");
@@ -270,18 +357,45 @@ void emit_global_aliases(ParserContext *ctx, FILE *out)
     TypeAlias *ta = ctx->type_aliases;
     while (ta)
     {
-        fprintf(out, "typedef %s %s;\n", ta->original_type, ta->alias);
+        if (ta->type_info)
+        {
+            char *c_type_str = type_to_c_string(ta->type_info);
+            if (c_type_str)
+            {
+                if (strstr(c_type_str, "(*)"))
+                {
+                    char *ptr = strstr(c_type_str, "(*)");
+                    int prefix_len = ptr - c_type_str;
+                    fprintf(out, "typedef %.*s (*%s)%s;\n", prefix_len, c_type_str, ta->alias,
+                            ptr + 3);
+                }
+                else
+                {
+                    fprintf(out, "typedef %s %s;\n", c_type_str, ta->alias);
+                }
+                free(c_type_str);
+            }
+            else
+            {
+                fprintf(out, "typedef %s %s;\n", ta->original_type, ta->alias);
+            }
+        }
+        else
+        {
+            fprintf(out, "typedef %s %s;\n", ta->original_type, ta->alias);
+        }
         ta = ta->next;
     }
 }
 
 // Emit enum constructor prototypes
-void emit_enum_protos(ASTNode *node, FILE *out)
+void emit_enum_protos(ParserContext *ctx, ASTNode *node, FILE *out)
 {
     while (node)
     {
         if (node->type == NODE_ENUM && !node->enm.is_template)
         {
+            const char *final_name = node->link_name ? node->link_name : node->enm.name;
             if (node->cfg_condition)
             {
                 fprintf(out, "#if %s\n", node->cfg_condition);
@@ -291,14 +405,38 @@ void emit_enum_protos(ASTNode *node, FILE *out)
             {
                 if (v->variant.payload)
                 {
-                    char *tstr = codegen_type_to_string(v->variant.payload);
-                    fprintf(out, "%s %s_%s(%s v);\n", node->enm.name, node->enm.name,
-                            v->variant.name, tstr);
-                    free(tstr);
+                    Type *pt = v->variant.payload;
+                    ASTNode *tuple_def = NULL;
+                    if (pt->kind == TYPE_STRUCT && strncmp(pt->name, "Tuple__", 7) == 0)
+                    {
+                        tuple_def = find_struct_def(ctx, pt->name);
+                    }
+
+                    if (tuple_def)
+                    {
+                        fprintf(out, "%s %s__%s(", final_name, final_name, v->variant.name);
+                        ASTNode *f = tuple_def->strct.fields;
+                        int i = 0;
+                        while (f)
+                        {
+                            char *at = f->field.type;
+                            fprintf(out, "%s _%d%s", at, i, (f->next) ? ", " : "");
+                            f = f->next;
+                            i++;
+                        }
+                        fprintf(out, ");\n");
+                    }
+                    else
+                    {
+                        char *tstr = type_to_c_string(v->variant.payload);
+                        fprintf(out, "%s %s__%s(%s v);\n", final_name, final_name, v->variant.name,
+                                tstr);
+                        free(tstr);
+                    }
                 }
                 else
                 {
-                    fprintf(out, "%s %s_%s();\n", node->enm.name, node->enm.name, v->variant.name);
+                    fprintf(out, "%s %s__%s();\n", final_name, final_name, v->variant.name);
                 }
                 v = v->next;
             }
@@ -328,32 +466,97 @@ void emit_lambda_defs(ParserContext *ctx, FILE *out)
             {
                 if (node->lambda.capture_modes && node->lambda.capture_modes[i] == 1)
                 {
-                    fprintf(out, "    %s* %s;\n", node->lambda.captured_types[i],
-                            node->lambda.captured_vars[i]);
+                    char *tstr = NULL;
+                    if (node->lambda.captured_types_info && node->lambda.captured_types_info[i])
+                    {
+                        tstr = type_to_c_string(node->lambda.captured_types_info[i]);
+                    }
+                    else
+                    {
+                        tstr = xstrdup(node->lambda.captured_types[i]);
+                    }
+                    fprintf(out, "    %s* %s;\n", tstr, node->lambda.captured_vars[i]);
+                    free(tstr);
                 }
                 else
                 {
-                    fprintf(out, "    %s %s;\n", node->lambda.captured_types[i],
-                            node->lambda.captured_vars[i]);
+                    char *tstr = NULL;
+                    if (node->lambda.captured_types_info && node->lambda.captured_types_info[i])
+                    {
+                        tstr = type_to_c_string(node->lambda.captured_types_info[i]);
+                    }
+                    else
+                    {
+                        tstr = xstrdup(node->lambda.captured_types[i]);
+                    }
+                    fprintf(out, "    %s %s;\n", tstr, node->lambda.captured_vars[i]);
+                    free(tstr);
+
+                    char *tname = node->lambda.captured_types[i];
+                    const char *clean = tname;
+                    if (strncmp(clean, "struct ", 7) == 0)
+                    {
+                        clean += 7;
+                    }
+
+                    ASTNode *fdef = find_struct_def(ctx, clean);
+                    if (fdef && fdef->type_info && fdef->type_info->traits.has_drop)
+                    {
+                        fprintf(out, "    int __z_drop_flag_%s;\n", node->lambda.captured_vars[i]);
+                    }
                 }
             }
-            fprintf(out, "};\n");
+            fprintf(out, "};\n\n");
+
+            // Generate Drop function for the closure context
+            fprintf(out, "static void _lambda_%d_drop(void* _ctx) {\n", node->lambda.lambda_id);
+            fprintf(out, "    struct Lambda_%d_Ctx* ctx = (struct Lambda_%d_Ctx*)_ctx;\n",
+                    node->lambda.lambda_id, node->lambda.lambda_id);
+
+            for (int i = 0; i < node->lambda.num_captures; i++)
+            {
+                if (node->lambda.capture_modes && node->lambda.capture_modes[i] == 0)
+                {
+                    char *tname = node->lambda.captured_types[i];
+                    const char *clean = tname;
+                    if (strncmp(clean, "struct ", 7) == 0)
+                    {
+                        clean += 7;
+                    }
+
+                    ASTNode *fdef = find_struct_def(ctx, clean);
+                    if (fdef && fdef->type_info && fdef->type_info->traits.has_drop)
+                    {
+                        fprintf(out, "    if (ctx->__z_drop_flag_%s) %s__Drop__glue(&ctx->%s);\n",
+                                node->lambda.captured_vars[i], clean,
+                                node->lambda.captured_vars[i]);
+                    }
+                }
+            }
+
+            fprintf(out, "    free(_ctx);\n");
+            fprintf(out, "}\n\n");
         }
 
         char *ret_type_str = node->lambda.return_type;
         if (node->type_info && node->type_info->inner &&
             node->type_info->inner->kind != TYPE_UNKNOWN)
         {
-            ret_type_str = type_to_string(node->type_info->inner);
+            ret_type_str = type_to_c_string(node->type_info->inner);
         }
 
         if (strcmp(ret_type_str, "unknown") == 0)
         {
-            fprintf(out, "void* _lambda_%d(void* _ctx", node->lambda.lambda_id);
+            fprintf(out, "void* _lambda_%d(", node->lambda.lambda_id);
         }
         else
         {
-            fprintf(out, "%s _lambda_%d(void* _ctx", ret_type_str, node->lambda.lambda_id);
+            fprintf(out, "%s _lambda_%d(", ret_type_str, node->lambda.lambda_id);
+        }
+
+        if (!node->lambda.is_bare)
+        {
+            fprintf(out, "void* _ctx");
         }
 
         if (node->type_info && node->type_info->inner &&
@@ -368,15 +571,21 @@ void emit_lambda_defs(ParserContext *ctx, FILE *out)
             if (node->type_info && node->type_info->args && node->type_info->args[i] &&
                 node->type_info->args[i]->kind != TYPE_UNKNOWN)
             {
-                param_type_str = type_to_string(node->type_info->args[i]);
+                param_type_str = type_to_c_string(node->type_info->args[i]);
             }
+
+            if (!node->lambda.is_bare || i > 0)
+            {
+                fprintf(out, ", ");
+            }
+
             if (strcmp(param_type_str, "unknown") == 0)
             {
-                fprintf(out, ", void* %s", node->lambda.param_names[i]);
+                fprintf(out, "void* %s", node->lambda.param_names[i]);
             }
             else
             {
-                fprintf(out, ", %s %s", param_type_str, node->lambda.param_names[i]);
+                fprintf(out, "%s %s", param_type_str, node->lambda.param_names[i]);
             }
             if (node->type_info && node->type_info->args && node->type_info->args[i] &&
                 node->type_info->args[i]->kind != TYPE_UNKNOWN)
@@ -395,12 +604,47 @@ void emit_lambda_defs(ParserContext *ctx, FILE *out)
         g_current_lambda = node;
         if (node->lambda.body && node->lambda.body->type == NODE_BLOCK)
         {
-            codegen_walker(ctx, node->lambda.body->block.statements, out);
+            if (node->lambda.is_expression && node->type_info && node->type_info->inner &&
+                node->type_info->inner->kind != TYPE_VOID)
+            {
+                ASTNode *stmt = node->lambda.body->block.statements;
+                while (stmt)
+                {
+                    if (stmt->next == NULL)
+                    {
+                        if (stmt->type != NODE_RETURN)
+                        {
+                            fprintf(out, "    return ");
+                        }
+                        codegen_node_single(ctx, stmt, out);
+                    }
+                    else
+                    {
+                        codegen_node_single(ctx, stmt, out);
+                    }
+                    stmt = stmt->next;
+                }
+            }
+            else
+            {
+                codegen_walker(ctx, node->lambda.body->block.statements, out);
+            }
+        }
+        else if (node->lambda.body)
+        {
+            if (node->type_info && node->type_info->inner &&
+                node->type_info->inner->kind != TYPE_VOID && node->lambda.body->type != NODE_RETURN)
+            {
+                fprintf(out, "    return ");
+            }
+            codegen_node_single(ctx, node->lambda.body, out);
+            fprintf(out, ";\n");
         }
         g_current_lambda = NULL;
 
         for (int i = defer_count - 1; i >= 0; i--)
         {
+            emit_source_mapping_duplicate(defer_stack[i], out);
             codegen_node_single(ctx, defer_stack[i], out);
         }
 
@@ -416,6 +660,7 @@ void emit_struct_defs(ParserContext *ctx, ASTNode *node, FILE *out)
 {
     while (node)
     {
+        ASTNode *v;
         if (node->type == NODE_STRUCT && node->strct.is_template)
         {
             node = node->next;
@@ -442,7 +687,7 @@ void emit_struct_defs(ParserContext *ctx, ASTNode *node, FILE *out)
 
             if (node->type_info && node->type_info->kind == TYPE_VECTOR)
             {
-                char *inner_c = codegen_type_to_string(node->type_info->inner);
+                char *inner_c = type_to_c_string(node->type_info->inner);
                 fprintf(out, "typedef ZC_SIMD(%s, %d) %s;\n", inner_c, node->type_info->array_size,
                         node->strct.name);
                 free(inner_c);
@@ -456,12 +701,78 @@ void emit_struct_defs(ParserContext *ctx, ASTNode *node, FILE *out)
 
             if (node->strct.is_union)
             {
-                fprintf(out, "union %s {", node->strct.name);
+                fprintf(out, "union");
             }
             else
             {
-                fprintf(out, "struct %s {", node->strct.name);
+                fprintf(out, "struct");
             }
+
+            int has_any_attr = node->strct.is_packed || node->strct.align ||
+                               node->strct.is_export || node->strct.attributes;
+            if (has_any_attr)
+            {
+                fprintf(out, " __attribute__((");
+                int first_attr = 1;
+                if (node->strct.is_packed)
+                {
+                    fprintf(out, "packed");
+                    first_attr = 0;
+                }
+                if (node->strct.align)
+                {
+                    if (!first_attr)
+                    {
+                        fprintf(out, ", ");
+                    }
+                    fprintf(out, "aligned(%d)", node->strct.align);
+                    first_attr = 0;
+                }
+                if (node->strct.is_export)
+                {
+                    if (!first_attr)
+                    {
+                        fprintf(out, ", ");
+                    }
+                    fprintf(out, "visibility(\"default\")");
+                    first_attr = 0;
+                }
+                if (node->strct.attributes)
+                {
+                    Attribute *custom = node->strct.attributes;
+                    while (custom)
+                    {
+                        if (!first_attr)
+                        {
+                            fprintf(out, ", ");
+                        }
+                        fprintf(out, "%s", custom->name);
+                        if (custom->arg_count > 0)
+                        {
+                            fprintf(out, "(");
+                            for (int i = 0; i < custom->arg_count; i++)
+                            {
+                                if (i > 0)
+                                {
+                                    fprintf(out, ", ");
+                                }
+                                fprintf(out, "%s", custom->args[i]);
+                            }
+                            fprintf(out, ")");
+                        }
+                        first_attr = 0;
+                        custom = custom->next;
+                    }
+                }
+                fprintf(out, "))");
+            }
+
+            if (node->strct.name)
+            {
+                fprintf(out, " %s", node->link_name ? node->link_name : node->strct.name);
+            }
+
+            fprintf(out, " {");
             fprintf(out, "\n");
             if (node->strct.fields)
             {
@@ -474,54 +785,6 @@ void emit_struct_defs(ParserContext *ctx, ASTNode *node, FILE *out)
             }
             fprintf(out, "}");
 
-            if (node->strct.is_packed && node->strct.align)
-            {
-                fprintf(out, " __attribute__((packed, aligned(%d)))", node->strct.align);
-            }
-            else if (node->strct.is_packed)
-            {
-                fprintf(out, " __attribute__((packed))");
-            }
-            if (node->strct.align)
-            {
-                fprintf(out, " __attribute__((aligned(%d)))", node->strct.align);
-            }
-            if (node->strct.is_export)
-            {
-                fprintf(out, " __attribute__((visibility(\"default\")))");
-            }
-
-            if (node->strct.attributes)
-            {
-                fprintf(out, " __attribute__((");
-                Attribute *custom = node->strct.attributes;
-                int first = 1;
-                while (custom)
-                {
-                    if (!first)
-                    {
-                        fprintf(out, ", ");
-                    }
-                    fprintf(out, "%s", custom->name);
-                    if (custom->arg_count > 0)
-                    {
-                        fprintf(out, "(");
-                        for (int i = 0; i < custom->arg_count; i++)
-                        {
-                            if (i > 0)
-                            {
-                                fprintf(out, ", ");
-                            }
-                            fprintf(out, "%s", custom->args[i]);
-                        }
-                        fprintf(out, ")");
-                    }
-                    first = 0;
-                    custom = custom->next;
-                }
-                fprintf(out, "))");
-            }
-
             fprintf(out, ";\n\n");
             if (node->cfg_condition)
             {
@@ -530,25 +793,26 @@ void emit_struct_defs(ParserContext *ctx, ASTNode *node, FILE *out)
         }
         else if (node->type == NODE_ENUM)
         {
+            const char *final_name = node->link_name ? node->link_name : node->enm.name;
             if (node->cfg_condition)
             {
                 fprintf(out, "#if %s\n", node->cfg_condition);
             }
             fprintf(out, "typedef enum { ");
-            ASTNode *v = node->enm.variants;
+            v = node->enm.variants;
             while (v)
             {
-                fprintf(out, "%s_%s_Tag, ", node->enm.name, v->variant.name);
+                fprintf(out, "%s__%s_Tag, ", final_name, v->variant.name);
                 v = v->next;
             }
-            fprintf(out, "} %s_Tag;\n", node->enm.name);
-            fprintf(out, "struct %s { %s_Tag tag; union { ", node->enm.name, node->enm.name);
+            fprintf(out, "} %s_Tag;\n", final_name);
+            fprintf(out, "struct %s { %s_Tag tag; union { ", final_name, final_name);
             v = node->enm.variants;
             while (v)
             {
                 if (v->variant.payload)
                 {
-                    char *tstr = codegen_type_to_string(v->variant.payload);
+                    char *tstr = type_to_c_string(v->variant.payload);
                     fprintf(out, "%s %s; ", tstr, v->variant.name);
                     free(tstr);
                 }
@@ -560,19 +824,87 @@ void emit_struct_defs(ParserContext *ctx, ASTNode *node, FILE *out)
             {
                 if (v->variant.payload)
                 {
-                    char *tstr = codegen_type_to_string(v->variant.payload);
-                    fprintf(out,
-                            "%s %s_%s(%s v) { return (%s){.tag=%s_%s_Tag, "
-                            ".data.%s=v}; }\n",
-                            node->enm.name, node->enm.name, v->variant.name, tstr, node->enm.name,
-                            node->enm.name, v->variant.name, v->variant.name);
+                    Type *pt = v->variant.payload;
+                    char *tstr = type_to_c_string(pt);
+                    ASTNode *tuple_def = NULL;
+                    if (pt->kind == TYPE_STRUCT && strncmp(pt->name, "Tuple__", 7) == 0)
+                    {
+                        tuple_def = find_struct_def(ctx, pt->name);
+                    }
+
+                    if (tuple_def)
+                    {
+                        // Generate multi-argument constructor for tuple variants
+                        fprintf(out, "%s %s__%s(", final_name, final_name, v->variant.name);
+                        ASTNode *f = tuple_def->strct.fields;
+                        int i = 0;
+                        while (f)
+                        {
+                            char *at =
+                                f->field.type; // Fields in generated tuples have C type strings
+                            fprintf(out, "%s _%d%s", at, i, (f->next) ? ", " : "");
+                            f = f->next;
+                            i++;
+                        }
+                        fprintf(out, ") {\n");
+                        if (g_config.use_cpp)
+                        {
+                            fprintf(out, "    %s _res = {}; _res.tag = %s__%s_Tag; ", final_name,
+                                    final_name, v->variant.name);
+                            for (int j = 0; j < i; j++)
+                            {
+                                fprintf(out, "_res.data.%s.v%d = _%d; ", v->variant.name, j, j);
+                            }
+                            fprintf(out, "return _res; }\n");
+                        }
+                        else
+                        {
+                            fprintf(out, "    return (%s){.tag=%s__%s_Tag, .data.%s={", final_name,
+                                    final_name, v->variant.name, v->variant.name);
+                            for (int j = 0; j < i; j++)
+                            {
+                                fprintf(out, ".v%d=_%d%s", j, j, (j == i - 1) ? "" : ", ");
+                            }
+                            fprintf(out, "}}; }\n");
+                        }
+                    }
+                    else
+                    {
+                        // Single payload variant (or non-tuple struct payload)
+                        if (g_config.use_cpp)
+                        {
+                            fprintf(out,
+                                    "%s %s__%s(%s v) { %s _res = {}; _res.tag=%s__%s_Tag; "
+                                    "_res.data.%s=v; return _res; }\n",
+                                    final_name, final_name, v->variant.name, tstr, final_name,
+                                    final_name, v->variant.name, v->variant.name);
+                        }
+                        else
+                        {
+                            fprintf(out,
+                                    "%s %s__%s(%s v) { return (%s){.tag=%s__%s_Tag, "
+                                    ".data.%s=v}; }\n",
+                                    final_name, final_name, v->variant.name, tstr, final_name,
+                                    final_name, v->variant.name, v->variant.name);
+                        }
+                    }
                     free(tstr);
                 }
                 else
                 {
-                    fprintf(out, "%s %s_%s() { return (%s){.tag=%s_%s_Tag}; }\n", node->enm.name,
-                            node->enm.name, v->variant.name, node->enm.name, node->enm.name,
-                            v->variant.name);
+                    if (g_config.use_cpp)
+                    {
+                        fprintf(out,
+                                "%s %s__%s() { %s _res = {}; _res.tag=%s__%s_Tag; return _res; }\n",
+                                final_name, final_name, v->variant.name, final_name, final_name,
+                                v->variant.name);
+                    }
+                    else
+                    {
+                        fprintf(out, "%s %s__%s() { return (%s){.tag=%s__%s_Tag}; }\n", final_name,
+                                final_name, v->variant.name, final_name, final_name,
+                                v->variant.name);
+                    }
                 }
                 v = v->next;
             }
@@ -592,14 +924,14 @@ static char *substitute_proto_self(const char *type_str, const char *replacement
     {
         return NULL;
     }
-    if (strcmp(type_str, "Self") == 0)
+    if (strcasecmp(type_str, "Self") == 0)
     {
         return xstrdup(replacement);
     }
     // Handle pointers (Self* -> replacement*)
-    if (strncmp(type_str, "Self", 4) == 0)
+    if (strncasecmp(type_str, "Self", 4) == 0)
     {
-        char *rest = (char *)type_str + 4;
+        const char *rest = type_str + 4;
         char *buf = xmalloc(strlen(replacement) + strlen(rest) + 1);
         sprintf(buf, "%s%s", replacement, rest);
         return buf;
@@ -628,7 +960,8 @@ void emit_trait_defs(ASTNode *node, FILE *out)
             while (m)
             {
                 char *ret_safe = substitute_proto_self(m->func.ret_type, "void*");
-                fprintf(out, "    %s (*%s)(", ret_safe, parse_original_method_name(m->func.name));
+                const char *orig = parse_original_method_name(m->func.name);
+                fprintf(out, "    %s (*%s)(", ret_safe, orig);
                 free(ret_safe);
 
                 int has_self = (m->func.args && strstr(m->func.args, "self"));
@@ -637,14 +970,24 @@ void emit_trait_defs(ASTNode *node, FILE *out)
                     fprintf(out, "void* self");
                 }
 
-                if (m->func.args)
+                if (m->func.args && strlen(m->func.args) > 0)
                 {
-                    if (!has_self)
-                    {
-                        fprintf(out, ", ");
-                    }
                     char *args_safe = replace_type_str(m->func.args, "Self", "void*", NULL, NULL);
-                    fprintf(out, "%s", args_safe);
+                    // Filter out "void* self" or "const void* self" if it's already there to avoid
+                    // duplication
+                    if (strstr(args_safe, "void* self") == args_safe ||
+                        strstr(args_safe, "const void* self") == args_safe)
+                    {
+                        fprintf(out, "%s", args_safe);
+                    }
+                    else if (strlen(args_safe) > 0)
+                    {
+                        if (!has_self)
+                        {
+                            fprintf(out, ", ");
+                        }
+                        fprintf(out, "%s", args_safe);
+                    }
                     free(args_safe);
                 }
                 fprintf(out, ");\n");
@@ -654,68 +997,86 @@ void emit_trait_defs(ASTNode *node, FILE *out)
             fprintf(out, "typedef struct %s { void *self; %s_VTable *vtable; } %s;\n",
                     node->trait.name, node->trait.name, node->trait.name);
 
-            m = node->trait.methods;
+            if (node->cfg_condition)
+            {
+                fprintf(out, "#endif\n");
+            }
+            fprintf(out, "\n");
+        }
+        node = node->next;
+    }
+}
+
+// Emit trait wrapper functions.
+void emit_trait_wrappers(ASTNode *node, FILE *out)
+{
+    while (node)
+    {
+        if (node->type == NODE_TRAIT)
+        {
+            if (node->trait.generic_param_count > 0)
+            {
+                node = node->next;
+                continue;
+            }
+            ASTNode *m = node->trait.methods;
             while (m)
             {
-                const char *orig = parse_original_method_name(m->func.name);
                 char *ret_sub = substitute_proto_self(m->func.ret_type, node->trait.name);
+                const char *orig = parse_original_method_name(m->func.name);
+                int is_const_self = (m->func.arg_count > 0 && m->func.arg_types &&
+                                     m->func.arg_types[0] && m->func.arg_types[0]->is_const);
+                fprintf(out, "%s %s__%s(%s%s* self", ret_sub, node->trait.name, orig,
+                        is_const_self ? "const " : "", node->trait.name);
 
-                fprintf(out, "%s %s__%s(%s* self", ret_sub, node->trait.name, orig,
-                        node->trait.name);
-
-                int has_self = (m->func.args && strstr(m->func.args, "self"));
-                if (m->func.args)
+                if (m->func.args && strlen(m->func.args) > 0)
                 {
-                    if (has_self)
+                    char *sa = replace_type_str(m->func.args, "Self", node->trait.name, NULL, NULL);
+                    if (strstr(sa, "void* self") == sa || strstr(sa, "const void* self") == sa)
                     {
-                        char *comma = strchr(m->func.args, ',');
+                        char *comma = strchr(sa, ',');
                         if (comma)
                         {
-                            // Substitute Self -> TraitName in wrapper args
-                            char *args_sub =
-                                replace_type_str(comma + 1, "Self", node->trait.name, NULL, NULL);
-                            fprintf(out, ", %s", args_sub);
-                            free(args_sub);
+                            fprintf(out, ", %s", comma + 1);
                         }
                     }
-                    else
+                    else if (strlen(sa) > 0)
                     {
-                        char *args_sub =
-                            replace_type_str(m->func.args, "Self", node->trait.name, NULL, NULL);
-                        fprintf(out, ", %s", args_sub);
-                        free(args_sub);
+                        fprintf(out, ", %s", sa);
                     }
+                    free(sa);
                 }
                 fprintf(out, ") {\n");
 
-                int ret_is_self = (strcmp(m->func.ret_type, "Self") == 0);
-
+                int ret_is_self = (strcasecmp(m->func.ret_type, "Self") == 0);
                 if (ret_is_self)
                 {
-                    // Special handling: return (Trait){.self = call(), .vtable = self->vtable}
-                    fprintf(out, "    void* ret = self->vtable->%s(self->self", orig);
+                    fprintf(out, "    void* res = self->vtable->%s(self->self", orig);
                 }
                 else
                 {
                     fprintf(out, "    return self->vtable->%s(self->self", orig);
                 }
 
-                if (m->func.args)
+                if (m->func.args && strlen(m->func.args) > 0)
                 {
                     char *call_args = extract_call_args(m->func.args);
-                    if (has_self)
+                    if (call_args && strlen(call_args) > 0)
                     {
-                        char *comma = strchr(call_args, ',');
-                        if (comma)
+                        if (strcmp(call_args, "self") != 0)
                         {
-                            fprintf(out, ", %s", comma + 1);
-                        }
-                    }
-                    else
-                    {
-                        if (strlen(call_args) > 0)
-                        {
-                            fprintf(out, ", %s", call_args);
+                            if (strstr(call_args, "self") == call_args)
+                            {
+                                char *comma = strchr(call_args, ',');
+                                if (comma)
+                                {
+                                    fprintf(out, ", %s", comma + 1);
+                                }
+                            }
+                            else
+                            {
+                                fprintf(out, ", %s", call_args);
+                            }
                         }
                     }
                     free(call_args);
@@ -724,13 +1085,11 @@ void emit_trait_defs(ASTNode *node, FILE *out)
 
                 if (ret_is_self)
                 {
-                    fprintf(out, "    return (%s){.self = ret, .vtable = self->vtable};\n",
+                    fprintf(out, "    return (%s){.self = res, .vtable = self->vtable};\n",
                             node->trait.name);
                 }
-
                 fprintf(out, "}\n\n");
                 free(ret_sub);
-
                 m = m->next;
             }
             if (node->cfg_condition)
@@ -746,6 +1105,8 @@ void emit_trait_defs(ASTNode *node, FILE *out)
 // Emit global variables
 void emit_globals(ParserContext *ctx, ASTNode *node, FILE *out)
 {
+    g_current_func_ret_type = NULL;
+    g_current_lambda = NULL;
     while (node)
     {
         if (node->type == NODE_VAR_DECL || node->type == NODE_CONST)
@@ -803,22 +1164,52 @@ void emit_protos(ParserContext *ctx, ASTNode *node, FILE *out)
     {
         if (f->type == NODE_FUNCTION)
         {
+            if (g_config.use_cpp && f->func.name && !f->func.body)
+            {
+                if (strncmp(f->func.name, "_z_", 3) == 0 || strncmp(f->func.name, "_time_", 6) == 0)
+                {
+                    f = f->next;
+                    continue;
+                }
+                static const char *skip_cstdlib[] = {
+                    "strstr",  "strchr",   "strrchr", "strpbrk", "memchr",  "atoi",   "atol",
+                    "atof",    "strtol",   "strtoul", "strtod",  "malloc",  "calloc", "realloc",
+                    "free",    "memcpy",   "memmove", "memset",  "memcmp",  "strlen", "strcmp",
+                    "strncmp", "strcpy",   "strncpy", "strcat",  "strncat", "printf", "fprintf",
+                    "sprintf", "snprintf", "fopen",   "fclose",  "fread",   "fwrite", "fseek",
+                    "ftell",   "exit",     "abort",   "abs",     NULL};
+                int skip_fn = 0;
+                for (int si = 0; skip_cstdlib[si]; si++)
+                {
+                    if (strcmp(f->func.name, skip_cstdlib[si]) == 0)
+                    {
+                        skip_fn = 1;
+                        break;
+                    }
+                }
+                if (skip_fn)
+                {
+                    f = f->next;
+                    continue;
+                }
+            }
+
             if (f->cfg_condition)
             {
                 fprintf(out, "#if %s\n", f->cfg_condition);
             }
             if (f->func.is_async)
             {
-                fprintf(out, "Async %s(%s);\n", f->func.name, f->func.args);
+                const char *final_name = (f->link_name) ? f->link_name : f->func.name;
+                fprintf(out, "Async %s(%s);\n", final_name, f->func.args);
                 // Also emit _impl_ prototype
                 if (f->func.ret_type)
                 {
-                    fprintf(out, "%s _impl_%s(%s);\n", f->func.ret_type, f->func.name,
-                            f->func.args);
+                    fprintf(out, "%s _impl_%s(%s);\n", f->func.ret_type, final_name, f->func.args);
                 }
                 else
                 {
-                    fprintf(out, "void _impl_%s(%s);\n", f->func.name, f->func.args);
+                    fprintf(out, "void _impl_%s(%s);\n", final_name, f->func.args);
                 }
             }
             else
@@ -840,8 +1231,19 @@ void emit_protos(ParserContext *ctx, ASTNode *node, FILE *out)
                 continue;
             }
 
+            // Resolve opaque alias (e.g. StringView -> Slice__char)
+            TypeAlias *ta = find_type_alias_node(g_parser_ctx, sname);
+            const char *resolved = (ta && !ta->is_opaque) ? ta->original_type : NULL;
+            const char *effective_name = resolved ? resolved : sname;
+
             char *mangled = replace_string_type(sname);
-            ASTNode *def = find_struct_def_codegen(g_parser_ctx, mangled);
+            ASTNode *def = find_struct_def(g_parser_ctx, mangled);
+            if (!def && resolved)
+            {
+                free(mangled);
+                mangled = replace_string_type(resolved);
+                def = find_struct_def(g_parser_ctx, mangled);
+            }
             int skip = 0;
             if (def)
             {
@@ -859,7 +1261,7 @@ void emit_protos(ParserContext *ctx, ASTNode *node, FILE *out)
                 char *buf = strip_template_suffix(sname);
                 if (buf)
                 {
-                    def = find_struct_def_codegen(g_parser_ctx, buf);
+                    def = find_struct_def(g_parser_ctx, buf);
                     if (def && def->strct.is_template)
                     {
                         skip = 1;
@@ -890,27 +1292,34 @@ void emit_protos(ParserContext *ctx, ASTNode *node, FILE *out)
                     m = m->next;
                     continue;
                 }
+                if (m->cfg_condition)
+                {
+                    fprintf(out, "#if %s\n", m->cfg_condition);
+                }
                 char *fname = m->func.name;
-                char *proto = xmalloc(strlen(fname) + strlen(sname) + 2);
+
+                // Build proto: if fname starts with sname__, replace with effective_name__
+                char *proto = NULL;
                 int slen = strlen(sname);
                 if (strncmp(fname, sname, slen) == 0 && fname[slen] == '_' &&
                     fname[slen + 1] == '_')
                 {
-                    strcpy(proto, fname);
+                    // Replace alias prefix with resolved name
+                    const char *method_part = fname + slen; // "__method"
+                    proto = xmalloc(strlen(effective_name) + strlen(method_part) + 1);
+                    sprintf(proto, "%s%s", effective_name, method_part);
                 }
                 else
                 {
-                    sprintf(proto, "%s__%s", sname, fname);
+                    proto = xmalloc(strlen(effective_name) + strlen(fname) + 3);
+                    sprintf(proto, "%s__%s", effective_name, fname);
                 }
 
-                if (m->func.is_async)
+                emit_func_signature(ctx, out, m, proto);
+                fprintf(out, ";\n");
+                if (m->cfg_condition)
                 {
-                    fprintf(out, "Async %s(%s);\n", proto, m->func.args);
-                }
-                else
-                {
-                    emit_func_signature(ctx, out, m, proto);
-                    fprintf(out, ";\n");
+                    fprintf(out, "#endif\n");
                 }
 
                 free(proto);
@@ -931,7 +1340,7 @@ void emit_protos(ParserContext *ctx, ASTNode *node, FILE *out)
             }
 
             char *mangled = replace_string_type(sname);
-            ASTNode *def = find_struct_def_codegen(g_parser_ctx, mangled);
+            ASTNode *def = find_struct_def(g_parser_ctx, mangled);
             int skip = 0;
             if (def)
             {
@@ -945,7 +1354,7 @@ void emit_protos(ParserContext *ctx, ASTNode *node, FILE *out)
                 char *buf = strip_template_suffix(sname);
                 if (buf)
                 {
-                    def = find_struct_def_codegen(g_parser_ctx, buf);
+                    def = find_struct_def(g_parser_ctx, buf);
                     if (def && def->strct.is_template)
                     {
                         skip = 1;
@@ -976,13 +1385,15 @@ void emit_protos(ParserContext *ctx, ASTNode *node, FILE *out)
                     m = m->next;
                     continue;
                 }
-                if (m->func.is_async)
+                if (m->cfg_condition)
                 {
-                    fprintf(out, "Async %s(%s);\n", m->func.name, m->func.args);
+                    fprintf(out, "#if %s\n", m->cfg_condition);
                 }
-                else
+                emit_func_signature(ctx, out, m, NULL);
+                fprintf(out, ";\n");
+                if (m->cfg_condition)
                 {
-                    fprintf(out, "%s %s(%s);\n", m->func.ret_type, m->func.name, m->func.args);
+                    fprintf(out, "#endif\n");
                 }
                 m = m->next;
             }
@@ -999,7 +1410,7 @@ void emit_impl_vtables(ParserContext *ctx, FILE *out)
     {
         char *trait;
         char *strct;
-    } emitted[1024];
+    } emitted[MAX_ERROR_MSG_LEN];
     int count = 0;
 
     while (ref)
@@ -1035,7 +1446,7 @@ void emit_impl_vtables(ParserContext *ctx, FILE *out)
 
             // Filter templates
             char *mangled = replace_string_type(strct);
-            ASTNode *def = find_struct_def_codegen(ctx, mangled);
+            ASTNode *def = find_struct_def(ctx, mangled);
             int skip = 0;
             if (def)
             {
@@ -1053,7 +1464,7 @@ void emit_impl_vtables(ParserContext *ctx, FILE *out)
                 char *buf = strip_template_suffix(strct);
                 if (buf)
                 {
-                    def = find_struct_def_codegen(ctx, buf);
+                    def = find_struct_def(ctx, buf);
                     if (def && def->strct.is_template)
                     {
                         skip = 1;
@@ -1091,34 +1502,38 @@ void emit_impl_vtables(ParserContext *ctx, FILE *out)
             emitted[count].strct = strct;
             count++;
 
-            if (0 == strcmp(trait, "Copy"))
+            if (0 == strcmp(trait, "Copy") || 0 == strcmp(trait, "Eq") ||
+                0 == strcmp(trait, "Drop") || 0 == strcmp(trait, "Clone") ||
+                0 == strcmp(trait, "Iterable"))
             {
-                // Marker trait, no runtime vtable needed
+                // Marker trait or statically-dispatched trait, no runtime vtable needed
                 ref = ref->next;
                 continue;
             }
 
-            fprintf(out, "%s_VTable %s_%s_VTable = {", trait, strct, trait);
+            fprintf(out, "%s_VTable %s__%s__VTable = {", trait, strct, trait);
 
             ASTNode *m = node->impl_trait.methods;
             while (m)
             {
-                // Calculate expected prefix: Struct__Trait_
-                char prefix[256];
-                sprintf(prefix, "%s__%s_", strct, trait);
-                const char *orig = m->func.name;
-                if (strncmp(orig, prefix, strlen(prefix)) == 0)
+                // Calculate expected prefix: Struct__Trait__
+                size_t pre_sz = strlen(strct) + strlen(trait) + 6;
+                char *prefix = xmalloc(pre_sz);
+                snprintf(prefix, pre_sz, "%s__%s__", strct, trait);
+
+                const char *orig_name = m->func.name;
+                if (strncmp(orig_name, prefix, strlen(prefix)) == 0)
                 {
-                    orig += strlen(prefix);
+                    orig_name += strlen(prefix);
                 }
                 else
                 {
-                    // Fallback if mangling schema differs (shouldn't happen)
-                    orig = parse_original_method_name(m->func.name);
+                    orig_name = parse_original_method_name(m->func.name);
                 }
 
-                fprintf(out, ".%s = (__typeof__(((%s_VTable*)0)->%s))%s__%s_%s", orig, trait, orig,
-                        strct, trait, orig);
+                fprintf(out, ".%s = (__typeof__(((%s_VTable*)0)->%s))%s", orig_name, trait,
+                        orig_name, m->func.name);
+                free(prefix);
                 if (m->next)
                 {
                     fprintf(out, ", ");
@@ -1140,16 +1555,25 @@ int emit_tests_and_runner(ParserContext *ctx, ASTNode *node, FILE *out)
     {
         if (cur->type == NODE_TEST)
         {
+            if (cur->cfg_condition)
+            {
+                fprintf(out, "#if %s\n", cur->cfg_condition);
+            }
             fprintf(out, "static void _z_test_%d() {\n", test_count);
             int saved = defer_count;
             codegen_walker(ctx, cur->test_stmt.body, out);
             // Run defers
             for (int i = defer_count - 1; i >= saved; i--)
             {
+                emit_source_mapping_duplicate(defer_stack[i], out);
                 codegen_node_single(ctx, defer_stack[i], out);
             }
             defer_count = saved;
             fprintf(out, "}\n");
+            if (cur->cfg_condition)
+            {
+                fprintf(out, "#endif\n");
+            }
             test_count++;
         }
         cur = cur->next;
@@ -1157,19 +1581,87 @@ int emit_tests_and_runner(ParserContext *ctx, ASTNode *node, FILE *out)
     if (test_count > 0)
     {
         fprintf(out, "\nvoid _z_run_tests() {\n");
-        for (int i = 0; i < test_count; i++)
+        cur = node;
+        int i = 0;
+        while (cur)
         {
-            fprintf(out, "    _z_test_%d();\n", i);
+            if (cur->type == NODE_TEST)
+            {
+                if (cur->cfg_condition)
+                {
+                    fprintf(out, "#if %s\n", cur->cfg_condition);
+                }
+                fprintf(out, "    _z_test_%d();\n", i);
+                if (cur->cfg_condition)
+                {
+                    fprintf(out, "#endif\n");
+                }
+                i++;
+            }
+            cur = cur->next;
         }
         fprintf(out, "}\n\n");
     }
     return test_count;
 }
 
+// Helper to emit typedefs for mangled pointer types (e.g., StringPtr for String*)
+// used as generic parameters. This resolves "unknown type name StringPtr" errors.
+static void emit_mangled_pointer_typedefs(ParserContext *ctx, FILE *out)
+{
+    char *emitted[2048];
+    int count = 0;
+
+    Instantiation *inst = ctx->instantiations;
+    while (inst)
+    {
+        if (inst->concrete_arg && inst->unmangled_arg && strstr(inst->concrete_arg, "Ptr") &&
+            strchr(inst->unmangled_arg, '*'))
+        {
+            // Check if already emitted
+            int found = 0;
+            for (int i = 0; i < count; i++)
+            {
+                if (strcmp(emitted[i], inst->concrete_arg) == 0)
+                {
+                    found = 1;
+                    break;
+                }
+            }
+
+            if (!found && count < 2048)
+            {
+                // In C, structs are usually typedef'd, so "typedef String* StringPtr;" is valid.
+                fprintf(out, "typedef %s %s;\n", inst->unmangled_arg, inst->concrete_arg);
+                emitted[count++] = inst->concrete_arg;
+            }
+        }
+        inst = inst->next;
+    }
+
+    // Also scan instantiated functions which might have unique pointer arguments
+    ASTNode *ifn = ctx->instantiated_funcs;
+    while (ifn)
+    {
+        if (ifn->type == NODE_FUNCTION && ifn->func.name && strstr(ifn->func.name, "__"))
+        {
+            char *mangled_part = strstr(ifn->func.name, "__") + 2;
+            if (strstr(mangled_part, "Ptr"))
+            {
+                // This is more complex because we need the original type.
+                // For now, struct instantiations cover 99% of cases via collections.
+            }
+        }
+        ifn = ifn->next;
+    }
+}
+
 // Emit type definitions-
 void print_type_defs(ParserContext *ctx, FILE *out, ASTNode *nodes)
 {
-    if (!g_config.is_freestanding)
+    emit_mangled_pointer_typedefs(ctx, out);
+
+    if (!g_config.is_freestanding && !g_config.misra_mode)
     {
         fprintf(out, "typedef char* string;\n");
 
@@ -1204,16 +1696,42 @@ void print_type_defs(ParserContext *ctx, FILE *out, ASTNode *nodes)
                          "va_start(args, count); for(int i=0; i<count; i++) { v.data[v.len++] = "
                          "va_arg(args, void*); } va_end(args); return v; }\n");
         }
-        fprintf(out, "#define Vec_push(v, i) _z_vec_push(&(v), (void*)(long)(i))\n");
+        fprintf(out, "#define Vec_push(v, i) _z_vec_push(&(v), (void*)(uintptr_t)(i))\n");
         fprintf(out, "static inline long _z_check_bounds(long index, long limit) { if(index < 0 || "
                      "index >= limit) { fprintf(stderr, \"Index out of bounds: %%ld (limit "
                      "%%ld)\\n\", index, limit); exit(1); } return index; }\n");
     }
     else
     {
-        fprintf(out, "static inline long _z_check_bounds(long index, long limit) { if (index < 0 "
-                     "|| index >= limit) { __builtin_trap(); } return index; }\n");
+        fprintf(out, "static inline long _z_check_bounds(long index, long limit) { if((index < 0) "
+                     "|| (index >= limit)) { __builtin_trap(); } return index; }\n");
     }
+
+    ASTNode *local = nodes;
+    while (local)
+    {
+        if (local->type == NODE_STRUCT && !local->strct.is_template)
+        {
+            if (local->type_info && local->type_info->kind == TYPE_VECTOR)
+            {
+                // For vectors, we emit a custom typedef in emit_struct_defs.
+                // Standard 'typedef struct Name Name' would conflict.
+            }
+            else if (local->strct.name)
+            {
+                const char *final_name = local->link_name ? local->link_name : local->strct.name;
+                const char *keyword = local->strct.is_union ? "union" : "struct";
+                fprintf(out, "typedef %s %s %s;\n", keyword, final_name, final_name);
+            }
+        }
+        if (local->type == NODE_ENUM && !local->enm.is_template && local->enm.name)
+        {
+            const char *final_name = local->link_name ? local->link_name : local->enm.name;
+            fprintf(out, "typedef struct %s %s;\n", final_name, final_name);
+        }
+        local = local->next;
+    }
+    fprintf(out, "\n");
 
     SliceType *rev = NULL;
     SliceType *c = ctx->used_slices;
@@ -1230,7 +1748,7 @@ void print_type_defs(ParserContext *ctx, FILE *out, ASTNode *nodes)
     while (c)
     {
         fprintf(out,
-                "typedef struct Slice_%s Slice_%s;\nstruct Slice_%s { %s *data; "
+                "typedef struct Slice__%s Slice__%s;\nstruct Slice__%s { %s *data; "
                 "int len; int cap; };\n",
                 c->name, c->name, c->name, c->name);
         c = c->next;
@@ -1239,13 +1757,15 @@ void print_type_defs(ParserContext *ctx, FILE *out, ASTNode *nodes)
     TupleType *t = ctx->used_tuples;
     while (t)
     {
-        fprintf(out, "typedef struct Tuple_%s Tuple_%s;\nstruct Tuple_%s { ", t->sig, t->sig,
-                t->sig);
+        char *clean_sig = sanitize_mangled_name(t->sig);
+        fprintf(out, "typedef struct Tuple__%s Tuple__%s;\nstruct Tuple__%s { ", clean_sig,
+                clean_sig, clean_sig);
+        free(clean_sig);
         char *s = xstrdup(t->sig);
         char *current = s;
         char *next_sep = strstr(current, "__");
         int i = 0;
-        while (current)
+        while (1)
         {
             if (next_sep)
             {
@@ -1266,28 +1786,60 @@ void print_type_defs(ParserContext *ctx, FILE *out, ASTNode *nodes)
     }
     fprintf(out, "\n");
 
-    // FIRST: Emit typedefs for ALL structs and enums in the current compilation
-    // unit (local definitions)
-    ASTNode *local = nodes;
-    while (local)
+    // End of type definitions
+}
+
+static int last_source_mapping_line = -1;
+static NodeType last_source_mapping_type = NODE_ROOT;
+static int allow_duplicate_source_mapping = 0;
+
+int should_emit_source_mapping(ASTNode *node)
+{
+    return node && node->type < NODE_REPL_PRINT && node->type != NODE_BLOCK &&
+           node->type != NODE_EXPR_UNARY && node->type != NODE_FIELD;
+}
+
+void emit_source_mapping_duplicate(ASTNode *node, FILE *out)
+{
+    allow_duplicate_source_mapping++;
+    emit_source_mapping(node, out);
+    allow_duplicate_source_mapping--;
+}
+
+void emit_source_mapping(ASTNode *node, FILE *out)
+{
+    if (!g_config.mode_debug)
     {
-        if (local->type == NODE_STRUCT && !local->strct.is_template)
+        return;
+    }
+
+    if (!should_emit_source_mapping(node))
+    {
+        return;
+    }
+
+    if (allow_duplicate_source_mapping <= 0)
+    {
+        if (node->token.line == last_source_mapping_line && node->type == last_source_mapping_type)
         {
-            if (local->type_info && local->type_info->kind == TYPE_VECTOR)
-            {
-                // For vectors, we emit a custom typedef in emit_struct_defs.
-                // Standard 'typedef struct Name Name' would conflict.
-            }
-            else
-            {
-                const char *keyword = local->strct.is_union ? "union" : "struct";
-                fprintf(out, "typedef %s %s %s;\n", keyword, local->strct.name, local->strct.name);
-            }
+            return;
         }
-        if (local->type == NODE_ENUM && !local->enm.is_template)
-        {
-            fprintf(out, "typedef struct %s %s;\n", local->enm.name, local->enm.name);
-        }
-        local = local->next;
+    }
+
+    if (!node->token.start || !node->token.file)
+    {
+        zwarn_at(node->token,
+                 "Encountered source mapping issue for node type %i, please report this issue.",
+                 node->type);
+        return;
+    }
+
+    last_source_mapping_line = node->token.line;
+    last_source_mapping_type = node->type;
+
+    if (!g_config.misra_mode)
+    {
+        char *safe_file = sanitize_path_for_c_string(node->token.file);
+        fprintf(out, "\n#line %i \"%s\"\n", node->token.line, safe_file);
     }
 }

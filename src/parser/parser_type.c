@@ -1,10 +1,12 @@
-
 #include "../ast/ast.h"
+#include "../constants.h"
 #include "analysis/const_fold.h"
 #include "parser.h"
+#include "../ast/primitives.h"
 
 Type *parse_type_base(ParserContext *ctx, Lexer *l)
 {
+    RECURSION_GUARD(ctx, l, type_new(TYPE_UNKNOWN));
     Token t = lexer_peek(l);
 
     if (t.type == TOK_IDENT)
@@ -46,10 +48,13 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
                 wrapper->alias.is_opaque_alias = 1;
                 wrapper->alias.alias_defined_in_file =
                     alias_node->defined_in_file ? xstrdup(alias_node->defined_in_file) : NULL;
+                RECURSION_EXIT(ctx);
                 return wrapper;
             }
 
-            return parse_type_formal(ctx, &tmp);
+            Type *t_res = parse_type_formal(ctx, &tmp);
+            RECURSION_EXIT(ctx);
+            return t_res;
         }
 
         // Self type alias: Replace "Self" with current impl struct type
@@ -84,19 +89,23 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
                     // To prevent name mangling, we might consider changing
                     // this to also use the prefix.
                     merged = xstrdup(resolved_suffix);
+
+                    register_extern_symbol(ctx, merged);
                 }
                 else
                 {
                     // Zen module: Use module base name as prefix
                     merged = xmalloc(strlen(mod->base_name) + strlen(resolved_suffix) + 2);
-                    sprintf(merged, "%s_%s", mod->base_name, resolved_suffix);
+                    snprintf(merged, strlen(mod->base_name) + strlen(resolved_suffix) + 2, "%s__%s",
+                             mod->base_name, resolved_suffix);
                 }
             }
             else
             {
                 // Regular namespace or enum variant
                 merged = xmalloc(strlen(name) + strlen(resolved_suffix) + 2);
-                sprintf(merged, "%s_%s", name, resolved_suffix);
+                snprintf(merged, strlen(name) + strlen(resolved_suffix) + 2, "%s__%s", name,
+                         resolved_suffix);
             }
 
             free(name);
@@ -105,115 +114,14 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
         }
 
         // Check for Primitives (Base types)
-        if (strcmp(name, "U0") == 0)
+        // Check for Primitives (Base types)
+        const ZenPrimitive *prim = find_primitive_by_name(name);
+        if (prim)
         {
             free(name);
-            return type_new(TYPE_VOID);
-        }
-        if (strcmp(name, "u0") == 0)
-        {
-            free(name);
-            return type_new(TYPE_VOID);
-        }
-        if (strcmp(name, "I8") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I8);
-        }
-        if (strcmp(name, "U8") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U8);
-        }
-        if (strcmp(name, "I16") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I16);
-        }
-        if (strcmp(name, "U16") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U16);
-        }
-        if (strcmp(name, "I32") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I32);
-        }
-        if (strcmp(name, "U32") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U32);
-        }
-        if (strcmp(name, "I64") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I64);
-        }
-        if (strcmp(name, "U64") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U64);
-        }
-        if (strcmp(name, "F32") == 0)
-        {
-            free(name);
-            return type_new(TYPE_F32);
-        }
-        if (strcmp(name, "f32") == 0)
-        {
-            free(name);
-            return type_new(TYPE_F32);
-        }
-        if (strcmp(name, "F64") == 0)
-        {
-            free(name);
-            return type_new(TYPE_F64);
-        }
-        if (strcmp(name, "f64") == 0)
-        {
-            free(name);
-            return type_new(TYPE_F64);
-        }
-        if (strcmp(name, "usize") == 0)
-        {
-            free(name);
-            return type_new(TYPE_USIZE);
-        }
-        if (strcmp(name, "isize") == 0)
-        {
-            free(name);
-            return type_new(TYPE_ISIZE);
-        }
-        if (strcmp(name, "byte") == 0)
-        {
-            free(name);
-            return type_new(TYPE_BYTE);
-        }
-        if (strcmp(name, "I128") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I128);
-        }
-        if (strcmp(name, "U128") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U128);
-        }
-        if (strcmp(name, "i8") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I8);
-        }
-        if (strcmp(name, "u8") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U8);
-        }
-        if (strcmp(name, "i16") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I16);
+            Type *t_prim = type_new(prim->kind);
+            RECURSION_EXIT(ctx);
+            return t_prim;
         }
 
         // C23 BitInt Support (i42, u256, etc.)
@@ -240,26 +148,31 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
                         if (width == 8)
                         {
                             free(name);
+                            RECURSION_EXIT(ctx);
                             return type_new(TYPE_I8);
                         }
                         if (width == 16)
                         {
                             free(name);
+                            RECURSION_EXIT(ctx);
                             return type_new(TYPE_I16);
                         }
                         if (width == 32)
                         {
                             free(name);
+                            RECURSION_EXIT(ctx);
                             return type_new(TYPE_I32);
                         }
                         if (width == 64)
                         {
                             free(name);
+                            RECURSION_EXIT(ctx);
                             return type_new(TYPE_I64);
                         }
                         if (width == 128)
                         {
                             free(name);
+                            RECURSION_EXIT(ctx);
                             return type_new(TYPE_I128);
                         }
                     }
@@ -268,247 +181,42 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
                         if (width == 8)
                         {
                             free(name);
+                            RECURSION_EXIT(ctx);
                             return type_new(TYPE_U8);
                         }
                         if (width == 16)
                         {
                             free(name);
+                            RECURSION_EXIT(ctx);
                             return type_new(TYPE_U16);
                         }
                         if (width == 32)
                         {
                             free(name);
+                            RECURSION_EXIT(ctx);
                             return type_new(TYPE_U32);
                         }
                         if (width == 64)
                         {
                             free(name);
+                            RECURSION_EXIT(ctx);
                             return type_new(TYPE_U64);
                         }
                         if (width == 128)
                         {
                             free(name);
+                            RECURSION_EXIT(ctx);
                             return type_new(TYPE_U128);
                         }
                     }
 
-                    Type *t = type_new(name[0] == 'u' ? TYPE_UBITINT : TYPE_BITINT);
-                    t->array_size = width;
+                    Type *inner_t = type_new(name[0] == 'u' ? TYPE_UBITINT : TYPE_BITINT);
+                    inner_t->array_size = width;
                     free(name);
-                    return t;
+                    RECURSION_EXIT(ctx);
+                    return inner_t;
                 }
             }
-        }
-        if (strcmp(name, "u16") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U16);
-        }
-        if (strcmp(name, "i32") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I32);
-        }
-        if (strcmp(name, "u32") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U32);
-        }
-        if (strcmp(name, "i64") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I64);
-        }
-        if (strcmp(name, "u64") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U64);
-        }
-        if (strcmp(name, "i128") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I128);
-        }
-        if (strcmp(name, "u128") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U128);
-        }
-        if (strcmp(name, "rune") == 0)
-        {
-            free(name);
-            return type_new(TYPE_RUNE);
-        }
-        if (strcmp(name, "uint") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U32); // Strict uint32_t
-        }
-
-        if (strcmp(name, "int") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I32); // Strict int32_t
-        }
-        if (strcmp(name, "float") == 0)
-        {
-            free(name);
-            return type_new(TYPE_F32);
-        }
-        if (strcmp(name, "double") == 0)
-        {
-            free(name);
-            return type_new(TYPE_F64);
-        }
-        if (strcmp(name, "void") == 0)
-        {
-            free(name);
-            return type_new(TYPE_VOID);
-        }
-        if (strcmp(name, "string") == 0)
-        {
-            free(name);
-            return type_new(TYPE_STRING);
-        }
-        if (strcmp(name, "bool") == 0)
-        {
-            free(name);
-            return type_new(TYPE_BOOL);
-        }
-        if (strcmp(name, "char") == 0)
-        {
-            free(name);
-            return type_new(TYPE_CHAR);
-        }
-        if (strcmp(name, "long") == 0)
-        {
-            zwarn_at(t, "'long' is treated as portable 'int64_t' in Zen C. Use 'c_long' for "
-                        "platform-dependent C long.");
-            free(name);
-            return type_new(TYPE_I64);
-        }
-        if (strcmp(name, "short") == 0)
-        {
-            zwarn_at(t, "'short' is treated as portable 'int16_t' in Zen C. Use 'c_short' for "
-                        "platform-dependent C short.");
-            free(name);
-            return type_new(TYPE_I16);
-        }
-        if (strcmp(name, "unsigned") == 0)
-        {
-            zwarn_at(t, "'unsigned' is treated as portable 'uint32_t' in Zen C. Use 'c_uint' for "
-                        "platform-dependent C unsigned int.");
-            free(name);
-            return type_new(TYPE_U32);
-        }
-        if (strcmp(name, "signed") == 0)
-        {
-            zwarn_at(t, "'signed' is treated as portable 'int32_t' in Zen C. Use 'c_int' for "
-                        "platform-dependent C int.");
-            free(name);
-            return type_new(TYPE_I32);
-        }
-        if (strcmp(name, "int8_t") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I8);
-        }
-        if (strcmp(name, "uint8_t") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U8);
-        }
-        if (strcmp(name, "int16_t") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I16);
-        }
-        if (strcmp(name, "uint16_t") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U16);
-        }
-        if (strcmp(name, "int32_t") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I32);
-        }
-        if (strcmp(name, "uint32_t") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U32);
-        }
-        if (strcmp(name, "int64_t") == 0)
-        {
-            free(name);
-            return type_new(TYPE_I64);
-        }
-        if (strcmp(name, "uint64_t") == 0)
-        {
-            free(name);
-            return type_new(TYPE_U64);
-        }
-        if (strcmp(name, "size_t") == 0)
-        {
-            free(name);
-            return type_new(TYPE_USIZE);
-        }
-        if (strcmp(name, "ssize_t") == 0)
-        {
-            free(name);
-            return type_new(TYPE_ISIZE);
-        }
-
-        // Portable C Types
-        if (strcmp(name, "c_int") == 0)
-        {
-            free(name);
-            return type_new(TYPE_C_INT);
-        }
-        if (strcmp(name, "c_uint") == 0)
-        {
-            free(name);
-            return type_new(TYPE_C_UINT);
-        }
-        if (strcmp(name, "c_long") == 0)
-        {
-            free(name);
-            return type_new(TYPE_C_LONG);
-        }
-        if (strcmp(name, "c_ulong") == 0)
-        {
-            free(name);
-            return type_new(TYPE_C_ULONG);
-        }
-        if (strcmp(name, "c_long_long") == 0)
-        {
-            free(name);
-            return type_new(TYPE_C_LONG_LONG);
-        }
-        if (strcmp(name, "c_ulong_long") == 0)
-        {
-            free(name);
-            return type_new(TYPE_C_ULONG_LONG);
-        }
-        if (strcmp(name, "c_short") == 0)
-        {
-            free(name);
-            return type_new(TYPE_C_SHORT);
-        }
-        if (strcmp(name, "c_ushort") == 0)
-        {
-            free(name);
-            return type_new(TYPE_C_USHORT);
-        }
-        if (strcmp(name, "c_char") == 0)
-        {
-            free(name);
-            return type_new(TYPE_C_CHAR);
-        }
-        if (strcmp(name, "c_uchar") == 0)
-        {
-            free(name);
-            return type_new(TYPE_C_UCHAR);
         }
 
         // Relaxed Type Check: If explicit 'struct Name', trust the user.
@@ -517,6 +225,8 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
             Type *ty = type_new(TYPE_STRUCT);
             ty->name = name;
             ty->is_explicit_struct = 1;
+            RECURSION_EXIT(ctx);
+            return ty;
         }
 
         // Selective imports ONLY apply when we're NOT in a module context
@@ -529,18 +239,22 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
                 // Resolve to the actual struct name which was prefixed during module
                 // parsing
                 free(name);
-                name = xmalloc(strlen(si->source_module) + strlen(si->symbol) + 2);
-                sprintf(name, "%s_%s", si->source_module, si->symbol);
+                name = xmalloc(strlen(si->source_module) + strlen(si->symbol) + 3);
+                snprintf(name, strlen(si->source_module) + strlen(si->symbol) + 3, "%s__%s",
+                         si->source_module, si->symbol);
             }
         }
 
         // If we're IN a module and no selective import matched, apply module prefix
-        if (ctx->current_module_prefix && !is_known_generic(ctx, name))
+        if (ctx->current_module_prefix && !is_known_generic(ctx, name) &&
+            !is_primitive_type_name(name) && strcasecmp(name, "Self") != 0 &&
+            !is_extern_symbol(ctx, name))
         {
             // Auto-prefix struct name if in module context (unless it's a known
             // primitive/generic)
-            char *prefixed_name = xmalloc(strlen(ctx->current_module_prefix) + strlen(name) + 2);
-            sprintf(prefixed_name, "%s_%s", ctx->current_module_prefix, name);
+            char *prefixed_name = xmalloc(strlen(ctx->current_module_prefix) + strlen(name) + 3);
+            snprintf(prefixed_name, strlen(ctx->current_module_prefix) + strlen(name) + 3, "%s__%s",
+                     ctx->current_module_prefix, name);
             free(name);
             name = prefixed_name;
         }
@@ -602,13 +316,10 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
                 int is_generic_dep = 0;
                 for (int i = 0; i < arg_count; ++i)
                 {
-                    for (int k = 0; k < ctx->known_generics_count; ++k)
+                    if (is_generic_dependent_str(ctx, args[i]))
                     {
-                        if (strcmp(args[i], ctx->known_generics[k]) == 0)
-                        {
-                            is_generic_dep = 1;
-                            break;
-                        }
+                        is_generic_dep = 1;
+                        break;
                     }
                 }
 
@@ -617,13 +328,20 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
                     instantiate_generic_multi(ctx, name, args, arg_count, t);
                 }
 
-                // Build mangled name
-                char mangled[256];
+                // Build mangled name dynamically
+                size_t mangled_len = strlen(name) + 1;
+                for (int i = 0; i < arg_count; i++)
+                {
+                    char *clean = sanitize_mangled_name(args[i]);
+                    mangled_len += 2 + strlen(clean);
+                    free(clean);
+                }
+                char *mangled = xmalloc(mangled_len);
                 strcpy(mangled, name);
                 for (int i = 0; i < arg_count; i++)
                 {
                     char *clean = sanitize_mangled_name(args[i]);
-                    strcat(mangled, "_");
+                    strcat(mangled, "__");
                     strcat(mangled, clean);
                     free(clean);
                     free(args[i]);
@@ -631,7 +349,7 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
                 free(args);
 
                 free(ty->name);
-                ty->name = xstrdup(mangled);
+                ty->name = mangled;
             }
             else
             {
@@ -654,15 +372,7 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
 
                 char *unmangled_arg = type_to_string(first_arg);
 
-                int is_single_dep = 0;
-                for (int k = 0; k < ctx->known_generics_count; ++k)
-                {
-                    if (strcmp(first_arg_str, ctx->known_generics[k]) == 0)
-                    {
-                        is_single_dep = 1;
-                        break;
-                    }
-                }
+                int is_single_dep = is_generic_dependent_str(ctx, first_arg_str);
 
                 if (!is_single_dep)
                 {
@@ -671,12 +381,13 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
                 free(unmangled_arg);
 
                 char *clean_arg = sanitize_mangled_name(first_arg_str);
-                char mangled[256];
-                sprintf(mangled, "%s_%s", name, clean_arg);
+                size_t mangled_sz = strlen(name) + strlen(clean_arg) + 3;
+                char *mangled = xmalloc(mangled_sz);
+                snprintf(mangled, mangled_sz, "%s__%s", name, clean_arg);
                 free(clean_arg);
 
                 free(ty->name);
-                ty->name = xstrdup(mangled);
+                ty->name = mangled;
             }
 
             free(first_arg_str);
@@ -684,6 +395,7 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
             ty->args = NULL;
             ty->arg_count = 0;
         }
+        RECURSION_EXIT(ctx);
         return ty;
     }
 
@@ -716,6 +428,7 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
             Type *arr = type_new(TYPE_ARRAY);
             arr->inner = inner;
             arr->array_size = size;
+            RECURSION_EXIT(ctx);
             return arr;
         }
 
@@ -734,13 +447,14 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
         Type *arr = type_new(TYPE_ARRAY);
         arr->inner = inner;
         arr->array_size = 0; // 0 means slice, not fixed-size
+        RECURSION_EXIT(ctx);
         return arr;
     }
 
     if (t.type == TOK_LPAREN)
     {
         lexer_next(l); // eat (
-        char sig[256];
+        char sig[MAX_SHORT_MSG_LEN];
         sig[0] = 0;
 
         while (1)
@@ -767,11 +481,14 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
 
         register_tuple(ctx, sig);
 
-        char *tuple_name = xmalloc(strlen(sig) + 7);
-        sprintf(tuple_name, "Tuple_%s", sig);
+        char *clean_sig = sanitize_mangled_name(sig);
+        char *tuple_name = xmalloc(strlen(clean_sig) + 8);
+        snprintf(tuple_name, strlen(clean_sig) + 8, "Tuple__%s", clean_sig);
+        free(clean_sig);
 
         Type *ty = type_new(TYPE_STRUCT);
         ty->name = tuple_name;
+        RECURSION_EXIT(ctx);
         return ty;
     }
 
@@ -785,14 +502,17 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l)
         Type *ty = type_new(TYPE_STRUCT);
         ty->name = fallback;
         ty->is_explicit_struct = 0;
+        RECURSION_EXIT(ctx);
         return ty;
     }
 
+    RECURSION_EXIT(ctx);
     return type_new(TYPE_UNKNOWN);
 }
 
 Type *parse_type_formal(ParserContext *ctx, Lexer *l)
 {
+    RECURSION_GUARD(ctx, l, type_new(TYPE_UNKNOWN));
     int is_restrict = 0;
     int is_const = 0;
 
@@ -810,6 +530,12 @@ Type *parse_type_formal(ParserContext *ctx, Lexer *l)
         }
     }
 
+    if (lexer_peek(l).type == TOK_OP && lexer_peek(l).start[0] == '*')
+    {
+        zpanic_at(lexer_peek(l), "Zen C uses postfix pointers (e.g. 'Type*'). Prefix pointer "
+                                 "syntax ('*Type') is not supported.");
+    }
+
     Type *t = NULL;
 
     // Example: fn(int, int) -> int
@@ -819,14 +545,31 @@ Type *parse_type_formal(ParserContext *ctx, Lexer *l)
         lexer_next(l); // eat 'fn'
 
         int star_count = 0;
-        while (lexer_peek(l).type == TOK_OP && strncmp(lexer_peek(l).start, "*", 1) == 0)
+        while (lexer_peek(l).type == TOK_OP && lexer_peek(l).start[0] == '*')
         {
+            Token st = lexer_peek(l);
+            int valid = 1;
+            for (int i = 0; i < st.len; i++)
+            {
+                if (st.start[i] != '*')
+                {
+                    valid = 0;
+                }
+            }
+            if (!valid)
+            {
+                break;
+            }
             lexer_next(l);
-            star_count++;
+            star_count += st.len;
         }
 
         Type *fn_type = type_new(TYPE_FUNCTION);
         fn_type->is_raw = (star_count > 0);
+        if (fn_type->is_raw)
+        {
+            fn_type->traits.has_drop = 0;
+        }
         fn_type->is_varargs = 0;
 
         Type *wrapped = fn_type;
@@ -843,6 +586,13 @@ Type *parse_type_formal(ParserContext *ctx, Lexer *l)
 
         while (lexer_peek(l).type != TOK_RPAREN)
         {
+            if (lexer_peek(l).type == TOK_ELLIPSIS)
+            {
+                lexer_next(l);
+                fn_type->is_varargs = 1;
+                break;
+            }
+
             Type *arg = parse_type_formal(ctx, l);
             fn_type->arg_count++;
             fn_type->args = xrealloc(fn_type->args, sizeof(Type *) * fn_type->arg_count);
@@ -879,10 +629,27 @@ Type *parse_type_formal(ParserContext *ctx, Lexer *l)
     }
 
     // Handles: T*, T**, etc.
-    while (lexer_peek(l).type == TOK_OP && *lexer_peek(l).start == '*')
+    while (lexer_peek(l).type == TOK_OP && lexer_peek(l).start[0] == '*')
     {
-        lexer_next(l); // consume '*'
-        t = type_new_ptr(t);
+        Token st = lexer_peek(l);
+        int valid = 1;
+        for (int i = 0; i < st.len; i++)
+        {
+            if (st.start[i] != '*')
+            {
+                valid = 0;
+            }
+        }
+        if (!valid)
+        {
+            break;
+        }
+
+        lexer_next(l); // consume '*' or '**'
+        for (int i = 0; i < st.len; i++)
+        {
+            t = type_new_ptr(t);
+        }
     }
 
     int *dims = NULL;
@@ -920,7 +687,15 @@ Type *parse_type_formal(ParserContext *ctx, Lexer *l)
         }
         else
         {
-            zpanic_at(size_expr->token, "Array size must be a known compile-time constant integer");
+            if (g_config.misra_mode)
+            {
+                zpanic_at(size_expr->token, "MISRA Rule 18.8");
+            }
+            else
+            {
+                zpanic_at(size_expr->token,
+                          "Array size must be a known compile-time constant integer");
+            }
         }
 
         if (lexer_next(l).type != TOK_RBRACKET)
@@ -952,6 +727,8 @@ Type *parse_type_formal(ParserContext *ctx, Lexer *l)
     {
         t->is_const = 1;
     }
+
+    RECURSION_EXIT(ctx);
     return t;
 }
 
@@ -1024,17 +801,26 @@ char *parse_array_literal(ParserContext *ctx, Lexer *l, const char *st)
     }
 
     char rt[64];
-    if (strncmp(st, "Slice_", 6) == 0)
+    if (st && strncmp(st, "Slice__", 7) == 0)
     {
-        strcpy(rt, st + 6);
+        strcpy(rt, st + 7);
     }
     else
     {
         strcpy(rt, "int");
     }
 
-    char *o = xmalloc(strlen(c) + 128);
-    sprintf(o, "(%s){.data=(%s[]){%s},.len=%d,.cap=%d}", st, rt, c, n, n);
+    size_t st_len = st ? strlen(st) : 0;
+    size_t o_sz = strlen(c) + st_len + strlen(rt) + 128;
+    char *o = xmalloc(o_sz);
+    if (st)
+    {
+        snprintf(o, o_sz, "(%s){.data=(%s[]){%s},.len=%d,.cap=%d}", st, rt, c, n, n);
+    }
+    else
+    {
+        snprintf(o, o_sz, "(Slice__int){.data=(int[]){%s},.len=%d,.cap=%d}", c, n, n);
+    }
     free(c);
     return o;
 }
@@ -1097,8 +883,9 @@ char *parse_tuple_literal(ParserContext *ctx, Lexer *l, const char *tn)
         strncat(c, s, len);
     }
 
-    char *o = xmalloc(strlen(c) + 128);
-    sprintf(o, "(%s){%s}", tn, c);
+    size_t o_sz = strlen(c) + strlen(tn) + 128;
+    char *o = xmalloc(o_sz);
+    snprintf(o, o_sz, "(%s){%s}", tn, c);
     free(c);
     return o;
 }
@@ -1106,13 +893,16 @@ ASTNode *parse_embed(ParserContext *ctx, Lexer *l)
 {
     lexer_next(l);
     Token t = lexer_next(l);
-    if (t.type != TOK_STRING)
+    if (t.type != TOK_STRING && t.type != TOK_RAW_STRING)
+
     {
         zpanic_at(t, "String required");
     }
-    char fn[256];
-    strncpy(fn, t.start + 1, t.len - 2);
-    fn[t.len - 2] = 0;
+    char *content = token_get_string_content(t);
+    char fn[MAX_PATH_LEN];
+    strncpy(fn, content, MAX_PATH_LEN - 1);
+    fn[MAX_PATH_LEN - 1] = 0;
+    free(content);
 
     // Check for optional "as Type"
     Type *target_type = NULL;
@@ -1127,6 +917,7 @@ ASTNode *parse_embed(ParserContext *ctx, Lexer *l)
     if (!f)
     {
         zpanic_at(t, "404: %s", fn);
+        return NULL; // In fault-tolerant mode (LSP), zpanic_at returns instead of exiting.
     }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
@@ -1141,14 +932,14 @@ ASTNode *parse_embed(ParserContext *ctx, Lexer *l)
     // Default Type if none
     if (!target_type)
     {
-        // Default: Slice_char
+        // Default: Slice__char
         register_slice(ctx, "char");
 
         Type *slice_type = type_new(TYPE_STRUCT);
-        slice_type->name = xstrdup("Slice_char");
+        slice_type->name = xstrdup("Slice__char");
         target_type = slice_type;
 
-        sprintf(o, "(Slice_char){.data=(char[]){");
+        snprintf(o, oc, "(Slice__char){.data=(char[]){");
     }
     else
     {
@@ -1162,18 +953,18 @@ ASTNode *parse_embed(ParserContext *ctx, Lexer *l)
             {
                 Type *ptr_type = type_new_ptr(target_type->inner); // Reuse inner
                 target_type = ptr_type;
-                sprintf(o, "(%s[]){", inner_ts);
+                snprintf(o, oc, "(%s[]){", inner_ts);
             }
             else
             {
-                // Slice -> Slice_T struct
+                // Slice -> Slice__T struct
                 register_slice(ctx, inner_ts);
-                char slice_name[256];
-                sprintf(slice_name, "Slice_%s", inner_ts);
+                char slice_name[MAX_TYPE_NAME_LEN];
+                snprintf(slice_name, sizeof(slice_name), "Slice__%s", inner_ts);
                 Type *slice_t = type_new(TYPE_STRUCT);
                 slice_t->name = xstrdup(slice_name);
                 target_type = slice_t;
-                sprintf(o, "(%s){.data=(%s[]){", slice_name, inner_ts);
+                snprintf(o, oc, "(%s){.data=(%s[]){", slice_name, inner_ts);
             }
             free(inner_ts);
         }
@@ -1181,17 +972,18 @@ ASTNode *parse_embed(ParserContext *ctx, Lexer *l)
         {
             if (strcmp(ts, "string") == 0 || strcmp(ts, "char*") == 0)
             {
-                sprintf(o, "(char*)\"");
+                snprintf(o, oc, "(char*)\"");
             }
             else
             {
-                sprintf(o, "(%s){", ts);
+                snprintf(o, oc, "(%s){", ts);
             }
         }
         free(ts);
     }
 
-    char *p = o + strlen(o);
+    size_t cur_len = strlen(o);
+    char *p = o + cur_len;
 
     // Check if string mode
     int is_string = (target_type && (strcmp(type_to_string(target_type), "string") == 0 ||
@@ -1199,38 +991,50 @@ ASTNode *parse_embed(ParserContext *ctx, Lexer *l)
 
     for (int i = 0; i < len; i++)
     {
+        if (cur_len + 16 >= oc)
+        {
+            break;
+        }
         if (is_string)
         {
             // Hex escape for string
-            p += sprintf(p, "\\x%02X", b[i]);
+            int w = snprintf(p, oc - cur_len, "\\x%02X", b[i]);
+            p += w;
+            cur_len += w;
         }
         else
         {
-            p += sprintf(p, "0x%02X,", b[i]);
+            int w = snprintf(p, oc - cur_len, "0x%02X,", b[i]);
+            p += w;
+            cur_len += w;
         }
     }
 
-    if (is_string)
+    if (cur_len + 16 < oc)
     {
-        sprintf(p, "\"");
-    }
-    else
-    {
-        int is_slice = (strncmp(o, "(Slice_", 7) == 0);
-
-        if (is_slice)
+        if (is_string)
         {
-            sprintf(p, "},.len=%ld,.cap=%ld}", len, len);
+            snprintf(p, oc - cur_len, "\"");
         }
         else
         {
-            sprintf(p, "}");
+            int is_slice = (strncmp(o, "(Slice__", 8) == 0);
+
+            if (is_slice)
+            {
+                snprintf(p, oc - cur_len, "},.len=%ld,.cap=%ld}", (long)len, (long)len);
+            }
+            else
+            {
+                snprintf(p, oc - cur_len, "}");
+            }
         }
     }
 
     free(b);
 
     ASTNode *n = ast_create(NODE_RAW_STMT);
+    n->token = t;
     n->raw_stmt.content = o;
     n->type_info = target_type;
     return n;

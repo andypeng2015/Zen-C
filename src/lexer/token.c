@@ -1,6 +1,8 @@
 
 #include "zprep.h"
 
+extern char *g_current_filename;
+
 void lexer_init(Lexer *l, const char *src)
 {
     l->src = src;
@@ -46,7 +48,7 @@ Token lexer_next(Lexer *l)
     // Check for EOF.
     if (!*s)
     {
-        return (Token){TOK_EOF, s, 0, start_line, start_col};
+        return (Token){TOK_EOF, s, 0, start_line, start_col, g_current_filename};
     }
 
     // C preprocessor directives.
@@ -60,6 +62,11 @@ Token lexer_next(Lexer *l)
                 len += 2;
                 l->line++;
             }
+            else if (s[len] == '\\' && s[len + 1] == '\r' && s[len + 2] == '\n')
+            {
+                len += 3;
+                l->line++;
+            }
             else
             {
                 len++;
@@ -67,7 +74,7 @@ Token lexer_next(Lexer *l)
         }
         l->pos += len;
 
-        return (Token){TOK_PREPROC, s, len, start_line, start_col};
+        return (Token){TOK_PREPROC, s, len, start_line, start_col, g_current_filename};
     }
 
     // Comments.
@@ -76,6 +83,15 @@ Token lexer_next(Lexer *l)
         int len = 2;
         while (s[len] && s[len] != '\n')
         {
+            if (g_config.misra_mode)
+            {
+                if ((s[len] == '/' && s[len + 1] == '/') || (s[len] == '/' && s[len + 1] == '*'))
+                {
+                    zerror_at(
+                        (Token){TOK_COMMENT, s, len + 2, start_line, start_col, g_current_filename},
+                        "MISRA Rule 3.1: '//' or '/*' within a comment");
+                }
+            }
             len++;
         }
 
@@ -83,7 +99,7 @@ Token lexer_next(Lexer *l)
         {
             l->pos += len;
             l->col += len;
-            return (Token){TOK_COMMENT, s, len, start_line, start_col};
+            return (Token){TOK_COMMENT, s, len, start_line, start_col, g_current_filename};
         }
 
         l->pos += len;
@@ -101,6 +117,17 @@ Token lexer_next(Lexer *l)
 
         while (s[0])
         {
+            if (g_config.misra_mode)
+            {
+                // Check for nested /* or //
+                if ((s[0] == '/' && s[1] == '*') || (s[0] == '/' && s[1] == '/'))
+                {
+                    zerror_at((Token){TOK_COMMENT, comment_start, (size_t)(s - comment_start) + 2,
+                                      start_line, start_col, g_current_filename},
+                              "MISRA Rule 3.1: '/*' or '//' within a comment");
+                }
+            }
+
             // s[len+1] can be at most the null terminator
             if (s[0] == '*' && s[1] == '/')
             {
@@ -127,7 +154,8 @@ Token lexer_next(Lexer *l)
         if (l->emit_comments)
         {
             size_t len = s - comment_start;
-            return (Token){TOK_COMMENT, comment_start, len, start_line, start_col};
+            return (Token){TOK_COMMENT, comment_start, len,
+                           start_line,  start_col,     g_current_filename};
         }
 
         return lexer_next(l);
@@ -147,79 +175,87 @@ Token lexer_next(Lexer *l)
 
         if (len == 4 && strncmp(s, "test", 4) == 0)
         {
-            return (Token){TOK_TEST, s, 4, start_line, start_col};
+            return (Token){TOK_TEST, s, 4, start_line, start_col, g_current_filename};
         }
         if (len == 6 && strncmp(s, "assert", 6) == 0)
         {
-            return (Token){TOK_ASSERT, s, 6, start_line, start_col};
+            return (Token){TOK_ASSERT, s, 6, start_line, start_col, g_current_filename};
         }
         if (len == 6 && strncmp(s, "sizeof", 6) == 0)
         {
-            return (Token){TOK_SIZEOF, s, 6, start_line, start_col};
+            return (Token){TOK_SIZEOF, s, 6, start_line, start_col, g_current_filename};
         }
         if (len == 5 && strncmp(s, "defer", 5) == 0)
         {
-            return (Token){TOK_DEFER, s, 5, start_line, start_col};
+            return (Token){TOK_DEFER, s, 5, start_line, start_col, g_current_filename};
         }
         if (len == 3 && strncmp(s, "def", 3) == 0)
         {
-            return (Token){TOK_DEF, s, 3, start_line, start_col};
+            return (Token){TOK_DEF, s, 3, start_line, start_col, g_current_filename};
         }
         if (len == 5 && strncmp(s, "trait", 5) == 0)
         {
-            return (Token){TOK_TRAIT, s, 5, start_line, start_col};
+            return (Token){TOK_TRAIT, s, 5, start_line, start_col, g_current_filename};
         }
         if (len == 4 && strncmp(s, "impl", 4) == 0)
         {
-            return (Token){TOK_IMPL, s, 4, start_line, start_col};
+            return (Token){TOK_IMPL, s, 4, start_line, start_col, g_current_filename};
         }
         if (len == 8 && strncmp(s, "autofree", 8) == 0)
         {
-            return (Token){TOK_AUTOFREE, s, 8, start_line, start_col};
+            return (Token){TOK_AUTOFREE, s, 8, start_line, start_col, g_current_filename};
         }
         if (len == 5 && strncmp(s, "alias", 5) == 0)
         {
-            return (Token){TOK_ALIAS, s, 5, start_line, start_col};
+            return (Token){TOK_ALIAS, s, 5, start_line, start_col, g_current_filename};
         }
         if (len == 3 && strncmp(s, "use", 3) == 0)
         {
-            return (Token){TOK_USE, s, 3, start_line, start_col};
+            return (Token){TOK_USE, s, 3, start_line, start_col, g_current_filename};
         }
         if (len == 8 && strncmp(s, "comptime", 8) == 0)
         {
-            return (Token){TOK_COMPTIME, s, 8, start_line, start_col};
+            return (Token){TOK_COMPTIME, s, 8, start_line, start_col, g_current_filename};
         }
         if (len == 5 && strncmp(s, "union", 5) == 0)
         {
-            return (Token){TOK_UNION, s, 5, start_line, start_col};
+            return (Token){TOK_UNION, s, 5, start_line, start_col, g_current_filename};
         }
         if (len == 3 && strncmp(s, "asm", 3) == 0)
         {
-            return (Token){TOK_ASM, s, 3, start_line, start_col};
+            return (Token){TOK_ASM, s, 3, start_line, start_col, g_current_filename};
         }
         if (len == 8 && strncmp(s, "volatile", 8) == 0)
         {
-            return (Token){TOK_VOLATILE, s, 8, start_line, start_col};
+            return (Token){TOK_VOLATILE, s, 8, start_line, start_col, g_current_filename};
         }
         if (len == 5 && strncmp(s, "async", 5) == 0)
         {
-            return (Token){TOK_ASYNC, s, 5, start_line, start_col};
+            return (Token){TOK_ASYNC, s, 5, start_line, start_col, g_current_filename};
         }
         if (len == 5 && strncmp(s, "await", 5) == 0)
         {
-            return (Token){TOK_AWAIT, s, 5, start_line, start_col};
+            return (Token){TOK_AWAIT, s, 5, start_line, start_col, g_current_filename};
         }
         if (len == 3 && strncmp(s, "and", 3) == 0)
         {
-            return (Token){TOK_AND, s, 3, start_line, start_col};
+            return (Token){TOK_AND, s, 3, start_line, start_col, g_current_filename};
         }
         if (len == 2 && strncmp(s, "or", 2) == 0)
         {
-            return (Token){TOK_OR, s, 2, start_line, start_col};
+            return (Token){TOK_OR, s, 2, start_line, start_col, g_current_filename};
+        }
+        if (len == 3 && strncmp(s, "not", 3) == 0)
+        {
+            return (Token){TOK_NOT, s, 3, start_line, start_col, g_current_filename};
         }
         if (len == 6 && strncmp(s, "opaque", 6) == 0)
         {
-            return (Token){TOK_OPAQUE, s, 6, start_line, start_col};
+            return (Token){TOK_OPAQUE, s, 6, start_line, start_col, g_current_filename};
+        }
+        if (len == 2 && strncmp(s, "do", 2) == 0)
+        {
+            return (Token){TOK_DO, s, 2, start_line, start_col, g_current_filename};
         }
 
         // F-Strings
@@ -238,39 +274,76 @@ Token lexer_next(Lexer *l)
         }
         else
         {
-            return (Token){TOK_IDENT, s, len, start_line, start_col};
+            return (Token){TOK_IDENT, s, len, start_line, start_col, g_current_filename};
         }
     }
 
     if (s[0] == 'f' && s[1] == '"')
     {
-        int len = 2;
-        while (s[len] && s[len] != '"')
+        int is_multi = (s[2] == '"' && s[3] == '"');
+        int len = is_multi ? 4 : 2;
+        while (s[len])
         {
-            if (s[len] == '\\')
+            if (is_multi && s[len] == '"' && s[len + 1] == '"' && s[len + 2] == '"')
+            {
+                break;
+            }
+            else if (!is_multi && s[len] == '"')
+            {
+                break;
+            }
+
+            if (s[len] == '\\' && !is_multi)
             {
                 len++;
             }
             len++;
         }
-        if (s[len] == '"')
+        if (is_multi && s[len] == '"' && s[len + 1] == '"' && s[len + 2] == '"')
+        {
+            len += 3;
+        }
+        else if (!is_multi && s[len] == '"')
         {
             len++;
         }
+
+        for (int i = 0; i < len; i++)
+        {
+            if (s[i] == '\n')
+            {
+                l->line++;
+                l->col = 1;
+            }
+            else
+            {
+                l->col++;
+            }
+        }
         l->pos += len;
-        l->col += len;
-        return (Token){TOK_FSTRING, s, len, start_line, start_col};
+        return (Token){TOK_FSTRING, s, len, start_line, start_col, g_current_filename};
     }
 
-    // Raw Strings (r"..." or r'...')
+    // Raw Strings (r"..." or r'...' or r"""...""")
     if (s[0] == 'r' && (s[1] == '"' || s[1] == '\''))
     {
         char quote = s[1];
-        int len = 2;
+        int is_multi = (quote == '"' && s[2] == '"' && s[3] == '"');
+        int len = is_multi ? 4 : 2;
+
         // In raw strings, only escape the quote itself
-        while (s[len] && s[len] != quote)
+        while (s[len])
         {
-            if (s[len] == '\\' && s[len + 1] == quote)
+            if (is_multi && s[len] == '"' && s[len + 1] == '"' && s[len + 2] == '"')
+            {
+                break;
+            }
+            else if (!is_multi && s[len] == quote)
+            {
+                break;
+            }
+
+            if (s[len] == '\\' && s[len + 1] == quote && !is_multi)
             {
                 len += 2; // Skip escaped quote
             }
@@ -279,13 +352,29 @@ Token lexer_next(Lexer *l)
                 len++;
             }
         }
-        if (s[len] == quote)
+        if (is_multi && s[len] == '"' && s[len + 1] == '"' && s[len + 2] == '"')
+        {
+            len += 3;
+        }
+        else if (!is_multi && s[len] == quote)
         {
             len++;
         }
+
+        for (int i = 0; i < len; i++)
+        {
+            if (s[i] == '\n')
+            {
+                l->line++;
+                l->col = 1;
+            }
+            else
+            {
+                l->col++;
+            }
+        }
         l->pos += len;
-        l->col += len;
-        return (Token){TOK_RAW_STRING, s, len, start_line, start_col};
+        return (Token){TOK_RAW_STRING, s, len, start_line, start_col, g_current_filename};
     }
 
     // Numbers
@@ -300,7 +389,7 @@ Token lexer_next(Lexer *l)
         {
             is_hex = 1;
             len = 2;
-            while (isxdigit(s[len]))
+            while (isxdigit(s[len]) || s[len] == '_')
             {
                 len++;
             }
@@ -309,7 +398,7 @@ Token lexer_next(Lexer *l)
         {
             is_bin = 1;
             len = 2;
-            while (s[len] == '0' || s[len] == '1')
+            while (s[len] == '0' || s[len] == '1' || s[len] == '_')
             {
                 len++;
             }
@@ -318,14 +407,20 @@ Token lexer_next(Lexer *l)
         {
             is_oct = 1;
             len = 2;
-            while (s[len] >= '0' && s[len] <= '7')
+            while ((s[len] >= '0' && s[len] <= '7') || s[len] == '_')
             {
                 len++;
             }
         }
         else
         {
-            while (isdigit(s[len]))
+            if (s[0] == '0' && isdigit(s[1]) && g_config.misra_mode)
+            {
+                // Rule 7.1: Octal constants shall not be used (and leading zeros are disallowed).
+                zerror_at((Token){TOK_INT, s, 2, start_line, start_col, g_current_filename},
+                          "MISRA Rule 7.1");
+            }
+            while (isdigit(s[len]) || s[len] == '_')
             {
                 len++;
             }
@@ -334,13 +429,13 @@ Token lexer_next(Lexer *l)
         if (!is_hex && !is_bin && !is_oct)
         {
             int is_float = 0;
-            if (s[len] == '.')
+            if (s[len] == '.' && isdigit(s[len + 1]))
             {
                 if (s[len + 1] != '.')
                 {
                     is_float = 1;
                     len++;
-                    while (isdigit(s[len]))
+                    while (isdigit(s[len]) || s[len] == '_')
                     {
                         len++;
                     }
@@ -355,7 +450,7 @@ Token lexer_next(Lexer *l)
                 {
                     len++;
                 }
-                while (isdigit(s[len]))
+                while (isdigit(s[len]) || s[len] == '_')
                 {
                     len++;
                 }
@@ -372,7 +467,7 @@ Token lexer_next(Lexer *l)
                 }
                 l->pos += len;
                 l->col += len;
-                return (Token){TOK_FLOAT, s, len, start_line, start_col};
+                return (Token){TOK_FLOAT, s, len, start_line, start_col, g_current_filename};
             }
         }
 
@@ -386,42 +481,103 @@ Token lexer_next(Lexer *l)
 
         l->pos += len;
         l->col += len;
-        return (Token){TOK_INT, s, len, start_line, start_col};
+        return (Token){TOK_INT, s, len, start_line, start_col, g_current_filename};
     }
 
     // Strings
     if (*s == '"')
     {
-        int len = 1;
-        while (s[len] && s[len] != '"')
+        int is_multi = (s[1] == '"' && s[2] == '"');
+        int len = is_multi ? 3 : 1;
+        while (s[len])
         {
-            if (s[len] == '\\')
+            if (is_multi && s[len] == '"' && s[len + 1] == '"' && s[len + 2] == '"')
+            {
+                break;
+            }
+            else if (!is_multi && s[len] == '"')
+            {
+                break;
+            }
+
+            if (s[len] == '\\' && !is_multi)
             {
                 len++;
             }
             len++;
         }
-        if (s[len] == '"')
+        if (is_multi && s[len] == '"' && s[len + 1] == '"' && s[len + 2] == '"')
+        {
+            len += 3;
+        }
+        else if (!is_multi && s[len] == '"')
         {
             len++;
         }
+
+        for (int i = 0; i < len; i++)
+        {
+            if (s[i] == '\n')
+            {
+                l->line++;
+                l->col = 1;
+            }
+            else
+            {
+                l->col++;
+            }
+        }
         l->pos += len;
-        l->col += len;
-        return (Token){TOK_STRING, s, len, start_line, start_col};
+        return (Token){TOK_STRING, s, len, start_line, start_col, g_current_filename};
     }
 
     if (*s == '\'')
     {
         int len = 1;
-        // Handle escapes like '\n' or regular 'a'
         if (s[len] == '\\')
         {
             len++;
-            len++;
+            if ((s[len] == 'u' || s[len] == 'U') && s[len + 1] == '{')
+            {
+                len += 2;
+                while ((s[len] >= '0' && s[len] <= '9') || (s[len] >= 'a' && s[len] <= 'f') ||
+                       (s[len] >= 'A' && s[len] <= 'F'))
+                {
+                    len++;
+                }
+                if (s[len] == '}')
+                {
+                    len++;
+                }
+            }
+            else
+            {
+                len++;
+            }
         }
         else
         {
-            len++;
+            unsigned char first = (unsigned char)s[len];
+            if ((first & 0x80) == 0)
+            {
+                len++;
+            }
+            else if ((first & 0xE0) == 0xC0)
+            {
+                len += 2;
+            }
+            else if ((first & 0xF0) == 0xE0)
+            {
+                len += 3;
+            }
+            else if ((first & 0xF8) == 0xF0)
+            {
+                len += 4;
+            }
+            else
+            {
+                len++;
+            }
         }
         if (s[len] == '\'')
         {
@@ -430,7 +586,7 @@ Token lexer_next(Lexer *l)
 
         l->pos += len;
         l->col += len;
-        return (Token){TOK_CHAR, s, len, start_line, start_col};
+        return (Token){TOK_CHAR, s, len, start_line, start_col, g_current_filename};
     }
 
     // Operators.
@@ -507,9 +663,14 @@ Token lexer_next(Lexer *l)
         }
     }
     else if ((s[0] == '&' && s[1] == '&') || (s[0] == '|' && s[1] == '|') ||
-             (s[0] == '+' && s[1] == '+') || (s[0] == '-' && s[1] == '-'))
+             (s[0] == '+' && s[1] == '+') || (s[0] == '-' && s[1] == '-') ||
+             (s[0] == '*' && s[1] == '*'))
     {
         len = 2;
+        if (s[0] == '*' && s[1] == '*' && s[2] == '=')
+        {
+            len = 3;
+        }
     }
     else if (s[1] == '=' && strchr("=!<>+-*/%|&^", s[0]))
     {
@@ -565,7 +726,7 @@ Token lexer_next(Lexer *l)
 
     l->pos += len;
     l->col += len;
-    return (Token){type, s, len, start_line, start_col};
+    return (Token){type, s, len, start_line, start_col, g_current_filename};
 }
 
 Token lexer_peek(Lexer *l)

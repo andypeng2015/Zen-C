@@ -12,6 +12,7 @@
 #include "zprep_plugin.h"
 
 char *g_current_func_ret_type = NULL;
+Type *g_current_func_ret_type_info = NULL;
 
 // Helper: emit a single pattern condition (either a value, or a range)
 static void emit_single_pattern_cond(const char *pat, int id, int is_ptr, FILE *out)
@@ -176,8 +177,8 @@ static bool is_int_type(TypeKind k)
     case TYPE_C_UINT:
     case TYPE_C_LONG:
     case TYPE_C_ULONG:
-    case TYPE_C_LONG_LONG:
-    case TYPE_C_ULONG_LONG:
+    case TYPE_C_LONGLONG:
+    case TYPE_C_ULONGLONG:
     case TYPE_C_SHORT:
     case TYPE_C_USHORT:
     case TYPE_C_CHAR:
@@ -235,6 +236,8 @@ void codegen_match_internal(ParserContext *ctx, ASTNode *node, FILE *out, int us
                          node->match_stmt.expr->type == NODE_EXPR_MEMBER ||
                          node->match_stmt.expr->type == NODE_EXPR_INDEX);
 
+    emit_source_mapping(node, out); // Step through match statements elegantly
+
     if (is_self)
     {
         emit_auto_type(ctx, node->match_stmt.expr, node->token, out);
@@ -274,8 +277,8 @@ void codegen_match_internal(ParserContext *ctx, ASTNode *node, FILE *out, int us
     }
 
     char *expr_type = infer_type(ctx, node->match_stmt.expr);
-    int is_option = (expr_type && strncmp(expr_type, "Option_", 7) == 0);
-    int is_result = (expr_type && strncmp(expr_type, "Result_", 7) == 0);
+    int is_option = IS_OPTION_TYPE(expr_type);
+    int is_result = IS_RESULT_TYPE(expr_type);
 
     char *enum_name = NULL;
     ASTNode *chk = node->match_stmt.cases;
@@ -309,7 +312,11 @@ void codegen_match_internal(ParserContext *ctx, ASTNode *node, FILE *out, int us
                 ASTNode *c2 = node->match_stmt.cases;
                 while (c2)
                 {
-                    if (strcmp(c2->match_case.pattern, v->variant_name) == 0)
+                    char mangled_v[512];
+                    snprintf(mangled_v, sizeof(mangled_v), "%s__%s", v->enum_name, v->variant_name);
+
+                    if (strcmp(c2->match_case.pattern, v->variant_name) == 0 ||
+                        strcmp(c2->match_case.pattern, mangled_v) == 0)
                     {
                         covered = 1;
                         break;
@@ -330,51 +337,71 @@ void codegen_match_internal(ParserContext *ctx, ASTNode *node, FILE *out, int us
     int first = 1;
     while (c)
     {
+        int is_wildcard = (strcmp(c->match_case.pattern, "_") == 0);
+        int is_final_wildcard = (is_wildcard && c->next == NULL);
+
         if (!first)
         {
             fprintf(out, " else ");
         }
-        fprintf(out, "if (");
-        if (strcmp(c->match_case.pattern, "_") == 0)
+
+        emit_source_mapping(c, out); // Step through match cases elegantly
+
+        if (!is_final_wildcard || first)
         {
-            fprintf(out, "1");
-        }
-        else if (is_option)
-        {
-            if (strcmp(c->match_case.pattern, "Some") == 0)
-            {
-                fprintf(out, "_m_%d->is_some", id);
-            }
-            else if (strcmp(c->match_case.pattern, "None") == 0)
-            {
-                fprintf(out, "!_m_%d->is_some", id);
-            }
-            else
+            fprintf(out, "if (");
+            if (is_wildcard)
             {
                 fprintf(out, "1");
             }
-        }
-        else if (is_result)
-        {
-            if (strcmp(c->match_case.pattern, "Ok") == 0)
+            else if (is_option)
             {
-                fprintf(out, "_m_%d->is_ok", id);
+                int m_is_ptr = has_ref_binding || (expr_type && strchr(expr_type, '*'));
+                const char *acc = m_is_ptr ? "->" : ".";
+
+                if (strcmp(c->match_case.pattern, "Some") == 0)
+                {
+                    fprintf(out, "_m_%d%sis_some", id, acc);
+                }
+                else if (strcmp(c->match_case.pattern, "None") == 0)
+                {
+                    fprintf(out, "!_m_%d%sis_some", id, acc);
+                }
+                else
+                {
+                    fprintf(out, "1");
+                }
             }
-            else if (strcmp(c->match_case.pattern, "Err") == 0)
+            else if (is_result)
             {
-                fprintf(out, "!_m_%d->is_ok", id);
+                int m_is_ptr = has_ref_binding || (expr_type && strchr(expr_type, '*'));
+                const char *acc = m_is_ptr ? "->" : ".";
+
+                if (strcmp(c->match_case.pattern, "Ok") == 0)
+                {
+                    fprintf(out, "_m_%d%sis_ok", id, acc);
+                }
+                else if (strcmp(c->match_case.pattern, "Err") == 0)
+                {
+                    fprintf(out, "!_m_%d%sis_ok", id, acc);
+                }
+                else
+                {
+                    fprintf(out, "1");
+                }
             }
             else
             {
-                fprintf(out, "1");
+                // Use helper for OR patterns, range patterns, and simple patterns
+                emit_pattern_condition(ctx, c->match_case.pattern, id, has_ref_binding, out);
             }
         }
-        else
+
+        if (!is_final_wildcard || first)
         {
-            // Use helper for OR patterns, range patterns, and simple patterns
-            emit_pattern_condition(ctx, c->match_case.pattern, id, has_ref_binding, out);
+            fprintf(out, ") ");
         }
-        fprintf(out, ") { ");
+        fprintf(out, "{ ");
         if (c->match_case.binding_count > 0)
         {
             for (int i = 0; i < c->match_case.binding_count; i++)
@@ -488,11 +515,13 @@ void codegen_match_internal(ParserContext *ctx, ASTNode *node, FILE *out, int us
                     ASTNode *stmt = body->block.statements;
                     while (stmt)
                     {
+                        emit_source_mapping(stmt, out);
                         codegen_node_single(ctx, stmt, out);
                         stmt = stmt->next;
                     }
                     for (int i = defer_count - 1; i >= saved; i--)
                     {
+                        emit_source_mapping_duplicate(defer_stack[i], out);
                         codegen_node_single(ctx, defer_stack[i], out);
                     }
                     defer_count = saved;
@@ -510,7 +539,9 @@ void codegen_match_internal(ParserContext *ctx, ASTNode *node, FILE *out, int us
             if (is_string_literal)
             {
                 char *inner = body->literal.string_val;
-                char *code = process_printf_sugar(ctx, inner, 1, "stdout", NULL, NULL, 0);
+                char *code =
+                    process_printf_sugar(ctx, body->token, inner, 1, "stdout", NULL, NULL, 0, 0, 0);
+
                 fprintf(out, "%s;", code);
                 free(code);
             }
@@ -527,10 +558,18 @@ void codegen_match_internal(ParserContext *ctx, ASTNode *node, FILE *out, int us
 
     if (is_expr)
     {
+        if (g_config.misra_mode && !has_wildcard)
+        {
+            fprintf(out, " else { } /* MISRA 15.7 */ ");
+        }
         fprintf(out, " _r_%d; })", id);
     }
     else
     {
+        if (g_config.misra_mode && !has_wildcard)
+        {
+            fprintf(out, " else { } /* MISRA 15.7 */ ");
+        }
         fprintf(out, " }");
     }
 }
@@ -540,6 +579,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
     {
         return;
     }
+
     switch (node->type)
     {
     case NODE_AST_COMMENT:
@@ -554,10 +594,17 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
         {
             break;
         }
+        if (node->cfg_condition)
+        {
+            fprintf(out, "#if %s\n", node->cfg_condition);
+        }
+
+        emit_source_mapping(node, out);
 
         if (node->func.is_async)
         {
-            fprintf(out, "struct %s_Args {\n", node->func.name);
+            const char *final_name = (node->link_name) ? node->link_name : node->func.name;
+            fprintf(out, "struct %s_Args {\n", final_name);
             char *args_copy = xstrdup(node->func.args);
             char *token = strtok(args_copy, ",");
             int arg_count = 0;
@@ -584,19 +631,24 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
             free(args_copy);
             fprintf(out, "};\n");
 
-            fprintf(out, "void* _runner_%s(void* _args)\n", node->func.name);
+            fprintf(out, "void* _runner_%s(void* _args)\n", final_name);
             fprintf(out, "{\n");
-            fprintf(out, "    struct %s_Args* args = (struct %s_Args*)_args;\n", node->func.name,
-                    node->func.name);
+            fprintf(out, "    struct %s_Args* args = (struct %s_Args*)_args;\n", final_name,
+                    final_name);
 
             // Determine mechanism: struct/large-type? -> malloc; primitive -> cast
             int returns_struct = 0;
             char *rt = node->func.ret_type;
-            if (strcmp(rt, "void") != 0 && strcmp(rt, "Async") != 0)
+            if (node->func.ret_type_info)
             {
-                if (is_struct_return_type(rt))
+                returns_struct = z_is_struct_type(node->func.ret_type_info);
+            }
+            else
+            {
+                if (rt && strstr(rt, "*") == NULL && strcmp(rt, "string") != 0 &&
+                    strcmp(rt, "void") != 0 && strcmp(rt, "Async") != 0)
                 {
-                    returns_struct = 1;
+                    returns_struct = is_struct_return_type(rt);
                 }
             }
 
@@ -606,7 +658,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
                 fprintf(out, "    %s *res_ptr = malloc(sizeof(%s));\n", rt, rt);
                 fprintf(out, "    *res_ptr = ");
             }
-            else if (strcmp(rt, "void") != 0 && strcmp(rt, "Async") != 0)
+            else if (rt && strcmp(rt, "void") != 0 && strcmp(rt, "Async") != 0)
             {
                 fprintf(out, "    %s res = ", rt);
             }
@@ -615,7 +667,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
                 fprintf(out, "    ");
             }
 
-            fprintf(out, "_impl_%s(", node->func.name);
+            fprintf(out, "_impl_%s(", final_name);
             for (int i = 0; i < arg_count; i++)
             {
                 fprintf(out, "%sargs->%s", i > 0 ? ", " : "", arg_names[i]);
@@ -629,7 +681,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
             }
             else if (strcmp(rt, "void") != 0)
             {
-                fprintf(out, "    return (void*)(long)res;\n");
+                fprintf(out, "    return (void*)(uintptr_t)res;\n");
             }
             else
             {
@@ -637,32 +689,36 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
             }
             fprintf(out, "}\n");
 
-            fprintf(out, "%s _impl_%s(%s)\n", node->func.ret_type, node->func.name,
-                    node->func.args);
+            fprintf(out, "%s _impl_%s(%s)\n", node->func.ret_type, final_name, node->func.args);
             fprintf(out, "{\n");
             defer_count = 0;
             codegen_walker(ctx, node->func.body, out);
             for (int i = defer_count - 1; i >= 0; i--)
             {
+                emit_source_mapping_duplicate(defer_stack[i], out);
                 codegen_node_single(ctx, defer_stack[i], out);
             }
             fprintf(out, "}\n");
 
             // 4. Define Public Wrapper (Spawns Thread)
-            fprintf(out, "Async %s(%s)\n", node->func.name, node->func.args);
+            fprintf(out, "Async %s(%s)\n", final_name, node->func.args);
             fprintf(out, "{\n");
-            fprintf(out, "    struct %s_Args* args = malloc(sizeof(struct %s_Args));\n",
-                    node->func.name, node->func.name);
+            fprintf(out, "    struct %s_Args* args = malloc(sizeof(struct %s_Args));\n", final_name,
+                    final_name);
             for (int i = 0; i < arg_count; i++)
             {
                 fprintf(out, "    args->%s = %s;\n", arg_names[i], arg_names[i]);
             }
 
             fprintf(out, "    pthread_t th;\n");
-            fprintf(out, "    pthread_create(&th, NULL, _runner_%s, args);\n", node->func.name);
+            fprintf(out, "    pthread_create(&th, NULL, _runner_%s, args);\n", final_name);
             fprintf(out, "    return (Async){.thread=th, .result=NULL};\n");
             fprintf(out, "}\n");
 
+            if (node->cfg_condition)
+            {
+                fprintf(out, "#endif\n");
+            }
             break;
         }
 
@@ -772,39 +828,94 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
             fprintf(out, "inline ");
         }
         emit_func_signature(ctx, out, node, NULL);
-        fprintf(out, "\n");
-        fprintf(out, "{\n");
+        fprintf(out, "\n{\n");
+        if (g_config.misra_mode && node->func.ret_type && strcmp(node->func.ret_type, "void") != 0)
+        {
+            char *safe_ret_type = type_to_c_string(node->func.ret_type_info);
+            fprintf(out, "    %s _misra_ret = 0;\n", safe_ret_type);
+            free(safe_ret_type);
+        }
         char *prev_ret = g_current_func_ret_type;
+        Type *prev_ret_info = g_current_func_ret_type_info;
         g_current_func_ret_type = node->func.ret_type;
+        g_current_func_ret_type_info = node->func.ret_type_info;
+
+        // Set self_is_pointer flag for codegen of the body
+        int prev_self_is_ptr = ctx->self_is_pointer;
+        ctx->self_is_pointer = 0;
+        if (node->func.arg_count > 0 && node->func.param_names && node->func.param_names[0] &&
+            strcmp(node->func.param_names[0], "self") == 0)
+        {
+            ctx->self_is_pointer = 1;
+        }
 
         // Initialize drop flags for arguments that implement Drop
         for (int i = 0; i < node->func.arg_count; i++)
         {
             Type *arg_type = node->func.arg_types[i];
-            char *arg_name = node->func.param_names[i];
+            char *arg_name = node->func.param_names ? node->func.param_names[i] : NULL;
             if (arg_type && arg_name)
             {
                 // Check if type implements Drop
                 int has_drop = 0;
-                if (arg_type->kind == TYPE_STRUCT && arg_type->name)
+                char *drop_type_name = NULL;
+
+                if (arg_type->kind == TYPE_FUNCTION ||
+                    (arg_type->kind == TYPE_STRUCT && arg_type->name))
                 {
-                    ASTNode *def = find_struct_def(ctx, arg_type->name);
-                    if (def && def->type == NODE_STRUCT && def->type_info &&
-                        def->type_info->traits.has_drop)
+                    if (arg_type->kind == TYPE_FUNCTION)
                     {
-                        has_drop = 1;
+                        if (arg_type->traits.has_drop)
+                        {
+                            has_drop = 1;
+                        }
+                    }
+                    else
+                    {
+                        ASTNode *def = find_struct_def(ctx, arg_type->name);
+                        if (def && def->type == NODE_STRUCT && def->type_info &&
+                            def->type_info->traits.has_drop)
+                        {
+                            has_drop = 1;
+                            drop_type_name = arg_type->name;
+                        }
                     }
                 }
 
                 if (has_drop)
                 {
+                    emit_source_mapping_duplicate(node, out);
                     fprintf(out, "    int __z_drop_flag_%s = 1;\n", arg_name);
 
                     ASTNode *defer_node = xmalloc(sizeof(ASTNode));
+                    defer_node->token = node->token;
                     defer_node->type = NODE_RAW_STMT;
-                    char *stmt_str = xmalloc(256 + strlen(arg_name) * 2 + strlen(arg_type->name));
-                    sprintf(stmt_str, "if (__z_drop_flag_%s) %s__Drop_glue(&%s);", arg_name,
-                            arg_type->name, arg_name);
+                    char *stmt_str = NULL;
+                    if (arg_type->kind == TYPE_FUNCTION)
+                    {
+                        size_t stmt_sz = 256 + strlen(arg_name) * 4;
+                        stmt_str = xmalloc(stmt_sz);
+                        snprintf(stmt_str, stmt_sz,
+                                 "if (__z_drop_flag_%s && %s.drop) %s.drop(%s.ctx);", arg_name,
+                                 arg_name, arg_name, arg_name);
+                    }
+                    else
+                    {
+                        size_t stmt_sz = 256 + strlen(arg_name) * 2 + strlen(drop_type_name);
+                        stmt_str = xmalloc(stmt_sz);
+                        // If it's self, it's already a pointer in C
+                        if (strcmp(arg_name, "self") == 0)
+                        {
+                            snprintf(stmt_str, stmt_sz, "if (__z_drop_flag_%s) %s__Drop__glue(%s);",
+                                     arg_name, drop_type_name, arg_name);
+                        }
+                        else
+                        {
+                            snprintf(stmt_str, stmt_sz,
+                                     "if (__z_drop_flag_%s) %s__Drop__glue(&%s);", arg_name,
+                                     drop_type_name, arg_name);
+                        }
+                    }
                     defer_node->raw_stmt.content = stmt_str;
 
                     if (defer_count < MAX_DEFER)
@@ -818,14 +929,35 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
         codegen_walker(ctx, node->func.body, out);
         for (int i = defer_count - 1; i >= 0; i--)
         {
+            emit_source_mapping_duplicate(defer_stack[i], out);
             codegen_node_single(ctx, defer_stack[i], out);
         }
         g_current_func_ret_type = prev_ret;
+        g_current_func_ret_type_info = prev_ret_info;
+        ctx->self_is_pointer = prev_self_is_ptr;
+
+        if (g_config.misra_mode)
+        {
+            fprintf(out, "    goto _misra_end_of_func;\n");
+            fprintf(out, "_misra_end_of_func:\n");
+            if (node->func.ret_type && strcmp(node->func.ret_type, "void") != 0)
+            {
+                fprintf(out, "    return _misra_ret;\n");
+            }
+            else
+            {
+                fprintf(out, "    return;\n");
+            }
+        }
         fprintf(out, "}\n");
+        if (node->cfg_condition)
+        {
+            fprintf(out, "#endif\n");
+        }
         break;
 
     case NODE_ASSERT:
-        fprintf(out, "assert(");
+        fprintf(out, "__zenc_assert(");
         codegen_expression(ctx, node->assert_stmt.condition, out);
         if (node->assert_stmt.message)
         {
@@ -845,16 +977,78 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
         }
         break;
     case NODE_IMPL:
-        g_current_impl_type = node->impl.struct_name;
+    {
+        char *sname = node->impl.struct_name;
+        TypeAlias *ta = find_type_alias_node(ctx, sname);
+        const char *resolved = (ta && !ta->is_opaque) ? ta->original_type : NULL;
+
+        // If this is an opaque alias, rename method func.name prefixes before codegen
+        if (resolved)
+        {
+            int slen = strlen(sname);
+            ASTNode *m = node->impl.methods;
+            while (m)
+            {
+                if (m->type == NODE_FUNCTION && m->func.name &&
+                    strncmp(m->func.name, sname, slen) == 0 && m->func.name[slen] == '_' &&
+                    m->func.name[slen + 1] == '_')
+                {
+                    const char *method_part = m->func.name + slen;
+                    size_t new_name_sz = strlen(resolved) + strlen(method_part) + 1;
+                    char *new_name = xmalloc(new_name_sz);
+                    snprintf(new_name, new_name_sz, "%s%s", resolved, method_part);
+                    free(m->func.name);
+                    m->func.name = new_name;
+                }
+                m = m->next;
+            }
+            g_current_impl_type = (char *)resolved;
+        }
+        else
+        {
+            g_current_impl_type = sname;
+        }
+
         codegen_walker(ctx, node->impl.methods, out);
         g_current_impl_type = NULL;
         break;
+    }
     case NODE_IMPL_TRAIT:
-        g_current_impl_type = node->impl_trait.target_type;
-        codegen_walker(ctx, node->impl_trait.methods, out);
+    {
+        char *sname = node->impl_trait.target_type;
+        TypeAlias *ta = find_type_alias_node(ctx, sname);
+        const char *resolved = (ta && !ta->is_opaque) ? ta->original_type : NULL;
 
+        if (resolved)
+        {
+            int slen = strlen(sname);
+            ASTNode *m = node->impl_trait.methods;
+            while (m)
+            {
+                if (m->type == NODE_FUNCTION && m->func.name &&
+                    strncmp(m->func.name, sname, slen) == 0 && m->func.name[slen] == '_' &&
+                    m->func.name[slen + 1] == '_')
+                {
+                    const char *method_part = m->func.name + slen;
+                    size_t new_name_sz = strlen(resolved) + strlen(method_part) + 1;
+                    char *new_name = xmalloc(new_name_sz);
+                    snprintf(new_name, new_name_sz, "%s%s", resolved, method_part);
+                    free(m->func.name);
+                    m->func.name = new_name;
+                }
+                m = m->next;
+            }
+            g_current_impl_type = (char *)resolved;
+        }
+        else
+        {
+            g_current_impl_type = sname;
+        }
+
+        codegen_walker(ctx, node->impl_trait.methods, out);
         g_current_impl_type = NULL;
         break;
+    }
     case NODE_DESTRUCT_VAR:
     {
         int id = tmp_counter++;
@@ -870,6 +1064,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
             char *variant = node->destruct.guard_variant;
             char *check = "val"; // field to access
 
+            emit_source_mapping_duplicate(node, out);
             if (strcmp(variant, "Some") == 0)
             {
                 fprintf(out, "    if (!_tmp_%d.is_some) {\n", id);
@@ -894,7 +1089,8 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
             fprintf(out, "    }\n");
 
             // Bind value
-            if (strstr(g_config.cc, "tcc"))
+            emit_source_mapping_duplicate(node, out);
+            if (z_path_match_compiler(g_config.cc, "tcc"))
             {
                 fprintf(out, "    __typeof__(_tmp_%d.%s) %s = _tmp_%d.%s;\n", id, check,
                         node->destruct.names[0], id, check);
@@ -908,11 +1104,12 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
         {
             for (int i = 0; i < node->destruct.count; i++)
             {
+                emit_source_mapping_duplicate(node, out);
                 if (node->destruct.is_struct_destruct)
                 {
                     char *field = node->destruct.field_names ? node->destruct.field_names[i]
                                                              : node->destruct.names[i];
-                    if (strstr(g_config.cc, "tcc"))
+                    if (z_path_match_compiler(g_config.cc, "tcc"))
                     {
                         fprintf(out, "    __typeof__(_tmp_%d.%s) %s = _tmp_%d.%s;\n", id, field,
                                 node->destruct.names[i], id, field);
@@ -933,7 +1130,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
                         fprintf(out, "    %s %s = _tmp_%d.v%d;\n", explicit_type,
                                 node->destruct.names[i], id, i);
                     }
-                    else if (strstr(g_config.cc, "tcc"))
+                    else if (z_path_match_compiler(g_config.cc, "tcc"))
                     {
                         fprintf(out, "    __typeof__(_tmp_%d.v%d) %s = _tmp_%d.v%d;\n", id, i,
                                 node->destruct.names[i], id, i);
@@ -955,6 +1152,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
         codegen_walker(ctx, node->block.statements, out);
         for (int i = defer_count - 1; i >= saved; i--)
         {
+            emit_source_mapping_duplicate(defer_stack[i], out);
             codegen_node_single(ctx, defer_stack[i], out);
         }
         defer_count = saved;
@@ -962,6 +1160,38 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
         break;
     }
     case NODE_VAR_DECL:
+    {
+        // Save pending closure free count — if the init expr creates a closure,
+        // the variable takes ownership and we should NOT free the context.
+        int saved_closure_frees = pending_closure_free_count;
+
+        if (strcmp(node->var_decl.name, "_") == 0 && node->var_decl.init_expr)
+        {
+            int is_void = 0;
+            if (node->type_info && node->type_info->kind == TYPE_VOID)
+            {
+                is_void = 1;
+            }
+            else if (node->var_decl.type_str && strcmp(node->var_decl.type_str, "void") == 0)
+            {
+                is_void = 1;
+            }
+            else if (!node->type_info && !node->var_decl.type_str)
+            {
+                char *ret_type = infer_type(ctx, node->var_decl.init_expr);
+                if (!ret_type || strcmp(ret_type, "void") == 0)
+                {
+                    is_void = 1;
+                }
+            }
+            if (is_void)
+            {
+                fprintf(out, "    ");
+                codegen_expression(ctx, node->var_decl.init_expr, out);
+                fprintf(out, ";\n");
+                break;
+            }
+        }
         fprintf(out, "    ");
         if (node->var_decl.is_static)
         {
@@ -976,7 +1206,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
             if (node->type_info &&
                 (!node->var_decl.init_expr || node->var_decl.init_expr->type != NODE_AWAIT))
             {
-                tname = codegen_type_to_string(node->type_info);
+                tname = type_to_c_string(node->type_info);
             }
             else if (node->var_decl.type_str && strcmp(node->var_decl.type_str, "__auto_type") != 0)
             {
@@ -1002,10 +1232,11 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
                     // Synthesize Defer: if (__z_drop_flag_name) Name__Drop_drop(&name);
                     ASTNode *defer_node = xmalloc(sizeof(ASTNode));
                     defer_node->type = NODE_RAW_STMT;
-                    char *stmt_str =
-                        xmalloc(256 + strlen(node->var_decl.name) * 2 + strlen(clean_type));
-                    sprintf(stmt_str, "if (__z_drop_flag_%s) %s__Drop_glue(&%s);",
-                            node->var_decl.name, clean_type, node->var_decl.name);
+                    defer_node->token = node->token;
+                    size_t stmt_sz = 256 + strlen(node->var_decl.name) * 2 + strlen(clean_type);
+                    char *stmt_str = xmalloc(stmt_sz);
+                    snprintf(stmt_str, stmt_sz, "if (__z_drop_flag_%s) %s__Drop__glue(&%s);",
+                             node->var_decl.name, clean_type, node->var_decl.name);
                     defer_node->raw_stmt.content = stmt_str;
                     defer_node->line = node->line;
 
@@ -1017,7 +1248,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
 
                 // Emit Variable with Type
                 emit_var_decl_type(ctx, out, tname, node->var_decl.name);
-                add_symbol(ctx, node->var_decl.name, tname, node->type_info);
+                add_symbol(ctx, node->var_decl.name, tname, node->type_info, 0);
 
                 if (node->var_decl.init_expr)
                 {
@@ -1029,7 +1260,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
                     TypeKind k = node->type_info->kind;
                     if (k == TYPE_ARRAY || k == TYPE_STRUCT)
                     {
-                        fprintf(out, " = {0}");
+                        fprintf(out, " = %s", g_config.use_cpp ? "{}" : "{0}");
                     }
                     else if (is_int_type(k))
                     {
@@ -1057,7 +1288,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
 
                 if (node->type_info)
                 {
-                    free(tname); // Free if allocated by codegen_type_to_string
+                    free(tname); // Free if allocated by type_to_c_string
                 }
             }
             else
@@ -1088,11 +1319,28 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
                         // Synthesize Defer: if (__z_drop_flag_name) Name__Drop_drop(&name);
                         ASTNode *defer_node = xmalloc(sizeof(ASTNode));
                         defer_node->type = NODE_RAW_STMT;
+                        defer_node->token = node->token;
                         // Build string
-                        char *stmt_str =
-                            xmalloc(256 + strlen(node->var_decl.name) * 2 + strlen(clean_type));
-                        sprintf(stmt_str, "if (__z_drop_flag_%s) %s__Drop_glue(&%s);",
-                                node->var_decl.name, clean_type, node->var_decl.name);
+                        char *stmt_str = NULL;
+                        if (node->var_decl.init_expr && node->var_decl.init_expr->type_info &&
+                            node->var_decl.init_expr->type_info->kind == TYPE_FUNCTION)
+                        {
+                            size_t stmt_sz = 256 + strlen(node->var_decl.name) * 4;
+                            stmt_str = xmalloc(stmt_sz);
+                            snprintf(stmt_str, stmt_sz,
+                                     "if (__z_drop_flag_%s && %s.drop) %s.drop(%s.ctx);",
+                                     node->var_decl.name, node->var_decl.name, node->var_decl.name,
+                                     node->var_decl.name);
+                        }
+                        else
+                        {
+                            size_t stmt_sz =
+                                256 + strlen(node->var_decl.name) * 2 + strlen(clean_type);
+                            stmt_str = xmalloc(stmt_sz);
+                            snprintf(stmt_str, stmt_sz,
+                                     "if (__z_drop_flag_%s) %s__Drop__glue(&%s);",
+                                     node->var_decl.name, clean_type, node->var_decl.name);
+                        }
                         defer_node->raw_stmt.content = stmt_str;
                         defer_node->line = node->line;
 
@@ -1104,7 +1352,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
                     }
 
                     emit_var_decl_type(ctx, out, inferred, node->var_decl.name);
-                    add_symbol(ctx, node->var_decl.name, inferred, NULL);
+                    add_symbol(ctx, node->var_decl.name, inferred, NULL, 0);
                     fprintf(out, " = ");
                     codegen_expression(ctx, node->var_decl.init_expr, out);
                     fprintf(out, ";\n");
@@ -1122,7 +1370,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
 
                     if (inferred)
                     {
-                        add_symbol(ctx, node->var_decl.name, inferred, NULL);
+                        add_symbol(ctx, node->var_decl.name, inferred, NULL, 0);
                     }
 
                     fprintf(out, " = ");
@@ -1136,7 +1384,11 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
                 }
             }
         }
+
+        // Suppress pending frees - variable owns the closure context
+        pending_closure_free_count = saved_closure_frees;
         break;
+    }
     case NODE_CONST:
         fprintf(out, "    const ");
         if (node->var_decl.type_str)
@@ -1169,37 +1421,104 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
         fprintf(out, "if (");
         codegen_expression(ctx, node->if_stmt.condition, out);
         fprintf(out, ") ");
+        if (g_config.misra_mode && node->if_stmt.then_body->type != NODE_BLOCK)
+        {
+            fprintf(out, "{\n");
+        }
         codegen_node_single(ctx, node->if_stmt.then_body, out);
+        if (g_config.misra_mode && node->if_stmt.then_body->type != NODE_BLOCK)
+        {
+            fprintf(out, "\n}");
+        }
         if (node->if_stmt.else_body)
         {
+            emit_source_mapping(node->if_stmt.else_body, out);
             fprintf(out, " else ");
+            if (g_config.misra_mode && node->if_stmt.else_body->type != NODE_BLOCK)
+            {
+                fprintf(out, "{\n");
+            }
             codegen_node_single(ctx, node->if_stmt.else_body, out);
+            if (g_config.misra_mode && node->if_stmt.else_body->type != NODE_BLOCK)
+            {
+                fprintf(out, "\n}");
+            }
+        }
+        else if (g_config.misra_mode)
+        {
+            fprintf(out, " else { } /* MISRA */ ");
         }
         break;
     case NODE_UNLESS:
         fprintf(out, "if (!(");
         codegen_expression(ctx, node->unless_stmt.condition, out);
         fprintf(out, ")) ");
+        if (g_config.misra_mode && node->unless_stmt.body->type != NODE_BLOCK)
+        {
+            fprintf(out, "{\n");
+        }
         codegen_node_single(ctx, node->unless_stmt.body, out);
+        if (g_config.misra_mode && node->unless_stmt.body->type != NODE_BLOCK)
+        {
+            fprintf(out, "\n}");
+        }
         break;
     case NODE_GUARD:
         fprintf(out, "if (!(");
         codegen_expression(ctx, node->guard_stmt.condition, out);
         fprintf(out, ")) ");
+        if (g_config.misra_mode && node->guard_stmt.body->type != NODE_BLOCK)
+        {
+            fprintf(out, "{\n");
+        }
         codegen_node_single(ctx, node->guard_stmt.body, out);
+        if (g_config.misra_mode && node->guard_stmt.body->type != NODE_BLOCK)
+        {
+            fprintf(out, "\n}");
+        }
         break;
     case NODE_WHILE:
     {
+        if (node->while_stmt.loop_label)
+        {
+            fprintf(out, "%s:;\n", node->while_stmt.loop_label);
+        }
         loop_defer_boundary[loop_depth++] = defer_count;
         fprintf(out, "while (");
         codegen_expression(ctx, node->while_stmt.condition, out);
         fprintf(out, ") ");
-        codegen_node_single(ctx, node->while_stmt.body, out);
+        if (node->while_stmt.loop_label)
+        {
+            fprintf(out, "{\n");
+            codegen_node_single(ctx, node->while_stmt.body, out);
+            fprintf(out, "__continue_%s:;\n", node->while_stmt.loop_label);
+            fprintf(out, "}\n");
+        }
+        else
+        {
+            if (g_config.misra_mode && node->while_stmt.body->type != NODE_BLOCK)
+            {
+                fprintf(out, "{\n");
+            }
+            codegen_node_single(ctx, node->while_stmt.body, out);
+            if (g_config.misra_mode && node->while_stmt.body->type != NODE_BLOCK)
+            {
+                fprintf(out, "\n}");
+            }
+        }
         loop_depth--;
+        if (node->while_stmt.loop_label)
+        {
+            fprintf(out, "__break_%s:;\n", node->while_stmt.loop_label);
+        }
         break;
     }
     case NODE_FOR:
     {
+        if (node->for_stmt.loop_label)
+        {
+            fprintf(out, "%s:;\n", node->for_stmt.loop_label);
+        }
         loop_defer_boundary[loop_depth++] = defer_count;
         fprintf(out, "for (");
         if (node->for_stmt.init)
@@ -1237,8 +1556,30 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
             codegen_expression_bare(ctx, node->for_stmt.step, out);
         }
         fprintf(out, ") ");
-        codegen_node_single(ctx, node->for_stmt.body, out);
+        if (node->for_stmt.loop_label)
+        {
+            fprintf(out, "{\n");
+            codegen_node_single(ctx, node->for_stmt.body, out);
+            fprintf(out, "__continue_%s:;\n", node->for_stmt.loop_label);
+            fprintf(out, "}\n");
+        }
+        else
+        {
+            if (g_config.misra_mode && node->for_stmt.body->type != NODE_BLOCK)
+            {
+                fprintf(out, "{\n");
+            }
+            codegen_node_single(ctx, node->for_stmt.body, out);
+            if (g_config.misra_mode && node->for_stmt.body->type != NODE_BLOCK)
+            {
+                fprintf(out, "\n}");
+            }
+        }
         loop_depth--;
+        if (node->for_stmt.loop_label)
+        {
+            fprintf(out, "__break_%s:;\n", node->for_stmt.loop_label);
+        }
         break;
     }
     case NODE_BREAK:
@@ -1248,6 +1589,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
             int boundary = loop_defer_boundary[loop_depth - 1];
             for (int i = defer_count - 1; i >= boundary; i--)
             {
+                emit_source_mapping_duplicate(defer_stack[i], out);
                 codegen_node_single(ctx, defer_stack[i], out);
             }
         }
@@ -1267,6 +1609,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
             int boundary = loop_defer_boundary[loop_depth - 1];
             for (int i = defer_count - 1; i >= boundary; i--)
             {
+                emit_source_mapping_duplicate(defer_stack[i], out);
                 codegen_node_single(ctx, defer_stack[i], out);
             }
         }
@@ -1297,40 +1640,98 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
         break;
     case NODE_DO_WHILE:
     {
+        if (node->do_while_stmt.loop_label)
+        {
+            fprintf(out, "%s:;\n", node->do_while_stmt.loop_label);
+        }
         loop_defer_boundary[loop_depth++] = defer_count;
         fprintf(out, "do ");
-        codegen_node_single(ctx, node->do_while_stmt.body, out);
+        if (node->do_while_stmt.loop_label)
+        {
+            fprintf(out, "{\n");
+            codegen_node_single(ctx, node->do_while_stmt.body, out);
+            fprintf(out, "__continue_%s:;\n", node->do_while_stmt.loop_label);
+            fprintf(out, "}\n");
+        }
+        else
+        {
+            codegen_node_single(ctx, node->do_while_stmt.body, out);
+        }
         fprintf(out, " while (");
         codegen_expression(ctx, node->do_while_stmt.condition, out);
         fprintf(out, ");\n");
         loop_depth--;
+        if (node->do_while_stmt.loop_label)
+        {
+            fprintf(out, "__break_%s:;\n", node->do_while_stmt.loop_label);
+        }
         break;
     }
     // Loop constructs: loop, repeat, for-in
     case NODE_LOOP:
     {
         // loop { ... } => while (1) { ... }
+        if (node->loop_stmt.loop_label)
+        {
+            fprintf(out, "%s:;\n", node->loop_stmt.loop_label);
+        }
         loop_defer_boundary[loop_depth++] = defer_count;
         fprintf(out, "while (1) ");
-        codegen_node_single(ctx, node->loop_stmt.body, out);
+        if (node->loop_stmt.loop_label)
+        {
+            fprintf(out, "{\n");
+            codegen_node_single(ctx, node->loop_stmt.body, out);
+            fprintf(out, "__continue_%s:;\n", node->loop_stmt.loop_label);
+            fprintf(out, "}\n");
+        }
+        else
+        {
+            codegen_node_single(ctx, node->loop_stmt.body, out);
+        }
         loop_depth--;
+        if (node->loop_stmt.loop_label)
+        {
+            fprintf(out, "__break_%s:;\n", node->loop_stmt.loop_label);
+        }
         break;
     }
     case NODE_REPEAT:
     {
+        if (node->repeat_stmt.loop_label)
+        {
+            fprintf(out, "%s:;\n", node->repeat_stmt.loop_label);
+        }
         loop_defer_boundary[loop_depth++] = defer_count;
         fprintf(out, "for (int _rpt_i = 0; _rpt_i < (%s); _rpt_i++) ", node->repeat_stmt.count);
-        codegen_node_single(ctx, node->repeat_stmt.body, out);
+        if (node->repeat_stmt.loop_label)
+        {
+            fprintf(out, "{\n");
+            codegen_node_single(ctx, node->repeat_stmt.body, out);
+            fprintf(out, "__continue_%s:;\n", node->repeat_stmt.loop_label);
+            fprintf(out, "}\n");
+        }
+        else
+        {
+            codegen_node_single(ctx, node->repeat_stmt.body, out);
+        }
         loop_depth--;
+        if (node->repeat_stmt.loop_label)
+        {
+            fprintf(out, "__break_%s:;\n", node->repeat_stmt.loop_label);
+        }
         break;
     }
     case NODE_FOR_RANGE:
     {
+        if (node->for_range.loop_label)
+        {
+            fprintf(out, "%s:;\n", node->for_range.loop_label);
+        }
         // Track loop entry for defer boundary
         loop_defer_boundary[loop_depth++] = defer_count;
 
         fprintf(out, "for (");
-        if (strstr(g_config.cc, "tcc"))
+        if (z_path_match_compiler(g_config.cc, "tcc"))
         {
             fprintf(out, "__typeof__((");
             codegen_expression(ctx, node->for_range.start, out);
@@ -1373,11 +1774,26 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
         {
             fprintf(out, "++) ");
         }
-        codegen_node_single(ctx, node->for_range.body, out);
+        if (node->for_range.loop_label)
+        {
+            fprintf(out, "{\n");
+            codegen_node_single(ctx, node->for_range.body, out);
+            fprintf(out, "__continue_%s:;\n", node->for_range.loop_label);
+            fprintf(out, "}\n");
+        }
+        else
+        {
+            codegen_node_single(ctx, node->for_range.body, out);
+        }
 
         loop_depth--;
+        if (node->for_range.loop_label)
+        {
+            fprintf(out, "__break_%s:;\n", node->for_range.loop_label);
+        }
         break;
     }
+
     case NODE_ASM:
     {
         int is_extended = (node->asm_stmt.num_outputs > 0 || node->asm_stmt.num_inputs > 0 ||
@@ -1393,7 +1809,8 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
         }
 
         char *code = node->asm_stmt.code;
-        char *transformed = xmalloc(strlen(code) * 3); // Generous buffer
+        size_t transformed_sz = strlen(code) * 3 + 128; // Extra buffer for expansions
+        char *transformed = xmalloc(transformed_sz);
         char *dst = transformed;
 
         for (char *p = code; *p; p++)
@@ -1436,15 +1853,26 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
                         }
                     }
 
+                    size_t rem = transformed_sz - (dst - transformed);
                     if (idx >= 0)
                     {
                         // Replace with %N
-                        dst += sprintf(dst, "%%%d", idx);
+#if defined(ZC_ARCH_ARM64)
+                        // Use most optimal register size on arm architectures
+                        if (node->asm_stmt.register_size <= 32)
+                        {
+                            dst += snprintf(dst, rem, "%%w%d", idx);
+                        }
+                        else
+#endif
+                        {
+                            dst += snprintf(dst, rem, "%%%d", idx);
+                        }
                     }
                     else
                     {
                         // Variable not found - error or keep as-is?
-                        dst += sprintf(dst, "{%s}", var_name);
+                        dst += snprintf(dst, rem, "{%s}", var_name);
                     }
 
                     p = end; // Skip past }
@@ -1557,11 +1985,13 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
     }
     case NODE_RETURN:
     {
+        // Suppress pending closure frees — returned closures escape the scope
+        pending_closure_free_count = 0;
         int has_defers = (defer_count > func_defer_boundary);
         int handled = 0;
 
         if (node->ret.value && node->ret.value->type == NODE_EXPR_ARRAY_LITERAL &&
-            g_current_func_ret_type && strncmp(g_current_func_ret_type, "Slice_", 6) == 0)
+            g_current_func_ret_type && strncmp(g_current_func_ret_type, "Slice__", 7) == 0)
         {
             // Heap allocation for slice literals to prevent use-after-return
             ASTNode *arr = node->ret.value;
@@ -1571,17 +2001,17 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
             // Prioritize the function return type (Slice_T) to determine the pointer type
             // This prevents "incompatible pointer type" errors in C when returning literals of
             // different types
-            if (g_current_func_ret_type && strncmp(g_current_func_ret_type, "Slice_", 6) == 0)
+            if (g_current_func_ret_type && strncmp(g_current_func_ret_type, "Slice__", 7) == 0)
             {
-                elem_type = xstrdup(g_current_func_ret_type + 6);
+                elem_type = xstrdup(g_current_func_ret_type + 7);
             }
             else if (arr->array_literal.elements && arr->array_literal.elements->type_info)
             {
-                elem_type = codegen_type_to_string(arr->array_literal.elements->type_info);
+                elem_type = type_to_c_string(arr->array_literal.elements->type_info);
             }
             else if (arr->type_info && arr->type_info->inner)
             {
-                elem_type = codegen_type_to_string(arr->type_info->inner);
+                elem_type = type_to_c_string(arr->type_info->inner);
             }
             else
             {
@@ -1621,8 +2051,16 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
                 ASTNode *def = find_struct_def(ctx, clean);
                 if (def && def->type_info && def->type_info->traits.has_drop)
                 {
-                    fprintf(out, "    return ({ ");
-                    if (strstr(g_config.cc, "tcc"))
+                    if (g_config.misra_mode)
+                    {
+                        fprintf(out, "    _misra_ret = ({ ");
+                    }
+                    else
+                    {
+                        fprintf(out, "    return ({ ");
+                    }
+
+                    if (z_path_match_compiler(g_config.cc, "tcc"))
                     {
                         fprintf(out, "__typeof__(");
                         codegen_expression(ctx, node->ret.value, out);
@@ -1633,16 +2071,33 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
                         fprintf(out, "ZC_AUTO");
                     }
                     fprintf(out, " _z_ret_mv = ");
+                    if (ctx->self_is_pointer && strcmp(node->ret.value->var_ref.name, "self") == 0)
+                    {
+                        fprintf(out, "*");
+                    }
                     codegen_expression(ctx, node->ret.value, out);
                     fprintf(out, "; memset(&");
+                    if (ctx->self_is_pointer && strcmp(node->ret.value->var_ref.name, "self") == 0)
+                    {
+                        fprintf(out, "*");
+                    }
                     codegen_expression(ctx, node->ret.value, out);
                     fprintf(out, ", 0, sizeof(_z_ret_mv)); ");
-                    // Run defers before returning
+                    if (strcmp(node->ret.value->var_ref.name, "self") != 0)
+                    {
+                        fprintf(out, "__z_drop_flag_%s = 0; ", node->ret.value->var_ref.name);
+                    }
                     for (int i = defer_count - 1; i >= func_defer_boundary; i--)
                     {
+                        emit_source_mapping_duplicate(defer_stack[i], out);
                         codegen_node_single(ctx, defer_stack[i], out);
                     }
                     fprintf(out, "_z_ret_mv; });\n");
+
+                    if (g_config.misra_mode)
+                    {
+                        fprintf(out, "    goto _misra_end_of_func;\n");
+                    }
                     handled = 1;
                 }
                 free(tname);
@@ -1653,33 +2108,107 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
         {
             if (has_defers && node->ret.value)
             {
-                // Save return value, run defers, then return
                 fprintf(out, "    { ");
-                emit_auto_type(ctx, node->ret.value, node->token, out);
+                if (g_current_func_ret_type_info)
+                {
+                    char *tstr = type_to_c_string(g_current_func_ret_type_info);
+                    fprintf(out, "%s", tstr);
+                    free(tstr);
+                }
+                else if (g_current_func_ret_type && strcmp(g_current_func_ret_type, "void") != 0 &&
+                         strcmp(g_current_func_ret_type, "unknown") != 0)
+                {
+                    fprintf(out, "%s", g_current_func_ret_type);
+                }
+                else
+                {
+                    emit_auto_type(ctx, node->ret.value, node->token, out);
+                }
                 fprintf(out, " _z_ret = ");
+                if (node->ret.value->type == NODE_EXPR_VAR && ctx->self_is_pointer &&
+                    strcmp(node->ret.value->var_ref.name, "self") == 0)
+                {
+                    fprintf(out, "*");
+                }
                 codegen_expression(ctx, node->ret.value, out);
                 fprintf(out, "; ");
                 for (int i = defer_count - 1; i >= func_defer_boundary; i--)
                 {
+                    emit_source_mapping_duplicate(defer_stack[i], out);
                     codegen_node_single(ctx, defer_stack[i], out);
                 }
-                fprintf(out, "return _z_ret; }\n");
+                if (g_config.misra_mode)
+                {
+                    fprintf(out, "_misra_ret = _z_ret; goto _misra_end_of_func; }\n");
+                }
+                else
+                {
+                    fprintf(out, "return _z_ret; }\n");
+                }
             }
             else if (has_defers)
             {
-                // No return value, just run defers
                 for (int i = defer_count - 1; i >= func_defer_boundary; i--)
                 {
+                    emit_source_mapping_duplicate(defer_stack[i], out);
                     codegen_node_single(ctx, defer_stack[i], out);
                 }
-                fprintf(out, "    return;\n");
+                if (g_config.misra_mode)
+                {
+                    fprintf(out, "    goto _misra_end_of_func;\n");
+                }
+                else
+                {
+                    fprintf(out, "    return;\n");
+                }
             }
             else
             {
-                // No defers, simple return
-                fprintf(out, "    return ");
-                codegen_expression(ctx, node->ret.value, out);
+                if (g_config.misra_mode)
+                {
+                    if (g_current_func_ret_type && strcmp(g_current_func_ret_type, "void") != 0)
+                    {
+                        fprintf(out, "    _misra_ret = ");
+                    }
+                    else
+                    {
+                        fprintf(out, "    ");
+                    }
+                }
+                else
+                {
+                    fprintf(out, "    return ");
+                }
+
+                if (node->ret.value && node->ret.value->type == NODE_EXPR_VAR &&
+                    ctx->self_is_pointer && strcmp(node->ret.value->var_ref.name, "self") == 0)
+                {
+                    // return self; -> return *self; (if returns by value)
+                    fprintf(out, "*");
+                }
+                else if (node->ret.value && node->ret.value->type == NODE_EXPR_UNARY &&
+                         strcmp(node->ret.value->unary.op, "&") == 0 &&
+                         node->ret.value->unary.operand->type == NODE_EXPR_VAR &&
+                         strcmp(node->ret.value->unary.operand->var_ref.name, "self") == 0)
+                {
+                    // return &self; -> return self; (since self is already a pointer in C)
+                    codegen_expression(ctx, node->ret.value->unary.operand, out);
+                    fprintf(out, ";\n");
+                    if (g_config.misra_mode)
+                    {
+                        fprintf(out, "    goto _misra_end_of_func;\n");
+                    }
+                    break;
+                }
+                if (node->ret.value)
+                {
+                    codegen_expression(ctx, node->ret.value, out);
+                }
                 fprintf(out, ";\n");
+                if (g_config.misra_mode)
+                {
+                    fprintf(out, "    goto _misra_end_of_func;\n");
+                }
             }
         }
         break;
@@ -1704,7 +2233,6 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
     }
     case NODE_REPL_PRINT:
     {
-        // Safe block for printing
         fprintf(out, "{ ");
         emit_auto_type(ctx, node->repl_print.expr, node->token, out);
         fprintf(out, " _zval = (");
@@ -1719,7 +2247,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
         int free_ret = 0;
         if (node->type_info)
         {
-            char *t = codegen_type_to_string(node->type_info);
+            char *t = type_to_c_string(node->type_info);
             if (t)
             {
                 ret_type = t;
@@ -1731,8 +2259,6 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
             ret_type = node->resolved_type;
         }
 
-        // Fallback: If type is still Async/void* (likely from Future type, not
-        // Result type), try to infer
         if (strcmp(ret_type, "Async") == 0 || strcmp(ret_type, "void*") == 0)
         {
             char *inf = infer_type(ctx, node);
@@ -1785,7 +2311,7 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
             {
                 if (needs_long_cast)
                 {
-                    fprintf(out, "(%s)(long)_r; })", ret_type);
+                    fprintf(out, "(%s)(uintptr_t)_r; })", ret_type);
                 }
                 else
                 {
@@ -1879,13 +2405,100 @@ void codegen_node_single(ParserContext *ctx, ASTNode *node, FILE *out)
         fprintf(out, ");\n");
         break;
     }
-    case NODE_RAW_STMT:
-        fprintf(out, "    %s\n", node->raw_stmt.content);
+    case NODE_PREPROC_DIRECTIVE:
+    {
+        fprintf(out, "%s\n", node->raw_stmt.content);
         break;
+    }
+    case NODE_RAW_STMT:
+    {
+        if (g_current_lambda)
+        {
+            Lexer l;
+            lexer_init(&l, node->raw_stmt.content);
+            Token t;
+            int last_pos = 0;
+            while ((t = lexer_next(&l)).type != TOK_EOF)
+            {
+                int current_tok_start = (int)(t.start - node->raw_stmt.content);
+                for (int i = last_pos; i < current_tok_start; i++)
+                {
+                    fputc(node->raw_stmt.content[i], out);
+                }
+
+                if (t.type == TOK_IDENT)
+                {
+                    char *name = token_strdup(t);
+                    int captured = -1;
+                    if (g_current_lambda->lambda.captured_vars)
+                    {
+                        for (int i = 0; i < g_current_lambda->lambda.num_captures; i++)
+                        {
+                            if (strcmp(name, g_current_lambda->lambda.captured_vars[i]) == 0)
+                            {
+                                captured = i;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (captured != -1)
+                    {
+                        if (g_current_lambda->lambda.capture_modes &&
+                            g_current_lambda->lambda.capture_modes[captured] == 1)
+                        {
+                            fprintf(out, "(*ctx->%s)", name);
+                        }
+                        else
+                        {
+                            fprintf(out, "ctx->%s", name);
+                        }
+                    }
+                    else
+                    {
+                        fprintf(out, "%.*s", t.len, t.start);
+                    }
+                    free(name);
+                }
+                else
+                {
+                    fprintf(out, "%.*s", t.len, t.start);
+                }
+                last_pos = current_tok_start + t.len;
+            }
+            fprintf(out, "%s\n", node->raw_stmt.content + last_pos);
+        }
+        else
+        {
+            fprintf(out, "    %s\n", node->raw_stmt.content);
+        }
+        break;
+    }
     default:
         codegen_expression(ctx, node, out);
         fprintf(out, ";\n");
-        break;
+        if (node->type == NODE_EXPR_CALL && node->call.callee && pending_closure_free_count > 0)
+        {
+            int is_thread_spawn = 0;
+            if (node->call.callee->type == NODE_EXPR_VAR && node->call.callee->var_ref.name &&
+                strstr(node->call.callee->var_ref.name, "Thread::spawn"))
+            {
+                is_thread_spawn = 1;
+            }
+            else if (node->call.callee->type == NODE_EXPR_MEMBER &&
+                     node->call.callee->member.target &&
+                     node->call.callee->member.target->type == NODE_EXPR_VAR &&
+                     strcmp(node->call.callee->member.target->var_ref.name, "Thread") == 0 &&
+                     strcmp(node->call.callee->member.field, "spawn") == 0)
+            {
+                is_thread_spawn = 1;
+            }
+            if (is_thread_spawn)
+            {
+                pending_closure_free_count = 0;
+            }
+        }
+        emit_pending_closure_frees(out);
     }
 }
 
@@ -1894,6 +2507,7 @@ void codegen_walker(ParserContext *ctx, ASTNode *node, FILE *out)
 {
     while (node)
     {
+        emit_source_mapping(node, out); // Step to this expression
         codegen_node_single(ctx, node, out);
         node = node->next;
     }

@@ -21,6 +21,7 @@ typedef enum
     PREC_COMPARISON, ///< Comparison operators.
     PREC_TERM,       ///< Addition and subtraction.
     PREC_FACTOR,     ///< Multiplication and division.
+    PREC_POWER,      ///< Exponentiation (**).
     PREC_UNARY,      ///< Unary operators.
     PREC_CALL,       ///< Function calls.
     PREC_PRIMARY     ///< Primary expressions.
@@ -33,43 +34,52 @@ struct MoveState;
 typedef struct ParserContext ParserContext;
 
 /**
+ * @brief Attributes for a declaration (e.g., @packed, @cfg).
+ */
+typedef struct DeclarationAttributes
+{
+    int is_packed;
+    int align;
+    char *cfg_condition;
+    int vector_size;
+    int cuda_global;
+    int cuda_device;
+    int cuda_host;
+    int is_pure;
+    int is_required;
+    int is_deprecated;
+    char *deprecated_msg;
+    int is_inline;
+    int is_noinline;
+    int is_noreturn;
+    int is_cold;
+    int is_hot;
+    int is_constructor;
+    int is_destructor;
+    int is_unused;
+    int is_weak;
+    int is_export;
+    int is_comptime;
+    char *section;
+    Attribute *custom_attributes;
+    char **derived_traits;
+    int derived_count;
+    char *link_name;
+} DeclarationAttributes;
+
+/**
+ * @brief Parses attributes (prefixed with @).
+ */
+DeclarationAttributes parse_attributes(ParserContext *ctx, Lexer *l);
+
+/**
  * @brief Parses a program.
  */
 ASTNode *parse_program(ParserContext *ctx, Lexer *l);
 
 extern ParserContext *g_parser_ctx;
 
-// Symbol table
-/**
- * @brief Represents a symbol in the symbol table.
- *
- * Used for variables, functions, and other named entities.
- */
-typedef struct ZenSymbol
-{
-    char *name;             ///< Symbol name.
-    char *type_name;        ///< String representation of the type.
-    Type *type_info;        ///< Formal type definition.
-    int is_used;            ///< 1 if the symbol has been referenced.
-    int is_autofree;        ///< 1 if it requires automatic memory management (RAII).
-    Token decl_token;       ///< Token where the symbol was declared.
-    int is_const_value;     ///< 1 if it is a compile-time constant.
-    int is_def;             ///< 1 if it is a definition (vs declaration).
-    int const_int_val;      ///< Integer value if it is a constant.
-    int is_moved;           ///< 1 if the value has been moved (ownership transfer).
-    struct ZenSymbol *next; ///< Next symbol in the bucket/list (chaining).
-} ZenSymbol;
-
-/**
- * @brief Represents a lexical scope (block).
- *
- * Scopes form a hierarchy (parent pointer) and contain a list of symbols defined in that scope.
- */
-typedef struct Scope
-{
-    ZenSymbol *symbols;   ///< Linked list of symbols in this scope.
-    struct Scope *parent; ///< Pointer to the parent scope (NULL for global).
-} Scope;
+#include "ast/symbols.h"
 
 /**
  * @brief Registry entry for a function signature.
@@ -86,7 +96,10 @@ typedef struct FuncSig
     Type *ret_type;       ///< Return type.
     int is_varargs;       ///< 1 if variadic.
     int is_async;         ///< 1 if async.
-    int must_use;         ///< 1 if return value must be used.
+    int required;         ///< 1 if return value must be used.
+    int is_pure;          ///< 1 if marked @pure.
+    char *link_name;      ///< Overriding C identifier (from @link_name).
+    int elide_from_idx;   ///< Index of parameter for lifetime elision (-1 if none)
     struct FuncSig *next; ///< Next function in registry.
 } FuncSig;
 
@@ -261,6 +274,7 @@ typedef struct TypeAlias
 {
     char *alias;         ///< New type name.
     char *original_type; ///< Original type.
+    Type *type_info;     ///< Parsed original type.
     struct TypeAlias *next;
     int is_opaque;
     char *defined_in_file;
@@ -274,12 +288,16 @@ typedef struct TypeAlias
  */
 struct ParserContext
 {
+    int recursion_depth;    ///< Guard against stack overflow.
+    Scope *global_scope;    ///< Root of the unified symbol table.
     Scope *current_scope;   ///< Current lexical scope for variable lookup.
-    FuncSig *func_registry; ///< Registry of declared function signatures.
+    FuncSig *func_registry; ///< Registry of declared function signatures (DEPRECATED: moved to
+                            ///< global_scope).
 
     // Lambdas
     LambdaRef *global_lambdas; ///< List of all lambdas generated during parsing.
     int lambda_counter;        ///< Counter for generating unique lambda IDs.
+    int fstring_counter;       ///< Counter for generating unique f-string IDs.
 
 // Generics
 #define MAX_KNOWN_GENERICS 1024
@@ -327,17 +345,21 @@ struct ParserContext
     DeprecatedFunc *deprecated_funcs; ///< Registry of deprecated functions.
 
     // LSP / Fault Tolerance
-    int is_fault_tolerant;     ///< 1 if parser should recover from errors (LSP mode).
-    void *error_callback_data; ///< User data for error callback.
+    int is_fault_tolerant; ///< 1 if parser should recover from errors (LSP mode).
+    int had_error; ///< Set by zpanic_at when fault-tolerant; checked by parser loops to bail out.
+    void *error_callback_data;                              ///< User data for error callback.
     void (*on_error)(void *data, Token t, const char *msg); ///< Callback for reporting errors.
+    void (*on_diagnostic)(void *data, Token t, int severity, const char *msg,
+                          int diag_id); ///< Unified diagnostic callback
 
     // LSP: Flat symbol list (persists after parsing for LSP queries)
     ZenSymbol *all_symbols; ///< comprehensive list of all symbols seen.
 
     // External C interop: suppress undefined warnings for external symbols
-    int has_external_includes; ///< Set when `#include <...>` is used.
-    char **extern_symbols;     ///< Explicitly declared extern symbols.
-    int extern_symbol_count;   ///< Count of external symbols.
+    int has_external_includes;
+    int is_comptime;         // Flag for comptime execution context
+    char **extern_symbols;   ///< Explicitly declared extern symbols.
+    int extern_symbol_count; ///< Count of external symbols.
 
     // Codegen state:
     FILE *hoist_out;    ///< File stream for hoisting code (e.g. from plugins).
@@ -354,6 +376,25 @@ struct ParserContext
     // Flow Analysis (Move Semantics)
     struct MoveState *move_state;
 };
+
+// Recursion Safety
+#define MAX_RECURSION_DEPTH 1024
+
+#define RECURSION_GUARD(ctx, l, ret)                                                               \
+    if (++((ctx)->recursion_depth) > MAX_RECURSION_DEPTH)                                          \
+    {                                                                                              \
+        zpanic_at(lexer_peek(l), "Recursion limit exceeded");                                      \
+        return ret;                                                                                \
+    }
+
+#define RECURSION_GUARD_TOKEN(ctx, tok, ret)                                                       \
+    if (++((ctx)->recursion_depth) > MAX_RECURSION_DEPTH)                                          \
+    {                                                                                              \
+        zpanic_at(tok, "Recursion limit exceeded");                                                \
+        return ret;                                                                                \
+    }
+
+#define RECURSION_EXIT(ctx) ((ctx)->recursion_depth)--
 
 typedef struct TypeUsage
 {
@@ -434,6 +475,11 @@ void warn_c_reserved_word(Token t, const char *name);
 /**
  * @brief Enters a new scope (pushes to scope stack).
  */
+/**
+ * @brief Checks if a character is valid in an identifier (isalnum or underscore).
+ */
+int is_ident_char(char c);
+
 void enter_scope(ParserContext *ctx);
 
 /**
@@ -444,13 +490,13 @@ void exit_scope(ParserContext *ctx);
 /**
  * @brief Adds a symbol to the current scope.
  */
-void add_symbol(ParserContext *ctx, const char *n, const char *t, Type *type_info);
+void add_symbol(ParserContext *ctx, const char *n, const char *t, Type *type_info, int is_export);
 
 /**
  * @brief Adds a symbol with definition token location.
  */
 void add_symbol_with_token(ParserContext *ctx, const char *n, const char *t, Type *type_info,
-                           Token tok);
+                           Token tok, int is_export);
 
 /**
  * @brief Finds a symbol's type information.
@@ -483,9 +529,9 @@ const char *normalize_type_name(const char *name);
 /**
  * @brief Registers a function.
  */
-void register_func(ParserContext *ctx, const char *name, int count, char **defaults,
-                   Type **arg_types, Type *ret_type, int is_varargs, int is_async,
-                   Token decl_token);
+void register_func(ParserContext *ctx, Scope *scope, const char *name, int count, char **defaults,
+                   Type **arg_types, Type *ret_type, int is_varargs, int is_async, int is_pure,
+                   const char *link_name, Token decl_token, int is_export);
 
 /**
  * @brief Registers a function template.
@@ -509,9 +555,20 @@ void register_generic(ParserContext *ctx, char *name);
 int is_known_generic(ParserContext *ctx, char *name);
 
 /**
+ * @brief Checks if a type name string depends on any known generic parameters.
+ * (e.g. "T*" returns 1 if T is a known generic).
+ */
+int is_generic_dependent_str(ParserContext *ctx, const char *type_str);
+
+/**
  * @brief Checks if a name is a primitive type.
  */
 int is_primitive_type_name(const char *name);
+
+/**
+ * @brief Maps a primitive type name string to its `TypeKind` enum.
+ */
+TypeKind get_primitive_type_kind(const char *name);
 
 /**
  * @brief Registers an implementation template.
@@ -544,14 +601,26 @@ void add_to_impl_list(ParserContext *ctx, ASTNode *node);
 void add_to_global_list(ParserContext *ctx, ASTNode *node);
 
 /**
+ * @brief Synchronizes linkage overrides across all type references in the AST.
+ */
+void sync_all_link_names(ParserContext *ctx, ASTNode *root);
+
+/**
  * @brief Registers built-in types and functions.
  */
 void register_builtins(ParserContext *ctx);
+void register_comptime_builtins(ParserContext *ctx);
 
 /**
  * @brief Adds an instantiated function to the list.
  */
 void add_instantiated_func(ParserContext *ctx, ASTNode *fn);
+int check_duplicate_variants(ASTNode *v1, ASTNode *v2);
+void append_to_gen(char **gen, size_t *cap, const char *s);
+void append_to_gen_fmt(char **gen, size_t *cap, const char *fmt, ...);
+char *process_printf_sugar(ParserContext *ctx, Token srctoken, const char *content, int newline,
+                           const char *target, char ***used_syms, int *count, int check_symbols,
+                           int is_raw, int is_expr);
 
 /**
  * @brief Instantiates a generic struct/function.
@@ -574,8 +643,9 @@ char *sanitize_mangled_name(const char *name);
  * @brief Registers a type alias.
  */
 TypeAlias *find_type_alias_node(ParserContext *ctx, const char *name);
-void register_type_alias(ParserContext *ctx, const char *alias, const char *original, int is_opaque,
-                         const char *defined_in_file);
+void register_type_alias(ParserContext *ctx, const char *alias, const char *original,
+                         Type *type_info, int is_opaque, const char *defined_in_file, Token tok,
+                         int is_export);
 
 /**
  * @brief Registers an implementation.
@@ -629,8 +699,12 @@ char *parse_and_convert_args(ParserContext *ctx, Lexer *l, char ***defaults_out,
 void scan_build_directives(struct ParserContext *ctx, const char *src);
 
 /**
+ * @brief Audit and potentially deprecate C-style preprocessor directives.
+ */
+void parser_audit_preprocessor(struct ParserContext *ctx, Token tok);
+
+/**
  * @brief Attempt to parse a #define macro as a constant integer.
- * Used for simple macros in headers to allow array sizes etc.
  */
 void try_parse_macro_const(struct ParserContext *ctx, const char *content);
 
@@ -681,8 +755,16 @@ void print_type_defs(ParserContext *ctx, FILE *out, ASTNode *nodes);
 // String manipulation
 
 /**
+ * @brief Extracts the inner content of a string literal token.
+ * Handles single-line, multi-line, f-string and raw string formats.
+ * caller must free the returned string.
+ */
+char *token_get_string_content(Token t);
+
+/**
  * @brief Replaces a substring in a string.
  */
+
 char *replace_in_string(const char *src, const char *old_w, const char *new_w);
 
 /**
@@ -707,12 +789,12 @@ char *extract_module_name(const char *path);
 /**
  * @brief Registers an enum variant.
  */
-void register_enum_variant(ParserContext *ctx, const char *ename, const char *vname, int tag);
+void register_enum_variant(ParserContext *ctx, const char *vname, const char *ename, int tag);
 
 /**
  * @brief Finds an enum variant.
  */
-EnumVariantReg *find_enum_variant(ParserContext *ctx, const char *vname);
+EnumVariantReg *find_enum_variant(ParserContext *ctx, const char *name);
 
 // Lambda helpers
 /**
@@ -741,6 +823,12 @@ void register_tuple(ParserContext *ctx, const char *sig);
  * @brief Finds a struct definition.
  */
 ASTNode *find_struct_def(ParserContext *ctx, const char *name);
+ASTNode *find_trait_def(ParserContext *ctx, const char *name);
+
+/**
+ * @brief Finds an already-registered concrete struct definition.
+ */
+ASTNode *find_concrete_struct_def(ParserContext *ctx, const char *name);
 
 /**
  * @brief Registers a struct definition.
@@ -844,6 +932,8 @@ Type *parse_type_base(ParserContext *ctx, Lexer *l);
  * @brief Parses an expression.
  */
 ASTNode *parse_expression(ParserContext *ctx, Lexer *l);
+ASTNode *parse_tuple_expression(ParserContext *ctx, Lexer *l, const char *type_name,
+                                ASTNode *first_elem);
 
 /**
  * @brief Parses an expression with minimum precedence.
@@ -889,6 +979,11 @@ ASTNode *parse_macro_call(ParserContext *ctx, Lexer *l, char *name);
  * @brief Parses a statement.
  */
 ASTNode *parse_statement(ParserContext *ctx, Lexer *l);
+
+/**
+ * @brief Normalizes raw block content (strips \r from CRLF sequences).
+ */
+char *normalize_raw_content(const char *content);
 
 /**
  * @brief Parses a block of statements { ... }.
@@ -943,8 +1038,7 @@ ASTNode *parse_return(ParserContext *ctx, Lexer *l);
 /**
  * @brief Processes a formatted string.
  */
-char *process_printf_sugar(ParserContext *ctx, const char *content, int newline, const char *target,
-                           char ***used_syms, int *count, int check_symbols);
+char *escape_c_string(const char *input);
 
 /**
  * @brief Parses an assert statement.
@@ -964,37 +1058,39 @@ ASTNode *parse_asm(ParserContext *ctx, Lexer *l);
 /**
  * @brief Parses a plugin statement.
  */
-ASTNode *parse_plugin(ParserContext *ctx, Lexer *l);
+ASTNode *parse_plugin(ParserContext *ctx, Lexer *l, Token tok);
 
 /**
  * @brief Parses a variable declaration.
  */
-ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l);
+ASTNode *parse_var_decl(ParserContext *ctx, Lexer *l, int is_export);
 
 /**
  * @brief Parses a def statement.
  */
-ASTNode *parse_def(ParserContext *ctx, Lexer *l);
+ASTNode *parse_def(ParserContext *ctx, Lexer *l, int is_export);
 
 /**
  * @brief Parses a type alias.
  */
-ASTNode *parse_type_alias(ParserContext *ctx, Lexer *l, int is_opaque);
+ASTNode *parse_type_alias(ParserContext *ctx, Lexer *l, int is_opaque, int is_export);
 
 /**
  * @brief Parses a function definition.
  */
-ASTNode *parse_function(ParserContext *ctx, Lexer *l, int is_async);
+ASTNode *parse_function(ParserContext *ctx, Lexer *l, int is_async, int is_extern,
+                        const char *link_name, int is_export);
 
 /**
- * @brief Parses a struct definition.
+ * @brief Parses a struct or union definition.
  */
-ASTNode *parse_struct(ParserContext *ctx, Lexer *l, int is_union, int is_opaque);
+ASTNode *parse_struct(ParserContext *ctx, Lexer *l, int is_union, int is_opaque, int is_extern,
+                      const char *link_name, int is_export);
 
 /**
  * @brief Parses an enum definition.
  */
-ASTNode *parse_enum(ParserContext *ctx, Lexer *l);
+ASTNode *parse_enum(ParserContext *ctx, Lexer *l, const char *link_name, int is_export);
 
 /**
  * @brief Parses a trait definition.
@@ -1010,6 +1106,12 @@ ASTNode *parse_impl(ParserContext *ctx, Lexer *l);
  * @brief Parses an implementation trait.
  */
 ASTNode *parse_impl_trait(ParserContext *ctx, Lexer *l);
+
+/**
+ * @brief Transforms an expression into a trait object (fat pointer).
+ */
+ASTNode *transform_to_trait_object(ParserContext *ctx, const char *target_trait,
+                                   ASTNode *source_expr);
 
 /**
  * @brief Parses a test definition.
@@ -1037,8 +1139,23 @@ ASTNode *parse_comptime(ParserContext *ctx, Lexer *l);
 char *patch_self_args(const char *args, const char *struct_name);
 
 /**
+ * @brief Checks if a token is a reserved keyword.
+ */
+int is_reserved_keyword(Token t);
+
+/**
+ * @brief Checks if an identifier is valid (not a keyword).
+ */
+void check_identifier(ParserContext *ctx, Token t);
+
+/**
  * @brief Main loop to parse top-level nodes in a file.
  */
 ASTNode *parse_program_nodes(ParserContext *ctx, Lexer *l);
+
+/**
+ * @brief Collapses triple or more underscores into a double underscore.
+ */
+char *merge_underscores(const char *name);
 
 #endif // PARSER_H

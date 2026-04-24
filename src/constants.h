@@ -1,13 +1,14 @@
-
 #ifndef ZEN_CONSTANTS_H
 #define ZEN_CONSTANTS_H
 
 // Buffer sizes
-#define MAX_TYPE_NAME_LEN 256    ///< Max length for type name strings.
-#define MAX_FUNC_NAME_LEN 512    ///< Max length for function names.
-#define MAX_ERROR_MSG_LEN 1024   ///< Max length for error messages.
-#define MAX_MANGLED_NAME_LEN 512 ///< Max length for mangled names (generics).
-#define MAX_PATH_LEN 4096        ///< Max length for file paths.
+#define MAX_TYPE_NAME_LEN 1024    ///< Max length for type name strings.
+#define MAX_VAR_NAME_LEN 256      ///< Max length for variable/parameter names.
+#define MAX_FUNC_NAME_LEN 1024    ///< Max length for function names.
+#define MAX_SHORT_MSG_LEN 256     ///< Max length for short diagnostic notes or hints.
+#define MAX_ERROR_MSG_LEN 2048    ///< Max length for full error messages.
+#define MAX_MANGLED_NAME_LEN 2048 ///< Max length for mangled names (generics).
+#define MAX_PATH_LEN 4096         ///< Max length for file paths.
 
 // Type checking helpers
 
@@ -93,9 +94,11 @@
     (IS_STRUCT_PREFIX(t) ? ((t) + 7) : (t)) ///< Returns ptr to name after "struct " prefix.
 
 // Generic type checks
-#define IS_OPTION_TYPE(t) ((t) && strncmp((t), "Option_", 7) == 0) ///< Checks if type is Option<T>.
-#define IS_RESULT_TYPE(t) ((t) && strncmp((t), "Result_", 7) == 0) ///< Checks if type is Result<T>.
-#define IS_VEC_TYPE(t) ((t) && strncmp((t), "Vec_", 4) == 0)       ///< Checks if type is Vec<T>.
-#define IS_SLICE_TYPE(t) ((t) && strncmp((t), "Slice_", 6) == 0)   ///< Checks if type is Slice<T>.
+#define IS_OPTION_TYPE(t)                                                                          \
+    ((t) && strncmp((t), "Option__", 8) == 0) ///< Checks if type is Option<T>.
+#define IS_RESULT_TYPE(t)                                                                          \
+    ((t) && strncmp((t), "Result__", 8) == 0)                     ///< Checks if type is Result<T>.
+#define IS_VEC_TYPE(t) ((t) && strncmp((t), "Vec__", 5) == 0)     ///< Checks if type is Vec<T>.
+#define IS_SLICE_TYPE(t) ((t) && strncmp((t), "Slice__", 7) == 0) ///< Checks if type is Slice<T>.
 
 #endif // ZEN_CONSTANTS_H

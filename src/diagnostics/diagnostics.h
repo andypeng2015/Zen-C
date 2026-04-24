@@ -7,6 +7,9 @@
 // Forward declaration
 struct ParserContext;
 
+extern int g_error_count;
+extern int g_warning_count;
+
 // ** Core Error Functions **
 
 /**
@@ -23,6 +26,7 @@ void zfatal(const char *fmt, ...);
  * @brief Fatal error with token location (exits unless fault-tolerant).
  */
 void zpanic_at(Token t, const char *fmt, ...);
+void zpanic_at_diag(int diag_id, Token t, const char *fmt, ...);
 
 /**
  * @brief Fatal error with suggestion (exits unless fault-tolerant).
@@ -61,11 +65,13 @@ void zwarn(const char *fmt, ...);
  * @brief Non-fatal warning with token location.
  */
 void zwarn_at(Token t, const char *fmt, ...);
+void zwarn_at_diag(int diag_id, Token t, const char *fmt, ...);
 
 /**
  * @brief Non-fatal warning with suggestion.
  */
 void zwarn_with_suggestion(Token t, const char *msg, const char *suggestion);
+void zwarn_with_suggestion_diag(int diag_id, Token t, const char *msg, const char *suggestion);
 
 // ** Specific Error Types **
 
@@ -93,5 +99,57 @@ void warn_array_bounds(Token t, int index, int size);
 void warn_format_string(Token t, int arg_num, const char *expected, const char *got);
 void warn_null_pointer(Token t, const char *expr);
 void warn_void_main(Token t);
+void warn_misra_violation(Token t, const char *msg);
+
+typedef enum
+{
+    CAT_NONE,
+    CAT_INTEROP,
+    CAT_PEDANTIC,
+    CAT_UNUSED,
+    CAT_STYLE,
+    CAT_TYPE,
+    CAT_SAFETY,
+    CAT_LOGIC,
+    CAT_CONVERSION
+} DiagnosticCategory;
+
+typedef enum
+{
+    DIAG_NONE,
+    // Interop
+    DIAG_INTEROP_UNDEF_FUNC, // W100
+    // Pedantic
+    DIAG_PEDANTIC_STRICT_TYPING, // W300
+    // Unused
+    DIAG_UNUSED_VAR,      // W200
+    DIAG_UNUSED_PARAM,    // W201
+    DIAG_STYLE_SHADOWING, // W700
+    // Safety
+    DIAG_SAFETY_NULL_PTR,         // W400
+    DIAG_SAFETY_DIV_ZERO,         // W401
+    DIAG_SAFETY_ARRAY_BOUNDS,     // W402
+    DIAG_SAFETY_INTEGER_OVERFLOW, // W403
+    // Logic
+    DIAG_LOGIC_UNREACHABLE,    // W500
+    DIAG_LOGIC_ALWAYS_TRUE,    // W501
+    DIAG_LOGIC_ALWAYS_FALSE,   // W502
+    DIAG_LOGIC_MISSING_RETURN, // W503
+    // Conversion
+    DIAG_CONVERSION_IMPLICIT,  // W600
+    DIAG_CONVERSION_NARROWING, // W601
+    // Style
+    DIAG_STYLE_FORMAT,           // W701
+    DIAG_STYLE_DEPRECATED_VAR,   // W702
+    DIAG_STYLE_DEPRECATED_CONST, // W703
+    // MISRA
+    DIAG_MISRA_VIOLATION,
+    // ...
+    DIAG_MAX
+} DiagnosticID;
+
+int is_diag_enabled(DiagnosticID id);
+void zwarn_diag(DiagnosticID id, Token t, const char *msg, const char *hint);
+int set_diag_by_name(const char *name, int enabled);
 
 #endif

@@ -1,6 +1,7 @@
 #include "json_rpc.h"
 #include "cJSON.h"
 #include "lsp_project.h"
+#include "lsp_formatter.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,7 @@ void lsp_references(const char *uri, int line, int col, int id);
 // Prototype
 void lsp_signature_help(const char *uri, int line, int col, int id);
 void lsp_rename(const char *uri, int line, int col, const char *new_name, int id);
+void lsp_code_action(const char *uri, cJSON *diagnostics, int id);
 
 // Helper to extract textDocument params
 static void get_params(cJSON *root, char **uri, int *line, int *col)
@@ -114,7 +116,7 @@ void handle_request(const char *json_str)
             "\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1},"
             "\"definitionProvider\":true,\"hoverProvider\":true,"
             "\"referencesProvider\":true,\"documentSymbolProvider\":true,"
-            "\"renameProvider\":true,"
+            "\"renameProvider\":true,\"codeActionProvider\":true,"
             "\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\"]},"
             "\"completionProvider\":{"
             "\"triggerCharacters\":[\".\"]},"
@@ -124,10 +126,15 @@ void handle_request(const char *json_str)
             "\"declaration\",\"definition\",\"readonly\","
             "\"static\",\"deprecated\",\"abstract\",\"async\",\"modification\",\"documentation\","
             "\"defaultLibrary\"]},\"full\":true}"
-            "}}}}}";
+            "}}}";
 
         // Dynamically construct response with correct ID
         cJSON *res_json = cJSON_Parse(response);
+        if (!res_json)
+        {
+            fprintf(stderr, "zls: Failed to construct initialize response\n");
+            return;
+        }
         cJSON_DeleteItemFromObject(res_json, "id");
         cJSON_AddNumberToObject(res_json, "id", id);
 
@@ -137,6 +144,10 @@ void handle_request(const char *json_str)
         free(str);
         cJSON_Delete(res_json);
         fflush(stdout);
+    }
+    else if (strcmp(method, "initialized") == 0)
+    {
+        lsp_project_index_workspace();
     }
     else if (strcmp(method, "textDocument/didOpen") == 0 ||
              strcmp(method, "textDocument/didChange") == 0)
@@ -226,10 +237,27 @@ void handle_request(const char *json_str)
     {
         char *uri = NULL;
         int line = 0, col = 0;
+        get_params(json, &uri, &line, &col);
         if (uri)
         {
             lsp_signature_help(uri, line, col, id);
             free(uri);
+        }
+    }
+    else if (strcmp(method, "textDocument/codeAction") == 0)
+    {
+        cJSON *params = cJSON_GetObjectItem(json, "params");
+        if (params)
+        {
+            cJSON *uri_obj = cJSON_GetObjectItem(params, "textDocument");
+            cJSON *uri = cJSON_GetObjectItem(uri_obj, "uri");
+            cJSON *context = cJSON_GetObjectItem(params, "context");
+            cJSON *diagnostics = cJSON_GetObjectItem(context, "diagnostics");
+
+            if (uri && diagnostics)
+            {
+                lsp_code_action(uri->valuestring, diagnostics, id);
+            }
         }
     }
     else if (strcmp(method, "textDocument/semanticTokens/full") == 0)
@@ -283,6 +311,87 @@ void handle_request(const char *json_str)
             lsp_rename(uri, line, col, new_name, id);
             free(uri);
         }
+    }
+    else if (strcmp(method, "textDocument/formatting") == 0)
+    {
+        cJSON *params = cJSON_GetObjectItem(json, "params");
+        cJSON *doc = cJSON_GetObjectItem(params, "textDocument");
+        if (doc)
+        {
+            cJSON *uri_item = cJSON_GetObjectItem(doc, "uri");
+            if (uri_item && uri_item->valuestring)
+            {
+                ProjectFile *pf = lsp_project_get_file(uri_item->valuestring);
+                if (pf && pf->source)
+                {
+                    char *formatted = lsp_format_source(pf->source);
+                    if (formatted)
+                    {
+                        cJSON *res_json = cJSON_CreateObject();
+                        cJSON_AddStringToObject(res_json, "jsonrpc", "2.0");
+                        cJSON_AddNumberToObject(res_json, "id", id);
+
+                        cJSON *result = cJSON_CreateArray();
+                        cJSON *edit = cJSON_CreateObject();
+
+                        // Replace whole document
+                        cJSON *range = cJSON_CreateObject();
+                        cJSON *start = cJSON_CreateObject();
+                        cJSON_AddNumberToObject(start, "line", 0);
+                        cJSON_AddNumberToObject(start, "character", 0);
+
+                        // Count lines in source
+                        int lines = 0;
+                        const char *p = pf->source;
+                        while (*p)
+                        {
+                            if (*p == '\n')
+                            {
+                                lines++;
+                            }
+                            p++;
+                        }
+
+                        cJSON *end = cJSON_CreateObject();
+                        cJSON_AddNumberToObject(end, "line", lines + 1);
+                        cJSON_AddNumberToObject(end, "character", 0);
+
+                        cJSON_AddItemToObject(range, "start", start);
+                        cJSON_AddItemToObject(range, "end", end);
+                        cJSON_AddItemToObject(edit, "range", range);
+                        cJSON_AddStringToObject(edit, "newText", formatted);
+
+                        cJSON_AddItemToArray(result, edit);
+                        cJSON_AddItemToObject(res_json, "result", result);
+
+                        char *str = cJSON_PrintUnformatted(res_json);
+                        fprintf(stdout, "Content-Length: %zu\r\n\r\n%s", strlen(str), str);
+                        fflush(stdout);
+                        free(str);
+                        cJSON_Delete(res_json);
+                        free(formatted);
+                    }
+                }
+            }
+        }
+    }
+    else if (strcmp(method, "shutdown") == 0)
+    {
+        cJSON *res_json = cJSON_CreateObject();
+        cJSON_AddStringToObject(res_json, "jsonrpc", "2.0");
+        cJSON_AddNumberToObject(res_json, "id", id);
+        cJSON_AddNullToObject(res_json, "result");
+
+        char *str = cJSON_PrintUnformatted(res_json);
+        fprintf(stdout, "Content-Length: %zu\r\n\r\n%s", strlen(str), str);
+        fflush(stdout);
+        free(str);
+        cJSON_Delete(res_json);
+    }
+    else if (strcmp(method, "exit") == 0)
+    {
+        // For notification, no ID. Just exit.
+        exit(0);
     }
 
     cJSON_Delete(json);

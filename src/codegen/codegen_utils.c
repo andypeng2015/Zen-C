@@ -1,8 +1,11 @@
 
 #include "../ast/ast.h"
+#include "../constants.h"
 #include "../parser/parser.h"
 #include "../zprep.h"
 #include "codegen.h"
+#include "../ast/primitives.h"
+#include <ctype.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +22,19 @@ ASTNode *g_current_lambda = NULL;
 int loop_defer_boundary[MAX_LOOP_DEPTH];
 int loop_depth = 0;
 int func_defer_boundary = 0;
+
+int pending_closure_frees[MAX_PENDING_CLOSURE_FREES];
+int pending_closure_free_count = 0;
+
+void emit_pending_closure_frees(FILE *out)
+{
+    for (int i = 0; i < pending_closure_free_count; i++)
+    {
+        fprintf(out, "free(_z_closure_ctx_stash[%d]); _z_closure_ctx_stash[%d] = NULL;\n",
+                pending_closure_frees[i], pending_closure_frees[i]);
+    }
+    pending_closure_free_count = 0;
+}
 
 // Strip template suffix from a type name (for example, "MyStruct<T>" -> "MyStruct")
 // Returns newly allocated string, caller must free.
@@ -38,6 +54,29 @@ char *strip_template_suffix(const char *name)
         return buf;
     }
     return xstrdup(name);
+}
+
+// Helper to emit a mangled name (Type__Method) with standardized underscores.
+void emit_mangled_name(ParserContext *ctx, FILE *out, const char *base, const char *method)
+{
+    if (!base || !method)
+    {
+        return;
+    }
+    char buf[MAX_ERROR_MSG_LEN];
+    snprintf(buf, sizeof(buf), "%s__%s", base, method);
+    char *merged = merge_underscores(buf);
+
+    ZenSymbol *sym = ctx ? find_symbol_in_all(ctx, merged) : NULL;
+    if (sym && sym->link_name)
+    {
+        fprintf(out, "%s", sym->link_name);
+    }
+    else
+    {
+        fprintf(out, "%s", merged);
+    }
+    free(merged);
 }
 
 // Helper to emit C declaration (handle arrays, function pointers correctly)
@@ -64,7 +103,7 @@ void emit_c_decl(ParserContext *ctx, FILE *out, const char *type_str, const char
     }
     else if (generic && (!bracket || generic < bracket))
     {
-        char mangled_candidate[256];
+        char mangled_candidate[MAX_MANGLED_NAME_LEN];
         char *gt = strchr(generic, '>');
         int success = 0;
 
@@ -76,10 +115,10 @@ void emit_c_decl(ParserContext *ctx, FILE *out, const char *type_str, const char
             // Limit check
             if (base_len + arg_len + 2 < 256)
             {
-                snprintf(mangled_candidate, 256, "%.*s_%.*s", base_len, type_str, arg_len,
+                snprintf(mangled_candidate, 256, "%.*s__%.*s", base_len, type_str, arg_len,
                          generic + 1);
 
-                if (find_struct_def_codegen(ctx, mangled_candidate))
+                if (find_struct_def(ctx, mangled_candidate))
                 {
                     fprintf(out, "%s %s", mangled_candidate, name);
                     success = 1;
@@ -91,6 +130,10 @@ void emit_c_decl(ParserContext *ctx, FILE *out, const char *type_str, const char
         {
             int base_len = generic - type_str;
             fprintf(out, "%.*s %s", base_len, type_str, name);
+        }
+        else if (gt[1] == '*')
+        {
+            fprintf(out, "*");
         }
 
         if (bracket)
@@ -115,50 +158,10 @@ void emit_var_decl_type(ParserContext *ctx, FILE *out, const char *type_str, con
     emit_c_decl(ctx, out, type_str, var_name);
 }
 
-// Find struct definition
-ASTNode *find_struct_def_codegen(ParserContext *ctx, const char *name)
-{
-    if (!name)
-    {
-        return NULL;
-    }
-    ASTNode *s = global_user_structs;
-    while (s)
-    {
-        if (s->type == NODE_STRUCT && strcmp(s->strct.name, name) == 0 && !s->strct.is_incomplete)
-        {
-            return s;
-        }
-        s = s->next;
-    }
-
-    // Check parsed structs list (imports)-
-    StructRef *sr = ctx->parsed_structs_list;
-    while (sr)
-    {
-        if (sr->node && sr->node->type == NODE_STRUCT && strcmp(sr->node->strct.name, name) == 0 &&
-            !sr->node->strct.is_incomplete)
-        {
-            return sr->node;
-        }
-        sr = sr->next;
-    }
-    s = ctx->instantiated_structs;
-    while (s)
-    {
-        if (s->type == NODE_STRUCT && strcmp(s->strct.name, name) == 0 && !s->strct.is_incomplete)
-        {
-            return s;
-        }
-        s = s->next;
-    }
-    return NULL;
-}
-
 // Get field type from struct.
 char *get_field_type_str(ParserContext *ctx, const char *struct_name, const char *field_name)
 {
-    char clean_name[256];
+    char clean_name[MAX_TYPE_NAME_LEN];
     strncpy(clean_name, struct_name, sizeof(clean_name) - 1);
     clean_name[sizeof(clean_name) - 1] = 0;
 
@@ -168,7 +171,7 @@ char *get_field_type_str(ParserContext *ctx, const char *struct_name, const char
         *ptr = 0;
     }
 
-    ASTNode *def = find_struct_def_codegen(ctx, clean_name);
+    ASTNode *def = find_struct_def(ctx, clean_name);
     if (!def)
     {
         return NULL;
@@ -189,13 +192,18 @@ char *get_field_type_str(ParserContext *ctx, const char *struct_name, const char
 // Type inference.
 char *infer_type(ParserContext *ctx, ASTNode *node)
 {
-    if (!node)
+    if (!node || !ctx)
     {
         return NULL;
     }
 
-    if (node->resolved_type && strcmp(node->resolved_type, "unknown") != 0 &&
-        strcmp(node->resolved_type, "void*") != 0)
+    if (node->type_info && node->type_info->kind != TYPE_UNKNOWN)
+    {
+        char *t = type_to_c_string(node->type_info);
+        return t;
+    }
+
+    if (node->resolved_type && strcmp(node->resolved_type, "unknown") != 0)
     {
         if (strcmp(node->resolved_type, "c_int") == 0)
         {
@@ -213,11 +221,11 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
         {
             return "unsigned long";
         }
-        if (strcmp(node->resolved_type, "c_long_long") == 0)
+        if (strcmp(node->resolved_type, "c_longlong") == 0)
         {
             return "long long";
         }
-        if (strcmp(node->resolved_type, "c_ulong_long") == 0)
+        if (strcmp(node->resolved_type, "c_ulonglong") == 0)
         {
             return "unsigned long long";
         }
@@ -245,7 +253,7 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
     {
         if (node->type_info)
         {
-            return type_to_string(node->type_info);
+            return type_to_c_string(node->type_info);
         }
         return NULL;
     }
@@ -261,7 +269,7 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
             }
             if (sym->type_info)
             {
-                return codegen_type_to_string(sym->type_info);
+                return type_to_c_string(sym->type_info);
             }
         }
     }
@@ -277,7 +285,7 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
                 {
                     if (sig->ret_type)
                     {
-                        char *inner = codegen_type_to_string(sig->ret_type);
+                        char *inner = type_to_c_string(sig->ret_type);
                         if (inner)
                         {
                             char *buf = xmalloc(strlen(inner) + 10);
@@ -289,18 +297,21 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
                 }
                 if (sig->ret_type)
                 {
-                    return codegen_type_to_string(sig->ret_type);
+                    return type_to_c_string(sig->ret_type);
                 }
             }
 
-            // Fallback for known stdlib memory functions.
+            // Fallback for known stdlib memory/file functions.
             if (strcmp(node->call.callee->var_ref.name, "malloc") == 0 ||
                 strcmp(node->call.callee->var_ref.name, "calloc") == 0 ||
-                strcmp(node->call.callee->var_ref.name, "realloc") == 0)
+                strcmp(node->call.callee->var_ref.name, "realloc") == 0 ||
+                strcmp(node->call.callee->var_ref.name, "fopen") == 0 ||
+                strcmp(node->call.callee->var_ref.name, "popen") == 0 ||
+                strcmp(node->call.callee->var_ref.name, "fdopen") == 0)
             {
                 return "void*";
             }
-            ASTNode *sdef = find_struct_def_codegen(ctx, node->call.callee->var_ref.name);
+            ASTNode *sdef = find_struct_def(ctx, node->call.callee->var_ref.name);
             if (sdef)
             {
                 return node->call.callee->var_ref.name;
@@ -312,8 +323,10 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
             char *target_type = infer_type(ctx, node->call.callee->member.target);
             if (target_type)
             {
-                char clean_type[256];
-                strcpy(clean_type, target_type);
+                char clean_type[MAX_TYPE_NAME_LEN];
+                snprintf(clean_type, sizeof(clean_type), "%s", target_type);
+
+                // Robustly strip all pointer levels for method lookup
                 char *ptr = strchr(clean_type, '*');
                 if (ptr)
                 {
@@ -326,14 +339,20 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
                     base += 7;
                 }
 
-                char func_name[512];
-                sprintf(func_name, "%s__%s", base, node->call.callee->member.field);
+                char func_base[MAX_MANGLED_NAME_LEN];
+                snprintf(func_base, sizeof(func_base), "%s__%s", base,
+                         node->call.callee->member.field);
+                char *func_name = merge_underscores(func_base);
 
                 FuncSig *sig = find_func(ctx, func_name);
+
                 if (sig && sig->ret_type)
                 {
-                    return codegen_type_to_string(sig->ret_type);
+                    char *ret = type_to_c_string(sig->ret_type);
+                    free(func_name);
+                    return ret;
                 }
+                free(func_name);
             }
         }
 
@@ -343,7 +362,7 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
             if (sym && sym->type_info && sym->type_info->kind == TYPE_FUNCTION &&
                 sym->type_info->inner)
             {
-                return type_to_string(sym->type_info->inner);
+                return type_to_c_string(sym->type_info->inner);
             }
         }
     }
@@ -376,7 +395,7 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
                 search_name += 7;
             }
 
-            ASTNode *def = find_struct_def_codegen(ctx, search_name);
+            ASTNode *def = find_struct_def(ctx, search_name);
             if (!def)
             {
                 // check enums list explicitly if not found in instantiated list
@@ -405,7 +424,7 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
                         {
                             if (var->variant.payload)
                             {
-                                return codegen_type_to_string(var->variant.payload);
+                                return type_to_c_string(var->variant.payload);
                             }
                             // Ok with no payload? Then it's void/u0.
                             return "void";
@@ -438,8 +457,8 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
             return NULL;
         }
 
-        char clean_name[256];
-        strcpy(clean_name, parent_type);
+        char clean_name[MAX_TYPE_NAME_LEN];
+        snprintf(clean_name, sizeof(clean_name), "%s", parent_type);
         char *ptr = strchr(clean_name, '*');
         if (ptr)
         {
@@ -516,9 +535,9 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
                 return buf;
             }
 
-            if (strncmp(array_type, "Slice_", 6) == 0)
+            if (strncmp(array_type, "Slice__", 7) == 0)
             {
-                return xstrdup(array_type + 6);
+                return xstrdup(array_type + 7);
             }
 
             char *search_name = array_type;
@@ -527,11 +546,11 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
                 search_name += 7;
             }
 
-            ASTNode *def = find_struct_def_codegen(ctx, search_name);
+            ASTNode *def = find_struct_def(ctx, search_name);
             if (def && def->type_info && def->type_info->kind == TYPE_VECTOR &&
                 def->type_info->inner)
             {
-                return type_to_string(def->type_info->inner);
+                return type_to_c_string(def->type_info->inner);
             }
         }
         return "int";
@@ -604,7 +623,7 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
             FuncSig *sig = find_func(ctx, node->unary.operand->call.callee->var_ref.name);
             if (sig && sig->ret_type)
             {
-                return codegen_type_to_string(sig->ret_type);
+                return type_to_c_string(sig->ret_type);
             }
         }
 
@@ -625,7 +644,7 @@ char *infer_type(ParserContext *ctx, ASTNode *node)
     {
         if (node->type_info)
         {
-            return type_to_string(node->type_info);
+            return type_to_c_string(node->type_info);
         }
         return NULL;
     }
@@ -766,7 +785,7 @@ void emit_auto_type(ParserContext *ctx, ASTNode *init_expr, Token t, FILE *out)
     }
     else
     {
-        if (strstr(g_config.cc, "tcc") && init_expr)
+        if (z_path_match_compiler(g_config.cc, "tcc") && init_expr)
         {
             fprintf(out, "__typeof__((");
             codegen_expression(ctx, init_expr, out);
@@ -778,13 +797,6 @@ void emit_auto_type(ParserContext *ctx, ASTNode *init_expr, Token t, FILE *out)
         }
     }
 }
-// C-compatible type stringifier for codegen.
-// Identical to type_to_string but strictly uses 'struct T' for structs to support
-// external/non-typedef'd types.
-char *codegen_type_to_string(Type *t)
-{
-    return type_to_c_string(t);
-}
 
 // Emit function signature using Type info for correct C codegen
 void emit_func_signature(ParserContext *ctx, FILE *out, ASTNode *func, const char *name_override)
@@ -792,6 +804,12 @@ void emit_func_signature(ParserContext *ctx, FILE *out, ASTNode *func, const cha
     if (!func || func->type != NODE_FUNCTION)
     {
         return;
+    }
+
+    // Emit MISRA static linkage
+    if (g_config.misra_mode && !func->func.is_export && strcmp(func->func.name, "main") != 0)
+    {
+        fprintf(out, "static ");
     }
 
     // Emit CUDA qualifiers (for both forward declarations and definitions)
@@ -811,36 +829,55 @@ void emit_func_signature(ParserContext *ctx, FILE *out, ASTNode *func, const cha
         }
     }
 
-    // Return type
-    char *ret_str;
-    if (func->func.ret_type_info)
-    {
-        ret_str = codegen_type_to_string(func->func.ret_type_info);
-    }
-    else if (func->func.ret_type)
-    {
-        ret_str = xstrdup(func->func.ret_type);
-    }
-    else
-    {
-        ret_str = xstrdup("void");
-    }
-
     char *ret_suffix = NULL;
-    char *fn_ptr = strstr(ret_str, "(*)");
 
-    if (fn_ptr)
+    // Return type
+    if (func->func.is_async)
     {
-        int prefix_len = fn_ptr - ret_str + 2; // Include "(*"
-        fprintf(out, "%.*s%s(", prefix_len, ret_str,
-                name_override ? name_override : func->func.name);
-        ret_suffix = fn_ptr + 2;
+        fprintf(out, "Async ");
     }
     else
     {
-        fprintf(out, "%s %s(", ret_str, name_override ? name_override : func->func.name);
+        char *ret_str;
+        if (func->func.ret_type_info)
+        {
+            ret_str = type_to_c_string(func->func.ret_type_info);
+        }
+        else if (func->func.ret_type)
+        {
+            ret_str = xstrdup(func->func.ret_type);
+        }
+        else
+        {
+            ret_str = xstrdup("void");
+        }
+
+        char *fn_ptr = strstr(ret_str, "(*)");
+
+        char *final_name = (func->link_name)
+                               ? func->link_name
+                               : (name_override ? (char *)name_override : func->func.name);
+
+        if (fn_ptr)
+        {
+            int prefix_len = fn_ptr - ret_str + 2; // Include "(*"
+            fprintf(out, "%.*s%s(", prefix_len, ret_str, final_name);
+            ret_suffix = xstrdup(fn_ptr + 2);
+        }
+        else
+        {
+            fprintf(out, "%s %s(", ret_str, final_name);
+        }
+        free(ret_str);
     }
-    free(ret_str);
+
+    if (func->func.is_async)
+    {
+        char *final_name = (func->link_name)
+                               ? func->link_name
+                               : (name_override ? (char *)name_override : func->func.name);
+        fprintf(out, "%s(", final_name);
+    }
 
     // Args
     if (func->func.arg_count == 0 && !func->func.is_varargs)
@@ -864,7 +901,7 @@ void emit_func_signature(ParserContext *ctx, FILE *out, ASTNode *func, const cha
             }
             else if (func->func.arg_types && func->func.arg_types[i])
             {
-                type_str = codegen_type_to_string(func->func.arg_types[i]);
+                type_str = type_to_c_string(func->func.arg_types[i]);
             }
             else
             {
@@ -896,10 +933,10 @@ void emit_func_signature(ParserContext *ctx, FILE *out, ASTNode *func, const cha
     if (ret_suffix)
     {
         fprintf(out, "%s", ret_suffix);
+        free(ret_suffix);
     }
 }
 
-// Invalidate a moved-from variable by zeroing it out to prevent double-free
 int emit_move_invalidation(ParserContext *ctx, ASTNode *node, FILE *out)
 {
     if (!node)
@@ -926,13 +963,58 @@ int emit_move_invalidation(ParserContext *ctx, ASTNode *node, FILE *out)
         def = find_struct_def(ctx, clean_type);
     }
 
-    if (def && def->type_info && def->type_info->traits.has_drop)
+    Type *t = node->type_info;
+    int has_drop = 0;
+    if (t)
+    {
+        if (t->kind == TYPE_FUNCTION)
+        {
+            has_drop = t->traits.has_drop && !t->is_raw;
+        }
+        else if (t->kind == TYPE_STRUCT || t->kind == TYPE_ENUM)
+        {
+            if (def && def->type_info)
+            {
+                has_drop = def->type_info->traits.has_drop;
+            }
+            else
+            {
+                has_drop = t->traits.has_drop;
+            }
+        }
+    }
+    else if (def && def->type_info)
+    {
+        has_drop = def->type_info->traits.has_drop;
+    }
+
+    if (has_drop)
     {
         if (node->type == NODE_EXPR_VAR)
         {
-            fprintf(out, "__z_drop_flag_%s = 0; ", node->var_ref.name);
-            fprintf(out, "memset(&%s, 0, sizeof(%s))", node->var_ref.name, node->var_ref.name);
-            return 1;
+            char *df_prefix = "";
+            if (g_current_lambda)
+            {
+                for (int i = 0; i < g_current_lambda->lambda.num_captures; i++)
+                {
+                    if (strcmp(node->var_ref.name, g_current_lambda->lambda.captured_vars[i]) == 0)
+                    {
+                        if (g_current_lambda->lambda.capture_modes &&
+                            g_current_lambda->lambda.capture_modes[i] == 0)
+                        {
+                            df_prefix = "ctx->";
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (strcmp(node->var_ref.name, "self") != 0)
+            {
+                fprintf(out, "%s__z_drop_flag_%s = 0", df_prefix, node->var_ref.name);
+                return 1;
+            }
+            return 0;
         }
         else if (node->type == NODE_EXPR_MEMBER)
         {
@@ -951,6 +1033,11 @@ int emit_move_invalidation(ParserContext *ctx, ASTNode *node, FILE *out)
 // Emits expression, wrapping it in a move-invalidation block if it's a consuming variable usage
 void codegen_expression_with_move(ParserContext *ctx, ASTNode *node, FILE *out)
 {
+    if (!node)
+    {
+        return;
+    }
+
     if (node && (node->type == NODE_EXPR_VAR || node->type == NODE_EXPR_MEMBER))
     {
         // Re-use infer logic to see if we need invalidation
@@ -966,15 +1053,51 @@ void codegen_expression_with_move(ParserContext *ctx, ASTNode *node, FILE *out)
             def = find_struct_def(ctx, clean_type);
         }
 
-        if (def && def->type_info && def->type_info->traits.has_drop)
+        Type *t = node->type_info;
+        int has_drop = 0;
+        if (t)
         {
-            fprintf(out, "({ __typeof__(");
-            codegen_expression(ctx, node, out);
-            fprintf(out, ") _mv = ");
-            codegen_expression(ctx, node, out);
-            fprintf(out, "; ");
-            emit_move_invalidation(ctx, node, out);
-            fprintf(out, "; _mv; })");
+            if (t->kind == TYPE_FUNCTION)
+            {
+                has_drop = t->traits.has_drop && !t->is_raw;
+            }
+            else if (t->kind == TYPE_STRUCT || t->kind == TYPE_ENUM)
+            {
+                if (def && def->type_info)
+                {
+                    has_drop = def->type_info->traits.has_drop;
+                }
+                else
+                {
+                    has_drop = t->traits.has_drop;
+                }
+            }
+        }
+        else if (def && def->type_info)
+        {
+            has_drop = def->type_info->traits.has_drop;
+        }
+
+        if (has_drop)
+        {
+            if (node->type == NODE_EXPR_VAR)
+            {
+                fprintf(out, "({ ");
+                emit_move_invalidation(ctx, node, out);
+                fprintf(out, "; ");
+                codegen_expression(ctx, node, out);
+                fprintf(out, "; })");
+            }
+            else
+            {
+                fprintf(out, "({ __typeof__(");
+                codegen_expression(ctx, node, out);
+                fprintf(out, ") _mv = ");
+                codegen_expression(ctx, node, out);
+                fprintf(out, "; ");
+                emit_move_invalidation(ctx, node, out);
+                fprintf(out, "; _mv; })");
+            }
             return;
         }
     }
@@ -983,22 +1106,40 @@ void codegen_expression_with_move(ParserContext *ctx, ASTNode *node, FILE *out)
 
 int is_struct_return_type(const char *ret_type)
 {
-    if (ret_type && strcmp(ret_type, "int") != 0 && strcmp(ret_type, "bool") != 0 &&
-        strcmp(ret_type, "char") != 0 && strcmp(ret_type, "float") != 0 &&
-        strcmp(ret_type, "double") != 0 && strcmp(ret_type, "long") != 0 &&
-        strcmp(ret_type, "usize") != 0 && strcmp(ret_type, "isize") != 0 &&
-        strcmp(ret_type, "byte") != 0 && strcmp(ret_type, "rune") != 0 &&
-        strcmp(ret_type, "size_t") != 0 && strcmp(ret_type, "ptrdiff_t") != 0 &&
-        strcmp(ret_type, "ssize_t") != 0 && strncmp(ret_type, "uint", 4) != 0 &&
-        strncmp(ret_type, "int", 3) != 0 && strncmp(ret_type, "i8", 2) != 0 &&
-        strncmp(ret_type, "u8", 2) != 0 && strncmp(ret_type, "i16", 3) != 0 &&
-        strncmp(ret_type, "u16", 3) != 0 && strncmp(ret_type, "i32", 3) != 0 &&
-        strncmp(ret_type, "u32", 3) != 0 && strncmp(ret_type, "i64", 3) != 0 &&
-        strncmp(ret_type, "u64", 3) != 0 && strncmp(ret_type, "f32", 3) != 0 &&
-        strncmp(ret_type, "f64", 3) != 0 && strncmp(ret_type, "i128", 4) != 0 &&
-        strncmp(ret_type, "u128", 4) != 0)
+    if (!ret_type)
     {
-        return 1;
+        return 0;
     }
-    return 0;
+
+    // Primitives from table (both Zen and C names)
+    if (find_primitive_by_name(ret_type) || find_primitive_by_c_name(ret_type))
+    {
+        return 0;
+    }
+
+    // C types that might be used directly
+    if (strcmp(ret_type, "size_t") == 0 || strcmp(ret_type, "ptrdiff_t") == 0 ||
+        strcmp(ret_type, "ssize_t") == 0 || strcmp(ret_type, "intptr_t") == 0 ||
+        strcmp(ret_type, "uintptr_t") == 0)
+    {
+        return 0;
+    }
+
+    // C23 BitInt Support (i42, u256, etc.)
+    if ((ret_type[0] == 'i' || ret_type[0] == 'u') && isdigit(ret_type[1]))
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+int z_is_struct_type(Type *t)
+{
+    if (!t)
+    {
+        return 0;
+    }
+    Type *base = get_inner_type(t);
+    return (base->kind == TYPE_STRUCT || base->kind == TYPE_ENUM);
 }

@@ -5,9 +5,6 @@
 #include <time.h>
 #include <unistd.h>
 
-// We keep it low by default.
-#define ZEN_PROBABILITY 10
-
 typedef struct
 {
     ZenTrigger trigger;
@@ -111,11 +108,17 @@ static void load_facts(void)
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
 
+    if (len < 0)
+    {
+        fclose(f);
+        return;
+    }
+
     char *data = malloc(len + 1);
     if (data)
     {
-        fread(data, 1, len, f);
-        data[len] = 0;
+        size_t read_bytes = fread(data, 1, len, f);
+        data[read_bytes] = 0;
     }
     fclose(f);
 
@@ -135,7 +138,15 @@ static void load_facts(void)
     if (cJSON_IsArray(json))
     {
         fact_count = cJSON_GetArraySize(json);
-        facts = calloc(fact_count, sizeof(ZenFact));
+        if (fact_count > 0)
+        {
+            facts = calloc(fact_count, sizeof(ZenFact));
+        }
+        if (!facts && fact_count > 0)
+        {
+            cJSON_Delete(json);
+            return;
+        }
 
         cJSON *item = NULL;
         int i = 0;
@@ -182,7 +193,7 @@ void zzen_at(Token t, const char *msg, const char *url)
                 g_current_filename ? g_current_filename : "unknown", t.line, t.col);
     }
 
-    if (t.start)
+    if (t.start && t.col > 0)
     {
         const char *line_start = t.start - (t.col - 1);
         const char *line_end = t.start;
@@ -190,7 +201,7 @@ void zzen_at(Token t, const char *msg, const char *url)
         {
             line_end++;
         }
-        int line_len = line_end - line_start;
+        int line_len = (int)(line_end - line_start);
 
         fprintf(stderr, COLOR_BLUE "   |\n" COLOR_RESET);
         fprintf(stderr, COLOR_BLUE "%-3d| " COLOR_RESET "%.*s\n", t.line, line_len, line_start);
@@ -210,7 +221,7 @@ void zzen_at(Token t, const char *msg, const char *url)
 
 int zen_trigger_at(ZenTrigger t, Token location)
 {
-    if (g_config.quiet || g_config.no_zen)
+    if (g_config.quiet || !g_config.zen_mode)
     {
         return 0;
     }
@@ -222,11 +233,6 @@ int zen_trigger_at(ZenTrigger t, Token location)
 
     extern int g_warning_count;
     if (g_warning_count > 0)
-    {
-        return 0;
-    }
-
-    if ((rand() % 100) >= ZEN_PROBABILITY)
     {
         return 0;
     }
@@ -270,7 +276,7 @@ int zen_trigger_at(ZenTrigger t, Token location)
 
 void zen_trigger_global(void)
 {
-    if (g_config.quiet || g_config.no_zen)
+    if (g_config.quiet || !g_config.zen_mode)
     {
         return;
     }
@@ -285,11 +291,6 @@ void zen_trigger_global(void)
 
     extern int g_warning_count;
     if (g_warning_count > 0)
-    {
-        return;
-    }
-
-    if ((rand() % 100) >= ZEN_PROBABILITY)
     {
         return;
     }

@@ -69,6 +69,7 @@ include_directories(
     ${PROJECT_SOURCE_DIR}/src/analysis
     ${PROJECT_SOURCE_DIR}/src/lsp
     ${PROJECT_SOURCE_DIR}/src/diagnostics
+    ${PROJECT_SOURCE_DIR}/std/third-party/tre/include
 )
 
 # Source files
@@ -83,25 +84,48 @@ set(SRCS
     src/parser/parser_type.c
     src/parser/parser_utils.c
     src/ast/ast.c
+    src/ast/primitives.c
+    src/ast/symbols.c
     src/codegen/codegen.c
     src/codegen/codegen_decl.c
     src/codegen/codegen_main.c
     src/codegen/codegen_utils.c
     src/codegen/codegen_stmt.c
     src/utils/utils.c
+    src/utils/colors.c
+    src/utils/cmd.c
+    src/utils/config.c
     src/lexer/token.c
     src/analysis/typecheck.c
+    src/analysis/move_check.c
+    src/analysis/const_fold.c
     src/lsp/cJSON.c
     src/lsp/json_rpc.c
     src/lsp/lsp_main.c
+    src/lsp/lsp_formatter.c
     src/lsp/lsp_project.c
     src/lsp/lsp_analysis.c
     src/lsp/lsp_index.c
     src/lsp/lsp_semantic.c
     src/zen/zen_facts.c
     src/repl/repl.c
-    src/repl/repl_os.c
+    src/platform/os.c
+    src/platform/console.c
+    src/platform/dylib.c
     src/plugins/plugin_manager.c
+    std/third-party/tre/lib/regcomp.c
+    std/third-party/tre/lib/regerror.c
+    std/third-party/tre/lib/regexec.c
+    std/third-party/tre/lib/tre-ast.c
+    std/third-party/tre/lib/tre-compile.c
+    std/third-party/tre/lib/tre-filter.c
+    std/third-party/tre/lib/tre-match-approx.c
+    std/third-party/tre/lib/tre-match-backtrack.c
+    std/third-party/tre/lib/tre-match-parallel.c
+    std/third-party/tre/lib/tre-mem.c
+    std/third-party/tre/lib/tre-parse.c
+    std/third-party/tre/lib/tre-stack.c
+    std/third-party/tre/lib/xmalloc.c
 )
 
 # Platform-specific library logic
@@ -134,27 +158,26 @@ if(NOT "${ZC_COMPILE_FLAGS}" STREQUAL "")
     target_compile_options(zc PRIVATE ${ZC_COMPILE_FLAGS})
 endif()
 
-# Build plugins as shared libraries
-set(PLUGIN_NAMES befunge brainfuck forth lisp regex sql)
+# Build plugins using our newly built zc compiler
+set(PLUGIN_NAMES befunge brainfuck forth lisp sql)
 foreach(plugin ${PLUGIN_NAMES})
-    add_library(${plugin}_plugin MODULE plugins/${plugin}.c)
+    set(PLUGIN_OUTPUT "${CMAKE_BINARY_DIR}/plugins/${plugin}${PLUGIN_EXT}")
     
-    # Plugins need to link against the same platform libs (especially for zc_compat symbols)
-    target_link_libraries(${plugin}_plugin PRIVATE ${PLATFORM_LIBS})
-    
-    set_target_properties(${plugin}_plugin PROPERTIES
-        OUTPUT_NAME ${plugin}
-        PREFIX ""
-        SUFFIX ${PLUGIN_EXT}
-        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins
+    add_custom_command(
+        OUTPUT "${PLUGIN_OUTPUT}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/plugins"
+        COMMAND $<TARGET_FILE:zc> build "${PROJECT_SOURCE_DIR}/plugins/${plugin}.zc" -shared -o "${PLUGIN_OUTPUT}"
+        DEPENDS zc "${PROJECT_SOURCE_DIR}/plugins/${plugin}.zc"
+        COMMENT "Building native plugin ${plugin}"
+        VERBATIM
     )
-    if(NOT "${SHARED_FLAGS}" STREQUAL "")
-        target_compile_options(${plugin}_plugin PRIVATE ${SHARED_FLAGS})
-    endif()
+    
+    add_custom_target(${plugin}_plugin ALL DEPENDS "${PLUGIN_OUTPUT}")
 endforeach()
 
 # --- Install Rules ---
 install(TARGETS zc DESTINATION bin)
+install(FILES std.zc DESTINATION share/zenc)
 install(DIRECTORY std DESTINATION share/zenc)
 install(FILES src/zen/facts.json DESTINATION share/zenc)
 install(FILES src/repl/docs.json DESTINATION share/zenc)

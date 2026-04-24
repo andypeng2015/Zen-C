@@ -17,10 +17,11 @@ typedef struct ASTNode ASTNode;
  */
 typedef enum
 {
-    LITERAL_INT = 0,    ///< Integer literal.
-    LITERAL_FLOAT = 1,  ///< Floating point literal.
-    LITERAL_STRING = 2, ///< String literal.
-    LITERAL_CHAR = 3    ///< Character literal.
+    LITERAL_INT = 0,       ///< Integer literal.
+    LITERAL_FLOAT = 1,     ///< Floating point literal.
+    LITERAL_STRING = 2,    ///< String literal.
+    LITERAL_CHAR = 3,      ///< Character literal.
+    LITERAL_RAW_STRING = 4 ///< Raw string literal.
 } LiteralKind;
 
 /**
@@ -53,28 +54,29 @@ typedef enum
     TYPE_RUNE,   ///< `rune`.
     TYPE_UINT,   ///< `uint` (alias).
     // Portable C Types (FFI)
-    TYPE_C_INT,        ///< `c_int` (int).
-    TYPE_C_UINT,       ///< `c_uint` (unsigned int).
-    TYPE_C_LONG,       ///< `c_long` (long).
-    TYPE_C_ULONG,      ///< `c_ulong` (unsigned long).
-    TYPE_C_LONG_LONG,  ///< `c_long_long` (long long).
-    TYPE_C_ULONG_LONG, ///< `c_ulong_long` (unsigned long long).
-    TYPE_C_SHORT,      ///< `c_short` (short).
-    TYPE_C_USHORT,     ///< `c_ushort` (unsigned short).
-    TYPE_C_CHAR,       ///< `c_char` (char).
-    TYPE_C_UCHAR,      ///< `c_uchar` (unsigned char).
+    TYPE_C_INT,       ///< `c_int` (int).
+    TYPE_C_UINT,      ///< `c_uint` (unsigned int).
+    TYPE_C_LONG,      ///< `c_long` (long).
+    TYPE_C_ULONG,     ///< `c_ulong` (unsigned long).
+    TYPE_C_LONGLONG,  ///< `c_longlong` (long long).
+    TYPE_C_ULONGLONG, ///< `c_ulonglong` (unsigned long long).
+    TYPE_C_SHORT,     ///< `c_short` (short).
+    TYPE_C_USHORT,    ///< `c_ushort` (unsigned short).
+    TYPE_C_CHAR,      ///< `c_char` (char).
+    TYPE_C_UCHAR,     ///< `c_uchar` (unsigned char).
 
-    TYPE_STRUCT,   ///< Struct type.
-    TYPE_ENUM,     ///< Enum type.
-    TYPE_POINTER,  ///< Pointer type (*).
-    TYPE_ARRAY,    ///< Fixed size array [N].
-    TYPE_VECTOR,   ///< SIMD vector type.
-    TYPE_FUNCTION, ///< Function pointer or reference.
-    TYPE_GENERIC,  ///< Generic type parameter (T).
-    TYPE_ALIAS,    ///< Opaque type alias.
-    TYPE_BITINT,   ///< C23 _BitInt(N).
-    TYPE_UBITINT,  ///< C23 unsigned _BitInt(N).
-    TYPE_UNKNOWN   ///< Unknown/unresolved type.
+    TYPE_STRUCT,     ///< Struct type.
+    TYPE_ENUM,       ///< Enum type.
+    TYPE_POINTER,    ///< Pointer type (*).
+    TYPE_ARRAY,      ///< Fixed size array [N].
+    TYPE_VECTOR,     ///< SIMD vector type.
+    TYPE_FUNCTION,   ///< Function pointer or reference.
+    TYPE_GENERIC,    ///< Generic type parameter (T).
+    TYPE_ALIAS,      ///< Opaque type alias.
+    TYPE_BITINT,     ///< C23 _BitInt(N).
+    TYPE_UBITINT,    ///< C23 unsigned _BitInt(N).
+    TYPE_UNSAFE_ANY, ///< Internal unsafe ANY type for match bindings.
+    TYPE_UNKNOWN     ///< Unknown/unresolved type.
 } TypeKind;
 
 /**
@@ -83,7 +85,9 @@ typedef enum
 typedef struct Type
 {
     TypeKind kind;          ///< The kind of type.
+    int lifetime_depth;     ///< Nesting depth of this type's lifetime (0 = static, >0 = local).
     char *name;             ///< Name of the type (for STRUCT, GENERIC, ENUM).
+    char *link_name;        ///< Optional linkage override (from @link_name).
     struct Type *inner;     ///< Inner type (for POINTER, ARRAY).
     struct Type **args;     ///< Generic arguments (for GENERIC instantiations).
     int arg_count;          ///< Count of generic arguments.
@@ -91,15 +95,15 @@ typedef struct Type
     int is_explicit_struct; ///< 1 if defined with "struct" keyword explicitly.
     int is_raw;             // Raw function pointer (fn*)
     int array_size;         ///< Size for fixed-size arrays. For TYPE_BITINT, this is the bit width.
+    struct
+    {
+        int has_drop;     ///< 1 if type implements Drop trait (RAII).
+        int has_iterable; ///< 1 if type implements Iterable trait.
+    } traits;
     union
     {
         int is_varargs;  ///< 1 if function type is variadic.
         int is_restrict; ///< 1 if pointer is restrict-qualified.
-        struct
-        {
-            int has_drop;     ///< 1 if type implements Drop trait (RAII).
-            int has_iterable; ///< 1 if type implements Iterable trait.
-        } traits;
         struct
         {
             int is_opaque_alias;
@@ -144,6 +148,7 @@ typedef enum
     NODE_EXPR_SIZEOF,        ///< Sizeof expression.
     NODE_EXPR_STRUCT_INIT,   ///< Struct initializer.
     NODE_EXPR_ARRAY_LITERAL, ///< Array literal.
+    NODE_EXPR_TUPLE_LITERAL, ///< Tuple literal.
     NODE_EXPR_SLICE,         ///< Slice operation.
     NODE_STRUCT,             ///< Struct definition.
     NODE_FIELD,              ///< Struct field.
@@ -175,6 +180,7 @@ typedef enum
     NODE_VA_END,             ///< va_end intrinsic.
     NODE_VA_COPY,            ///< va_copy intrinsic.
     NODE_VA_ARG,             ///< va_arg intrinsic.
+    NODE_PREPROC_DIRECTIVE,  ///< C-style preprocessor directive (#define, etc).
     NODE_AST_COMMENT         ///< Comment node.
 } NodeType;
 
@@ -202,6 +208,7 @@ struct ASTNode
     Token definition_token; // For LSP: Location where the symbol used in this
                             // node was defined.
     char *cfg_condition;    // C preprocessor condition from @cfg
+    char *link_name;        // Optional override for external C name
 
     union
     {
@@ -225,7 +232,7 @@ struct ASTNode
             Type *ret_type_info;
             int is_varargs;
             int is_inline;
-            int must_use; // @must_use: warn if return value is discarded.
+            int required; // @required: warn if return value is discarded.
             // GCC attributes
             int noinline;    // @noinline
             int constructor; // @constructor
@@ -246,6 +253,7 @@ struct ASTNode
             int cuda_host;   // @host -> __host__
 
             char **c_type_overrides; // @ctype("...") per parameter
+            int elide_from_idx;      // Index of parameter for lifetime elision (-1 if none)
 
             Attribute *attributes; // Custom attributes
         } func;
@@ -268,6 +276,8 @@ struct ASTNode
             Type *type_info;
             int is_autofree;
             int is_static;
+            int is_export;
+            int is_let; // Declared with 'let'
         } var_decl;
 
         struct
@@ -283,6 +293,7 @@ struct ASTNode
             ASTNode *variants;
             int is_template;
             char *generic_param;
+            int is_export;
         } enm;
 
         struct
@@ -291,6 +302,7 @@ struct ASTNode
             char *original_type;
             int is_opaque;
             char *defined_in_file;
+            int is_export;
         } type_alias;
 
         struct
@@ -324,6 +336,7 @@ struct ASTNode
             char *step;
             int is_inclusive;
             ASTNode *body;
+            char *loop_label;
         } for_range;
 
         struct
@@ -336,6 +349,7 @@ struct ASTNode
         {
             char *count;
             ASTNode *body;
+            char *loop_label;
         } repeat_stmt;
 
         struct
@@ -400,6 +414,7 @@ struct ASTNode
         {
             char *name;
             char *suggestion;
+            struct ZenSymbol *symbol;
         } var_ref;
 
         struct
@@ -421,6 +436,8 @@ struct ASTNode
         {
             ASTNode *array;
             ASTNode *index;
+            ASTNode *extra_indices; // Linked list of additional indices (for v[i, j, k])
+            int index_count;        // Total index count (1 for v[i], 2 for v[i,j], etc.)
         } index;
 
         struct
@@ -447,6 +464,12 @@ struct ASTNode
             ASTNode *elements;
             int count;
         } array_literal;
+
+        struct
+        {
+            ASTNode *elements;
+            int count;
+        } tuple_literal;
 
         struct
         {
@@ -530,6 +553,10 @@ struct ASTNode
         {
             char *plugin_name;
             char *body;
+            int start_line;
+            int start_col;
+            int end_line;
+            int end_col;
         } plugin_stmt;
 
         struct
@@ -558,6 +585,7 @@ struct ASTNode
         {
             char *code;
             int is_volatile;
+            int register_size; // The register size to use of 32/64/128 bits
             char **outputs;
             char **output_modes;
             char **inputs;
@@ -576,8 +604,10 @@ struct ASTNode
             int num_params;
             int lambda_id;
             int is_expression;
+            int is_bare; // 1 if should be emitted without void* ctx (for fn*)
             char **captured_vars;
             char **captured_types;
+            Type **captured_types_info;
             int num_captures;
             int *capture_modes;
             int default_capture_mode;
@@ -590,6 +620,8 @@ struct ASTNode
         {
             char *target_type;
             ASTNode *expr;
+            Type *target_type_info;
+            int is_type;
         } size_of;
 
         struct
@@ -675,11 +707,18 @@ void ast_free(ASTNode *node);
 Type *type_new(TypeKind kind);
 Type *type_new_ptr(Type *inner);
 Type *type_new_array(Type *inner, int size);
+Type *type_clone(Type *t);
 Type *type_new_vector(Type *inner, int size);
 int type_eq(Type *a, Type *b);
 int is_integer_type(Type *t);
+int is_incomplete_type(struct ParserContext *ctx, Type *t);
+int is_unsigned_type(Type *t);
+int is_signed_type(Type *t);
+int is_boolean_type(Type *t);
 int is_float_type(Type *t);
+int is_composite_expression(ASTNode *node);
 char *type_to_string(Type *t);
 char *type_to_c_string(Type *t);
+Type *get_inner_type(Type *t);
 
 #endif

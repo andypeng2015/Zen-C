@@ -1,6 +1,9 @@
 
 #include "parser.h"
+#include "constants.h"
 #include "zprep.h"
+#include "cmd.h"
+#include "platform/os.h"
 
 char *g_current_filename = "unknown";
 ParserContext *g_parser_ctx = NULL;
@@ -46,7 +49,8 @@ static void *arena_alloc_raw(size_t size)
 }
 
 #include <time.h>
-#include "../platform/os.h"
+#include "platform/arch.h"
+#include "platform/os.h"
 
 void *xmalloc(size_t size)
 {
@@ -82,7 +86,7 @@ char *xstrdup(const char *s)
 {
     if (!s)
     {
-        return NULL;
+        zfatal("xstrdup(NULL)");
     }
     size_t len = strlen(s);
     char *d = xmalloc(len + 1);
@@ -91,35 +95,176 @@ char *xstrdup(const char *s)
     return d;
 }
 
-char *load_file(const char *fn)
+char *merge_underscores(const char *name)
 {
-    FILE *f = fopen(fn, "rb");
-    if (!f)
+    if (!name)
     {
-        char *root = getenv("ZC_ROOT");
-        if (root)
-        {
-            char path[1024];
-            snprintf(path, sizeof(path), "%s/%s", root, fn);
-            f = fopen(path, "rb");
-        }
-    }
-    if (!f)
-    {
-        char path[1024];
-        snprintf(path, sizeof(path), "/usr/local/share/zenc/%s", fn);
-        f = fopen(path, "rb");
-    }
-    if (!f)
-    {
-        char path[1024];
-        snprintf(path, sizeof(path), "/usr/share/zenc/%s", fn);
-        f = fopen(path, "rb");
+        return NULL;
     }
 
+    size_t len = strlen(name);
+    char *res = xmalloc(len + 1);
+    char *out = res;
+    const char *in = name;
+
+    while (*in)
+    {
+        if (in[0] == '_' && in[1] == '_' && in[2] == '_')
+        {
+            // Triple or more underscores -> collapse to double
+            *out++ = '_';
+            *out++ = '_';
+            in += 3;
+            while (*in == '_')
+            {
+                in++;
+            }
+        }
+        else
+        {
+            *out++ = *in++;
+        }
+    }
+    *out = '\0';
+    return res;
+}
+
+char *sanitize_path_for_c_string(const char *path)
+{
+    if (!path)
+    {
+        return NULL;
+    }
+    char *sanitized = xstrdup(path);
+    for (int i = 0; sanitized[i]; i++)
+    {
+        if (sanitized[i] == '\\')
+        {
+            sanitized[i] = '/';
+        }
+    }
+    return sanitized;
+}
+
+char *z_resolve_path(const char *fn, const char *relative_to)
+{
+    if (!fn)
+    {
+        return NULL;
+    }
+
+    // 1. Absolute path
+    if (z_is_abs_path(fn))
+    {
+        if (access(fn, R_OK) == 0)
+        {
+            char *real = realpath(fn, NULL);
+            return real ? real : xstrdup(fn);
+        }
+        return NULL;
+    }
+
+    char path[MAX_PATH_LEN];
+
+    // 2. Relative to current file
+    if (relative_to)
+    {
+        char *dir = xstrdup(relative_to);
+        char *last_slash = z_path_last_sep(dir);
+        if (last_slash)
+        {
+            *last_slash = 0;
+            snprintf(path, sizeof(path), "%s/%s", dir, fn);
+            if (access(path, R_OK) == 0)
+            {
+                free(dir);
+                char *real = realpath(path, NULL);
+                return real ? real : xstrdup(path);
+            }
+        }
+        free(dir);
+    }
+
+    // 3. Current directory
+    if (access(fn, R_OK) == 0)
+    {
+        char *real = realpath(fn, NULL);
+        return real ? real : xstrdup(fn);
+    }
+
+    // 4. Include paths (-I)
+    for (int i = 0; i < g_config.include_path_count; i++)
+    {
+        snprintf(path, sizeof(path), "%s/%s", g_config.include_paths[i], fn);
+        if (access(path, R_OK) == 0)
+        {
+            char *real = realpath(path, NULL);
+            return real ? real : xstrdup(path);
+        }
+    }
+
+    // 5. Root path (ZC_ROOT)
+    if (g_config.root_path)
+    {
+        // Try with std/ prefix (for stdlib modules like "slice.zc")
+        snprintf(path, sizeof(path), "%s/std/%s", g_config.root_path, fn);
+        if (access(path, R_OK) == 0)
+        {
+            char *real = realpath(path, NULL);
+            return real ? real : xstrdup(path);
+        }
+
+        // Try as-is relative to root_path
+        snprintf(path, sizeof(path), "%s/%s", g_config.root_path, fn);
+        if (access(path, R_OK) == 0)
+        {
+            char *real = realpath(path, NULL);
+            return real ? real : xstrdup(path);
+        }
+    }
+
+    // 6. System paths
+#ifdef ZEN_SHARE_DIR
+    const char *system_paths[] = {ZEN_SHARE_DIR, "/usr/local/share/zenc", "/usr/share/zenc"};
+    int sys_count = 3;
+#else
+    const char *system_paths[] = {"/usr/local/share/zenc", "/usr/share/zenc"};
+    int sys_count = 2;
+#endif
+
+    for (int i = 0; i < sys_count; i++)
+    {
+        snprintf(path, sizeof(path), "%s/%s", system_paths[i], fn);
+        if (access(path, R_OK) == 0)
+        {
+            char *real = realpath(path, NULL);
+            return real ? real : xstrdup(path);
+        }
+
+        // Also try with std/ prefix in system paths
+        snprintf(path, sizeof(path), "%s/std/%s", system_paths[i], fn);
+        if (access(path, R_OK) == 0)
+        {
+            char *real = realpath(path, NULL);
+            return real ? real : xstrdup(path);
+        }
+    }
+
+    return NULL;
+}
+
+char *load_file(const char *fn)
+{
+    char *resolved = z_resolve_path(fn, g_current_filename);
+    if (!resolved)
+    {
+        return NULL;
+    }
+
+    FILE *f = fopen(resolved, "rb");
     if (!f)
     {
-        return 0;
+        return NULL;
     }
     fseek(f, 0, SEEK_END);
     long l = ftell(f);
@@ -135,48 +280,28 @@ char *load_file(const char *fn)
 char g_link_flags[MAX_FLAGS_SIZE] = "";
 char g_cflags[MAX_FLAGS_SIZE] = "";
 int g_warning_count = 0;
+int g_error_count = 0;
 CompilerConfig g_config = {0};
 
-static void append_flag(char *dest, size_t max_size, const char *flag)
+void append_flag(char *dest, size_t max_size, const char *prefix, const char *val)
 {
     size_t current_len = strlen(dest);
-    int has_space = strchr(flag, ' ') != NULL;
-    size_t flag_len = strlen(flag) + (has_space ? 2 : 0);
 
-    if (current_len > 0)
+    if (current_len > 0 && dest[current_len - 1] != ' ')
     {
-        if (current_len + flag_len + 2 >= max_size)
-        {
-            zwarn("Build flags buffer overflow prevented.");
-            return;
-        }
-        strcat(dest, " ");
-        if (has_space)
-        {
-            strcat(dest, "\"");
-        }
-        strcat(dest, flag);
-        if (has_space)
-        {
-            strcat(dest, "\"");
-        }
+        strncat(dest, " ", max_size - current_len - 1);
+        current_len++;
     }
-    else
+
+    if (prefix)
     {
-        if (flag_len + 1 >= max_size)
-        {
-            zwarn("Build flags buffer overflow prevented.");
-            return;
-        }
-        if (has_space)
-        {
-            strcat(dest, "\"");
-        }
-        strcat(dest, flag);
-        if (has_space)
-        {
-            strcat(dest, "\"");
-        }
+        strncat(dest, prefix, max_size - current_len - 1);
+        current_len = strlen(dest);
+    }
+
+    if (val)
+    {
+        strncat(dest, val, max_size - current_len - 1);
     }
 }
 
@@ -194,9 +319,9 @@ static void expand_env_vars(char *dest, size_t dest_size, const char *src)
             const char *end = strchr(s + 2, '}');
             if (end)
             {
-                char var_name[256];
+                char var_name[MAX_VAR_NAME_LEN];
                 int len = end - (s + 2);
-                if (len < 255)
+                if (len < MAX_VAR_NAME_LEN - 1)
                 {
                     strncpy(var_name, s + 2, len);
                     var_name[len] = 0;
@@ -206,7 +331,7 @@ static void expand_env_vars(char *dest, size_t dest_size, const char *src)
                         size_t val_len = strlen(val);
                         if (val_len < remaining)
                         {
-                            strcpy(d, val);
+                            strncpy(d, val, remaining);
                             d += val_len;
                             remaining -= val_len;
                             s = end + 1;
@@ -227,7 +352,7 @@ static int is_os_active(const char *os_name)
 {
     if (0 == strcmp(os_name, "linux"))
     {
-#ifdef __linux__
+#if ZC_OS_LINUX
         return 1;
 #else
         return 0;
@@ -235,7 +360,7 @@ static int is_os_active(const char *os_name)
     }
     else if (0 == strcmp(os_name, "windows"))
     {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
         return 1;
 #else
         return 0;
@@ -243,7 +368,7 @@ static int is_os_active(const char *os_name)
     }
     else if (0 == strcmp(os_name, "macos") || 0 == strcmp(os_name, "darwin"))
     {
-#ifdef __APPLE__
+#if ZC_OS_MACOS
         return 1;
 #else
         return 0;
@@ -261,7 +386,7 @@ void scan_build_directives(ParserContext *ctx, const char *src)
         if (p[0] == '/' && p[1] == '/' && p[2] == '>')
         {
             p += 3;
-            while (*p == ' ')
+            while (*p && isspace((unsigned char)*p) && *p != '\n')
             {
                 p++;
             }
@@ -283,9 +408,10 @@ void scan_build_directives(ParserContext *ctx, const char *src)
 
             // Strip trailing \r (Windows CRLF)
             int rlen = strlen(raw_line);
-            if (rlen > 0 && raw_line[rlen - 1] == '\r')
+            while (rlen > 0 && (raw_line[rlen - 1] == '\r' || raw_line[rlen - 1] == '\n' ||
+                                isspace((unsigned char)raw_line[rlen - 1])))
             {
-                raw_line[rlen - 1] = 0;
+                raw_line[--rlen] = 0;
             }
 
             char line[2048];
@@ -302,7 +428,7 @@ void scan_build_directives(ParserContext *ctx, const char *src)
                     if (is_os_active(line))
                     {
                         directive = colon + 1;
-                        while (*directive == ' ')
+                        while (*directive && isspace((unsigned char)*directive))
                         {
                             directive++;
                         }
@@ -326,80 +452,194 @@ void scan_build_directives(ParserContext *ctx, const char *src)
             if (0 == strncmp(directive, "link:", 5))
             {
                 directive_val = directive + 5;
-                while (*directive_val == ' ')
+                while (*directive_val && isspace((unsigned char)*directive_val))
                 {
                     directive_val++;
                 }
-                append_flag(g_link_flags, sizeof(g_link_flags), directive_val);
+                append_flag(g_link_flags, sizeof(g_link_flags), directive_val, NULL);
             }
             else if (0 == strncmp(directive, "cflags:", 7))
             {
                 directive_val = directive + 7;
-                while (*directive_val == ' ')
+                while (*directive_val && isspace((unsigned char)*directive_val))
                 {
                     directive_val++;
                 }
-                append_flag(g_cflags, sizeof(g_cflags), directive_val);
+                append_flag(g_cflags, sizeof(g_cflags), directive_val, NULL);
             }
             else if (0 == strncmp(directive, "include:", 8))
             {
                 directive_val = directive + 8;
-                while (*directive_val == ' ')
+                while (*directive_val && isspace((unsigned char)*directive_val))
                 {
                     directive_val++;
                 }
-                char flags[2048];
-                snprintf(flags, sizeof(flags), "-I%s", directive_val);
-                append_flag(g_cflags, sizeof(g_cflags), flags);
+
+                char *dp = directive_val;
+                while (*dp)
+                {
+                    while (*dp && isspace((unsigned char)*dp))
+                    {
+                        dp++;
+                    }
+                    if (!*dp)
+                    {
+                        break;
+                    }
+
+                    char path[MAX_PATH_LEN];
+                    char *d = path;
+                    while (*dp && !isspace((unsigned char)*dp))
+                    {
+                        if (d - path < 1023)
+                        {
+                            *d++ = *dp++;
+                        }
+                        else
+                        {
+                            dp++;
+                        }
+                    }
+                    *d = '\0';
+
+                    char flags[MAX_PATH_LEN + 32];
+                    snprintf(flags, sizeof(flags), "-I%s", path);
+                    append_flag(g_cflags, sizeof(g_cflags), flags, NULL);
+                }
             }
             else if (strncmp(directive, "lib:", 4) == 0)
             {
                 directive_val = directive + 4;
-                while (*directive_val == ' ')
+                while (*directive_val && isspace((unsigned char)*directive_val))
                 {
                     directive_val++;
                 }
-                char flags[2048];
-                snprintf(flags, sizeof(flags), "-L%s", directive_val);
-                append_flag(g_link_flags, sizeof(g_link_flags), flags);
+
+                char *dp = directive_val;
+                while (*dp)
+                {
+                    while (*dp && isspace((unsigned char)*dp))
+                    {
+                        dp++;
+                    }
+                    if (!*dp)
+                    {
+                        break;
+                    }
+
+                    char path[MAX_PATH_LEN];
+                    char *d = path;
+                    while (*dp && !isspace((unsigned char)*dp))
+                    {
+                        if (d - path < 1023)
+                        {
+                            *d++ = *dp++;
+                        }
+                        else
+                        {
+                            dp++;
+                        }
+                    }
+                    *d = '\0';
+
+                    char flags[MAX_PATH_LEN + 32];
+                    snprintf(flags, sizeof(flags), "-L%s", path);
+                    append_flag(g_link_flags, sizeof(g_link_flags), flags, NULL);
+                }
             }
             else if (strncmp(directive, "framework:", 10) == 0)
             {
                 directive_val = directive + 10;
-                while (*directive_val == ' ')
+                while (*directive_val && isspace((unsigned char)*directive_val))
                 {
                     directive_val++;
                 }
-                char flags[2048];
-                snprintf(flags, sizeof(flags), "-framework %s", directive_val);
-                append_flag(g_link_flags, sizeof(g_link_flags), flags);
+
+                char *dp = directive_val;
+                while (*dp)
+                {
+                    while (*dp && isspace((unsigned char)*dp))
+                    {
+                        dp++;
+                    }
+                    if (!*dp)
+                    {
+                        break;
+                    }
+
+                    char name[MAX_VAR_NAME_LEN];
+                    char *d = name;
+                    while (*dp && !isspace((unsigned char)*dp))
+                    {
+                        if (d - name < 255)
+                        {
+                            *d++ = *dp++;
+                        }
+                        else
+                        {
+                            dp++;
+                        }
+                    }
+                    *d = '\0';
+
+                    char flags[MAX_VAR_NAME_LEN + 32];
+                    snprintf(flags, sizeof(flags), "-framework %s", name);
+                    append_flag(g_link_flags, sizeof(g_link_flags), flags, NULL);
+                }
             }
             else if (strncmp(directive, "define:", 7) == 0)
             {
                 directive_val = directive + 7;
-                while (*directive_val == ' ')
+                while (*directive_val && isspace((unsigned char)*directive_val))
                 {
                     directive_val++;
                 }
-                char flags[2048];
-                snprintf(flags, sizeof(flags), "-D%s", directive_val);
-                append_flag(g_cflags, sizeof(g_cflags), flags);
 
-                if (g_config.cfg_define_count < 64)
+                char *dp = directive_val;
+                while (*dp)
                 {
-                    char *name = xstrdup(directive_val);
-                    char *eq = strchr(name, '=');
-                    if (eq)
+                    while (*dp && isspace((unsigned char)*dp))
                     {
-                        *eq = '\0';
+                        dp++;
                     }
-                    g_config.cfg_defines[g_config.cfg_define_count++] = name;
+                    if (!*dp)
+                    {
+                        break;
+                    }
+
+                    char def_val[MAX_ERROR_MSG_LEN];
+                    char *d = def_val;
+                    while (*dp && !isspace((unsigned char)*dp))
+                    {
+                        if (d - def_val < 1023)
+                        {
+                            *d++ = *dp++;
+                        }
+                        else
+                        {
+                            dp++;
+                        }
+                    }
+                    *d = '\0';
+
+                    append_flag(g_cflags, sizeof(g_cflags), "-D", def_val);
+
+                    if (g_config.cfg_define_count < 64)
+                    {
+                        char *name = xstrdup(def_val);
+                        char *eq = strchr(name, '=');
+                        if (eq)
+                        {
+                            *eq = '\0';
+                        }
+                        g_config.cfg_defines[g_config.cfg_define_count++] = name;
+                    }
                 }
             }
             else if (0 == strncmp(directive, "shell:", 6))
             {
                 directive_val = directive + 6;
-                while (*directive_val == ' ')
+                while (*directive_val && isspace((unsigned char)*directive_val))
                 {
                     directive_val++;
                 }
@@ -411,7 +651,7 @@ void scan_build_directives(ParserContext *ctx, const char *src)
             else if (strncmp(directive, "get:", 4) == 0)
             {
                 char *url = directive + 4;
-                while (*url == ' ')
+                while (*url && isspace((unsigned char)*url))
                 {
                     url++;
                 }
@@ -424,15 +664,24 @@ void scan_build_directives(ParserContext *ctx, const char *src)
             {
                 char *libs = directive + 11;
 
-                // Security check for malicious pkg-config commands containing bash injections
+                // Security check for malicious pkg-config commands containing shell injections.
+                // We only allow a strict whitelist of characters: alphanumeric, spaces, and safe
+                // non-alphanumeric. This prevents characters like ;, &, |, $, `, (, ), <, >, etc.
                 int is_safe = 1;
-                for (int i = 0; libs[i]; i++)
+                if (!libs || !*libs)
                 {
-                    if (!isalnum(libs[i]) && libs[i] != '-' && libs[i] != '_' && libs[i] != ' ' &&
-                        libs[i] != '.')
+                    is_safe = 0;
+                }
+                else
+                {
+                    for (int i = 0; libs[i]; i++)
                     {
-                        is_safe = 0;
-                        break;
+                        if (!isalnum((unsigned char)libs[i]) && libs[i] != '-' && libs[i] != '_' &&
+                            libs[i] != ' ' && libs[i] != '.' && libs[i] != '+')
+                        {
+                            is_safe = 0;
+                            break;
+                        }
                     }
                 }
 
@@ -444,40 +693,39 @@ void scan_build_directives(ParserContext *ctx, const char *src)
                 }
                 else
                 {
-                    char cmd[4096];
-                    snprintf(cmd, sizeof(cmd), "pkg-config --cflags %s", libs);
-                    FILE *fp = popen(cmd, "r");
-                    if (fp)
-                    {
-                        char buf[1024];
-                        if (fgets(buf, sizeof(buf), fp))
-                        {
-                            size_t l = strlen(buf);
-                            if (l > 0 && buf[l - 1] == '\n')
-                            {
-                                buf[l - 1] = 0;
-                            }
-                            append_flag(g_cflags, sizeof(g_cflags), buf);
-                        }
-                        pclose(fp);
-                    }
+                    ArgList args;
+                    arg_list_init(&args);
+                    arg_list_add(&args, "pkg-config");
+                    arg_list_add(&args, "--cflags");
+                    arg_list_add_from_string(&args, libs);
 
-                    snprintf(cmd, sizeof(cmd), "pkg-config --libs %s", libs);
-                    fp = popen(cmd, "r");
-                    if (fp)
+                    char buf[MAX_ERROR_MSG_LEN];
+                    if (z_run_command_capture(args.args, buf, sizeof(buf)) == 0)
                     {
-                        char buf[1024];
-                        if (fgets(buf, sizeof(buf), fp))
+                        size_t l = strlen(buf);
+                        if (l > 0 && buf[l - 1] == '\n')
                         {
-                            size_t l = strlen(buf);
-                            if (l > 0 && buf[l - 1] == '\n')
-                            {
-                                buf[l - 1] = 0;
-                            }
-                            append_flag(g_link_flags, sizeof(g_link_flags), buf);
+                            buf[l - 1] = 0;
                         }
-                        pclose(fp);
+                        append_flag(g_cflags, sizeof(g_cflags), buf, NULL);
                     }
+                    arg_list_free(&args);
+
+                    arg_list_init(&args);
+                    arg_list_add(&args, "pkg-config");
+                    arg_list_add(&args, "--libs");
+                    arg_list_add_from_string(&args, libs);
+
+                    if (z_run_command_capture(args.args, buf, sizeof(buf)) == 0)
+                    {
+                        size_t l = strlen(buf);
+                        if (l > 0 && buf[l - 1] == '\n')
+                        {
+                            buf[l - 1] = 0;
+                        }
+                        append_flag(g_link_flags, sizeof(g_link_flags), buf, NULL);
+                    }
+                    arg_list_free(&args);
                 }
             }
             else
@@ -511,15 +759,22 @@ int levenshtein(const char *s1, const char *s2)
         return 999;
     }
 
-    int matrix[len1 + 1][len2 + 1];
+    // Use a single-dimensional array to avoid VLA stack overflow
+    int *matrix = malloc((len1 + 1) * (len2 + 1) * sizeof(int));
+    if (!matrix)
+    {
+        return 999;
+    }
+
+#define MATRIX(i, j) matrix[(i) * (len2 + 1) + (j)]
 
     for (int i = 0; i <= len1; i++)
     {
-        matrix[i][0] = i;
+        MATRIX(i, 0) = i;
     }
     for (int j = 0; j <= len2; j++)
     {
-        matrix[0][j] = j;
+        MATRIX(0, j) = j;
     }
 
     for (int i = 1; i <= len1; i++)
@@ -527,17 +782,50 @@ int levenshtein(const char *s1, const char *s2)
         for (int j = 1; j <= len2; j++)
         {
             int cost = (s1[i - 1] == s2[j - 1]) ? 0 : 1;
-            int del = matrix[i - 1][j] + 1;
-            int ins = matrix[i][j - 1] + 1;
-            int sub = matrix[i - 1][j - 1] + cost;
+            int del = MATRIX(i - 1, j) + 1;
+            int ins = MATRIX(i, j - 1) + 1;
+            int sub = MATRIX(i - 1, j - 1) + cost;
 
-            matrix[i][j] = (del < ins) ? del : ins;
-            if (sub < matrix[i][j])
+            MATRIX(i, j) = (del < ins) ? del : ins;
+            if (sub < MATRIX(i, j))
             {
-                matrix[i][j] = sub;
+                MATRIX(i, j) = sub;
             }
         }
     }
 
-    return matrix[len1][len2];
+    int result = MATRIX(len1, len2);
+    free(matrix);
+    return result;
+}
+
+char *z_basename(const char *path)
+{
+    if (!path)
+    {
+        return NULL;
+    }
+    const char *last_slash = strrchr(path, '/');
+    const char *last_bslash = strrchr(path, '\\');
+    const char *last_sep = last_slash > last_bslash ? last_slash : last_bslash;
+    if (last_sep)
+    {
+        return xstrdup(last_sep + 1);
+    }
+    return xstrdup(path);
+}
+
+char *z_strip_ext(const char *filename)
+{
+    if (!filename)
+    {
+        return NULL;
+    }
+    char *res = xstrdup(filename);
+    char *last_dot = strrchr(res, '.');
+    if (last_dot)
+    {
+        *last_dot = '\0';
+    }
+    return res;
 }

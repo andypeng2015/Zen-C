@@ -69,7 +69,9 @@ typedef enum
     TOK_IMPL,       ///< 'impl' keyword.
     TOK_AND,        ///< 'and' keyword.
     TOK_OR,         ///< 'or' keyword.
+    TOK_NOT,        ///< 'not' keyword.
     TOK_FOR,        ///< 'for' keyword.
+    TOK_DO,         ///< 'do' keyword.
     TOK_COMPTIME,   ///< 'comptime' keyword.
     TOK_ELLIPSIS,   ///< ...
     TOK_UNION,      ///< 'union' keyword.
@@ -94,6 +96,7 @@ typedef struct
     int len;           ///< Length of the token text.
     int line;          ///< Line number (1-based).
     int col;           ///< Column number (1-based).
+    const char *file;  ///< Name of file with source code.
 } Token;
 
 /**
@@ -137,31 +140,57 @@ void register_trait(const char *name);
  * @brief Check if a name is a trait.
  */
 int is_trait(const char *name);
+int is_trait_ptr(const char *name);
 
 /**
  * @brief Allocate memory.
  */
-void *xmalloc(size_t size);
+void *xmalloc(size_t size) __attribute__((returns_nonnull));
 
 /**
  * @brief Reallocate memory.
  */
-void *xrealloc(void *ptr, size_t new_size);
+void *xrealloc(void *ptr, size_t new_size) __attribute__((returns_nonnull));
 
 /**
  * @brief Allocate and zero memory.
  */
-void *xcalloc(size_t n, size_t size);
+void *xcalloc(size_t n, size_t size) __attribute__((returns_nonnull));
 
 /**
  * @brief Duplicate a string.
  */
-char *xstrdup(const char *s);
+char *xstrdup(const char *s) __attribute__((returns_nonnull));
+
+/**
+ * @brief Resolve a source file path using include paths and root path.
+ */
+char *z_resolve_path(const char *filename, const char *relative_to);
 
 /**
  * @brief Load a file.
  */
 char *load_file(const char *filename);
+
+/**
+ * @brief Sanitize file path for C string literals (converts \ to /).
+ */
+char *sanitize_path_for_c_string(const char *path);
+
+/**
+ * @brief Get the basename of a path (strips director).
+ */
+char *z_basename(const char *path);
+
+/**
+ * @brief Strips the extension from a filename.
+ */
+char *z_strip_ext(const char *filename);
+
+/**
+ * @brief Appends a flag to a buffer with space handling and overflow protection.
+ */
+void append_flag(char *dest, size_t max_size, const char *prefix, const char *val);
 
 // ** Buffer Size Constants **
 #define MAX_FLAGS_SIZE 1024
@@ -202,20 +231,27 @@ typedef struct
 
     // Modes.
     int mode_run;        ///< 1 if 'run' command (compile & execute).
+    int mode_debug;      ///< 1 if `debug` command (emits source mappings and implies mode_run).
     int mode_check;      ///< 1 if 'check' command (syntax/type check only).
+    int mode_transpile;  ///< 1 if 'transpile' command (to C).
     int emit_c;          ///< 1 if --emit-c (keep generated C file).
     int verbose;         ///< 1 if --verbose.
     int quiet;           ///< 1 if --quiet.
-    int no_zen;          ///< 1 if --no-zen (disable zen facts/easter eggs).
+    int zen_mode;        ///< 1 if --zen (enable zen facts/easter eggs).
     int repl_mode;       ///< 1 if --repl (internal flag for REPL usage).
     int is_freestanding; ///< 1 if --freestanding (no stdlib).
-    int mode_transpile;  ///< 1 if 'transpile' command (to C).
     int use_cpp;         ///< 1 if --cpp (emit C++ compatible code).
     int use_cuda;        ///< 1 if --cuda (emit CUDA-compatible code).
     int use_objc;        ///< 1 if --objc (emit Objective-C compatible code).
     int mode_lsp;        ///< 1 if 'lsp' command (Language Server Protocol).
     int json_output;     ///< 1 if --json (emit structured JSON diagnostics).
-    int use_typecheck;   ///< 1 if --typecheck (enable manual semantic analysis).
+    int use_typecheck;   ///< 1 if --check (enable manual semantic analysis).
+    int warn_as_errors;  ///< 1 if --warn-errors or -Werror (treat Zen C warnings as errors).
+    int no_suppress_warnings; ///< 1 if --no-suppress-warnings (disable default C warning
+                              ///< suppressions).
+    int warn_pedantic;        ///< 1 if -Wpedantic or --pedantic (show extra diagnostics).
+    int misra_mode;           ///< 1 if --misra (emit MISRA C compliant code).
+    uint64_t diag_mask;       ///< Bitmask of enabled diagnostics.
 
     int keep_comments; ///< 1 if --keep-comments (preserve comments in output).
 
@@ -230,6 +266,13 @@ typedef struct
     // User-defined -D flags tracked for @cfg() evaluation.
     char *cfg_defines[64]; ///< Define names from -D flags.
     int cfg_define_count;  ///< Number of tracked -D defines.
+
+    // User-defined -I flags tracked for import resolution.
+    char *include_paths[64]; ///< Include paths for module resolution.
+    int include_path_count;  ///< Number of tracked -I paths.
+
+    char *root_path; ///< Detected Zen-C root directory.
+    char *input_dir; ///< Directory of the primary input file.
 } CompilerConfig;
 
 extern CompilerConfig g_config;

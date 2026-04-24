@@ -5,13 +5,12 @@ include <stdio.h>
 include <stdbool.h>
 include <stdarg.h>
 
-let __zen_hash_seed: usize = 14695981039346656037;
-
-extern fn exit(code: int);
-
-fn _zen_panic(file: const char*, line: int, func: const char*, msg: const char*) {
-    fprintf(stderr, "%s:%d (%s): Panic: %s\n", file, line, func, msg);
+fn __zenc_panic_impl(file: const char*, line: int, func: const char*, msg: const char*) {
+    fprintf(stderr, "panic: %s\n  at %s:%d in %s()\n", msg, file, line, func);
     exit(1);
 }
 
-#define panic(msg) _zen_panic(__FILE__, __LINE__, __func__, msg)
+fn __zenc_todo_impl(file: const char*, line: int, func: const char*, msg: const char*) {
+    fprintf(stderr, "todo: %s\n  at %s:%d in %s()\n", msg, file, line, func);
+    exit(1);
+}

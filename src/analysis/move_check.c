@@ -1,3 +1,4 @@
+#include "../constants.h"
 #include "move_check.h"
 #include "../diagnostics/diagnostics.h"
 #include <stdio.h>
@@ -57,9 +58,39 @@ void move_state_free(MoveState *state)
     free(state);
 }
 
-void mark_moved_in_state(MoveState *state, const char *name, Token t)
+char *get_node_path(ASTNode *node, int depth)
 {
-    if (!state)
+    if (!node || depth > 32)
+    {
+        return NULL;
+    }
+    RECURSION_GUARD_TOKEN(g_parser_ctx, node->token, NULL);
+
+    char *path = NULL;
+
+    if (node->type == NODE_EXPR_VAR)
+    {
+        path = xstrdup(node->var_ref.name);
+    }
+    else if (node->type == NODE_EXPR_MEMBER)
+    {
+        char *target_path = get_node_path(node->member.target, depth + 1);
+        if (target_path)
+        {
+            char buffer[MAX_ERROR_MSG_LEN];
+            snprintf(buffer, sizeof(buffer), "%s.%s", target_path, node->member.field);
+            free(target_path);
+            path = xstrdup(buffer);
+        }
+    }
+
+    RECURSION_EXIT(g_parser_ctx);
+    return path;
+}
+
+void mark_moved_in_state(MoveState *state, const char *path, Token t)
+{
+    if (!state || !path)
     {
         return;
     }
@@ -67,7 +98,7 @@ void mark_moved_in_state(MoveState *state, const char *name, Token t)
     MoveEntry *e = state->entries;
     while (e)
     {
-        if (strcmp(e->symbol_name, name) == 0)
+        if (strcmp(e->symbol_name, path) == 0)
         {
             e->status = MOVE_STATE_MOVED;
             e->moved_at = t;
@@ -77,22 +108,26 @@ void mark_moved_in_state(MoveState *state, const char *name, Token t)
     }
 
     MoveEntry *new_entry = xmalloc(sizeof(MoveEntry));
-    new_entry->symbol_name = xstrdup(name);
+    new_entry->symbol_name = xstrdup(path);
     new_entry->status = MOVE_STATE_MOVED;
     new_entry->moved_at = t;
     new_entry->next = state->entries;
     state->entries = new_entry;
 }
 
-MoveStatus get_move_status(MoveState *state, const char *name)
+MoveStatus get_move_status(MoveState *state, const char *path)
 {
+    if (!path)
+    {
+        return MOVE_STATE_VALID;
+    }
     MoveState *s = state;
     while (s)
     {
         MoveEntry *e = s->entries;
         while (e)
         {
-            if (strcmp(e->symbol_name, name) == 0)
+            if (strcmp(e->symbol_name, path) == 0)
             {
                 return e->status;
             }
@@ -143,78 +178,113 @@ void move_state_merge(MoveState *target, MoveState *a, MoveState *b)
     }
 }
 
+void move_state_merge_into(MoveState **target, MoveState *src)
+{
+    if (!src)
+    {
+        return;
+    }
+
+    if (!*target)
+    {
+        *target = move_state_clone(src);
+        return;
+    }
+
+    MoveEntry *e = src->entries;
+    while (e)
+    {
+        if (e->status == MOVE_STATE_MOVED)
+        {
+            mark_moved_in_state(*target, e->symbol_name, e->moved_at);
+        }
+        e = e->next;
+    }
+}
+
 int is_type_copy(ParserContext *ctx, Type *t)
 {
     if (!t)
     {
         return 1; // Default to Copy for unknown types
     }
+    RECURSION_GUARD_TOKEN(ctx, (Token){0}, 1);
 
-    switch (t->kind)
+    int result = 1;
+    if (t->traits.has_drop)
     {
-    case TYPE_INT:
-    case TYPE_I8:
-    case TYPE_I16:
-    case TYPE_I32:
-    case TYPE_I64:
-    case TYPE_U8:
-    case TYPE_U16:
-    case TYPE_U32:
-    case TYPE_U64:
-    case TYPE_F32:
-    case TYPE_F64:
-    case TYPE_BOOL:
-    case TYPE_CHAR:
-    case TYPE_VOID:
-    case TYPE_POINTER:
-    case TYPE_FUNCTION:
-    case TYPE_ENUM:
-    case TYPE_BITINT:
-    case TYPE_UBITINT:
-        return 1;
-
-    case TYPE_STRUCT:
-        if (check_impl(ctx, "Copy", t->name))
-        {
-            return 1;
-        }
-        if (!find_struct_def(ctx, t->name) && !check_impl(ctx, "Drop", t->name))
-        {
-            return 1;
-        }
-        return 0;
-
-    case TYPE_ARRAY:
-        return is_type_copy(ctx, t->inner);
-
-    case TYPE_ALIAS:
-        if (t->alias.is_opaque_alias)
-        {
-            return 1;
-        }
-        return is_type_copy(ctx, t->inner);
-
-    default:
-        return 1;
+        result = 0;
     }
-}
-
-static void tc_error_with_hints(TypeChecker *tc, Token t, const char *msg, const char *const *hints)
-{
-    if (tc)
+    else if (t->name && check_impl(ctx, "Drop", t->name))
     {
-        zerror_with_hints(t, msg, hints);
-        tc->error_count++;
+        result = 0;
     }
     else
     {
-        zpanic_with_hints(t, msg, hints);
+        switch (t->kind)
+        {
+        case TYPE_INT:
+        case TYPE_I8:
+        case TYPE_I16:
+        case TYPE_I32:
+        case TYPE_I64:
+        case TYPE_U8:
+        case TYPE_U16:
+        case TYPE_U32:
+        case TYPE_U64:
+        case TYPE_F32:
+        case TYPE_F64:
+        case TYPE_BOOL:
+        case TYPE_CHAR:
+        case TYPE_VOID:
+        case TYPE_POINTER:
+        case TYPE_FUNCTION:
+            result = 1;
+            break;
+        case TYPE_ENUM:
+        case TYPE_BITINT:
+        case TYPE_UBITINT:
+            result = 1;
+            break;
+        case TYPE_STRUCT:
+            if (check_impl(ctx, "Copy", t->name))
+            {
+                result = 1;
+            }
+            else if (check_impl(ctx, "Drop", t->name))
+            {
+                result = 0;
+            }
+            else
+            {
+                result = 1;
+            }
+            break;
+        case TYPE_ARRAY:
+            result = is_type_copy(ctx, t->inner);
+            break;
+        case TYPE_ALIAS:
+            if (t->alias.is_opaque_alias)
+            {
+                result = 1;
+            }
+            else
+            {
+                result = is_type_copy(ctx, t->inner);
+            }
+            break;
+        default:
+            result = 1;
+            break;
+        }
     }
+    RECURSION_EXIT(ctx);
+    return result;
 }
 
-void check_use_validity(TypeChecker *tc, ASTNode *var_node, ZenSymbol *sym)
+void check_path_validity(TypeChecker *tc, const char *path, Token t)
 {
-    if (!sym || !var_node)
+    if (!path)
     {
         return;
     }
@@ -225,59 +295,96 @@ void check_use_validity(TypeChecker *tc, ASTNode *var_node, ZenSymbol *sym)
 
     if (ctx && ctx->move_state)
     {
-        status = get_move_status(ctx->move_state, sym->name);
-    }
-    else
-    {
-        if (sym->is_moved)
-        {
-            status = MOVE_STATE_MOVED;
-        }
+        status = get_move_status(ctx->move_state, path);
     }
 
     if (status == MOVE_STATE_MOVED || status == MOVE_STATE_MAYBE_MOVED)
     {
-        char msg[256];
-        snprintf(msg, 255, "Use of moved value '%s'", sym->name);
+        if (tc && tc->in_loop_pass2)
+        {
+            if (t.line == 0)
+            {
+                return;
+            }
+            if (tc->loop_start_state)
+            {
+                MoveStatus start_status = get_move_status(tc->loop_start_state, path);
+                if (start_status == MOVE_STATE_MOVED || start_status == MOVE_STATE_MAYBE_MOVED)
+                {
+                    return;
+                }
+            }
+        }
+
+        char msg[MAX_ERROR_MSG_LEN];
+        snprintf(msg, 255, "Use of moved value '%s'", path);
 
         const char *hints[] = {"This type owns resources and cannot be implicitly copied",
                                "Consider using a reference ('&') to borrow the value instead",
                                NULL};
-        tc_error_with_hints(tc, var_node->token, msg, hints);
+        tc_move_error_with_hints(tc, t, msg, hints);
     }
 }
 
-void mark_symbol_moved(ParserContext *ctx, ZenSymbol *sym, ASTNode *context_node)
+void check_use_validity(TypeChecker *tc, ASTNode *use_node)
 {
-    if (!sym)
+    if (!use_node)
     {
         return;
     }
 
-    Type *t = sym->type_info;
+    char *path = get_node_path(use_node, 0);
+    if (!path && use_node->type == NODE_EXPR_VAR)
+    {
+        path = xstrdup(use_node->var_ref.name);
+    }
+
+    if (!path)
+    {
+        return;
+    }
+
+    check_path_validity(tc, path, use_node->token);
+    free(path);
+}
+
+void mark_symbol_moved(ParserContext *ctx, ZenSymbol *sym, ASTNode *context_node)
+{
+    if (!context_node)
+    {
+        return;
+    }
+
+    Type *t = context_node->type_info ? context_node->type_info : (sym ? sym->type_info : NULL);
     int copy = is_type_copy(ctx, t);
 
     if (t && ctx && !copy)
     {
-        // sym->is_moved = 1; // DISABLE GLOBAL FLAG to rely on flow state
-        // Keeping it for fallback if move_state is NULL?
-        // Better to migrate fully, but for safety in mixed steps:
-        if (!ctx->move_state)
+        if (sym)
         {
             sym->is_moved = 1;
         }
 
         if (ctx->move_state)
         {
-            Token loc = context_node ? context_node->token : (Token){0};
-            mark_moved_in_state(ctx->move_state, sym->name, loc);
+            char *path = get_node_path(context_node, 0);
+            if (!path && sym)
+            {
+                path = xstrdup(sym->name);
+            }
+
+            if (path)
+            {
+                mark_moved_in_state(ctx->move_state, path, context_node->token);
+                free(path);
+            }
         }
     }
 }
 
-void mark_valid_in_state(MoveState *state, const char *name, Token t)
+void mark_valid_in_state(MoveState *state, const char *path, Token t)
 {
-    if (!state)
+    if (!state || !path)
     {
         return;
     }
@@ -285,7 +392,7 @@ void mark_valid_in_state(MoveState *state, const char *name, Token t)
     MoveEntry *e = state->entries;
     while (e)
     {
-        if (strcmp(e->symbol_name, name) == 0)
+        if (strcmp(e->symbol_name, path) == 0)
         {
             e->status = MOVE_STATE_VALID;
             e->moved_at = t;
@@ -295,7 +402,7 @@ void mark_valid_in_state(MoveState *state, const char *name, Token t)
     }
 
     MoveEntry *new_entry = xmalloc(sizeof(MoveEntry));
-    new_entry->symbol_name = xstrdup(name);
+    new_entry->symbol_name = xstrdup(path);
     new_entry->status = MOVE_STATE_VALID;
     new_entry->moved_at = t;
     new_entry->next = state->entries;
@@ -307,10 +414,22 @@ void mark_symbol_valid(ParserContext *ctx, ZenSymbol *sym, ASTNode *context_node
     if (sym)
     {
         sym->is_moved = 0;
-        if (ctx && ctx->move_state)
+    }
+
+    if (ctx && ctx->move_state)
+    {
+        char *path = get_node_path(context_node, 0);
+        if (!path && sym)
         {
-            Token loc = context_node ? context_node->token : (Token){0};
-            mark_valid_in_state(ctx->move_state, sym->name, loc);
+            path = xstrdup(sym->name);
+        }
+
+        if (path)
+        {
+            mark_valid_in_state(ctx->move_state, path,
+                                context_node ? context_node->token
+                                             : (sym ? sym->decl_token : (Token){0}));
+            free(path);
         }
     }
 }

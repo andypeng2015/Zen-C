@@ -2,23 +2,22 @@
 #define ZC_PLATFORM_OS_H
 
 #include "lang.h"
+#include "arch.h"
 
 // OS Detection
 #ifdef __COSMOPOLITAN__
 #include <cosmo.h>
 #define z_is_windows() IsWindows()
 #else
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
 #define z_is_windows() 1
-#define ZC_OS_WINDOWS
 #else
 #define z_is_windows() 0
-#define ZC_OS_LINUX /* Assuming Linux/Unix */
 #endif
 #endif
 
 // System headers
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
 #include <windows.h>
 #include <direct.h>
 #include <io.h>
@@ -46,7 +45,7 @@ static inline int z_is_abs_path(const char *p)
     {
         return 1;
     }
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     if (p[0] == '\\' || (isalpha(p[0]) && p[1] == ':'))
     {
         return 1;
@@ -58,7 +57,7 @@ static inline int z_is_abs_path(const char *p)
 static inline char *z_path_last_sep(const char *path)
 {
     char *last_slash = strrchr(path, '/');
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     char *last_bs = strrchr(path, '\\');
     if (last_bs > last_slash)
     {
@@ -70,7 +69,7 @@ static inline char *z_path_last_sep(const char *path)
 
 static inline const char *z_get_exe_ext(void)
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     return ".exe";
 #else
     return ".bin";
@@ -79,7 +78,7 @@ static inline const char *z_get_exe_ext(void)
 
 static inline const char *z_get_null_redirect(void)
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     return " > NUL 2>&1";
 #else
     return " > /dev/null 2>&1";
@@ -88,7 +87,7 @@ static inline const char *z_get_null_redirect(void)
 
 static inline const char *z_get_comptime_link_flags(void)
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     return " std/third-party/tre/lib/*.c";
 #else
     return "";
@@ -97,7 +96,7 @@ static inline const char *z_get_comptime_link_flags(void)
 
 static inline const char *z_get_run_prefix(void)
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     return "";
 #else
     return "./";
@@ -106,7 +105,7 @@ static inline const char *z_get_run_prefix(void)
 
 static inline const char *z_get_plugin_ext(void)
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     return ".dll";
 #else
     return ".so";
@@ -165,10 +164,35 @@ const char *z_get_system_name(void);
 FILE *z_tmpfile(void);
 
 /**
+ * @brief Check if a compiler path/command matches a specific compiler family.
+ * @param path The compiler path or command string.
+ * @param compiler_name The name to match against (e.g. "gcc", "clang", "tcc", "emcc", "msvc").
+ * @return 1 if matched, 0 otherwise.
+ */
+int z_path_match_compiler(const char *path, const char *compiler_name);
+
+/**
+ * @brief Check if a path has a specific extension.
+ * @param path The path to check.
+ * @param ext The extension to look for (including the dot).
+ * @return 1 if matched, 0 otherwise.
+ */
+int z_path_has_extension(const char *path, const char *ext);
+
+/**
  * @brief Run a command securely without shell interpretation.
  * @param argv NULL-terminated array of arguments.
  * @return Exit code of the process.
  */
 int z_run_command(char *const argv[]);
+
+/**
+ * @brief Run a command securely and capture its stdout.
+ * @param argv NULL-terminated array of arguments.
+ * @param buffer Buffer to store output.
+ * @param size Size of the buffer.
+ * @return Exit code of the process, or -1 on error.
+ */
+int z_run_command_capture(char *const argv[], char *buffer, size_t size);
 
 #endif // ZC_PLATFORM_OS_H

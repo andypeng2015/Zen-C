@@ -1,5 +1,14 @@
 obj/
+obj-*/
+obj.ape/
+bin/
 zc
+zc.exe
+zc.com
+zc-boot.com
+zc-fuzz
+zc-fuzz-cmplog
+zc-asan
 result
 out.c
 a.out
@@ -8,6 +17,8 @@ a.out
 *.dll
 *.dylib
 *.a
+*.so.dSYM/
+*.dSYM/
 .vscode/
 .idea/
 *.swp
@@ -25,3 +36,11 @@ docs/latex/
 *.db
 build_dir_env.txt 
 build_dir_linux.txt
+fuzz/
+scratch/
+test_out_*.out.c
+trace.txt
+zc-*
+_tmp_comptime_*.c
+.github/workflows/fuzzing.yml
+tests/compiler/lsp/test_runner

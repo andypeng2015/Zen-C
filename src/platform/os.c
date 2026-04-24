@@ -5,7 +5,7 @@
 #include <string.h>
 #include <time.h>
 
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
 #include <windows.h>
 #include <io.h>
 #include <process.h>
@@ -13,11 +13,14 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/wait.h>
+#if ZC_OS_MACOS
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 void z_setup_terminal(void)
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     if (hOut == INVALID_HANDLE_VALUE)
     {
@@ -30,6 +33,7 @@ void z_setup_terminal(void)
     }
     dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     SetConsoleMode(hOut, dwMode);
+    SetConsoleOutputCP(CP_UTF8);
 
     HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
     if (hErr == INVALID_HANDLE_VALUE)
@@ -47,7 +51,7 @@ void z_setup_terminal(void)
 
 double z_get_monotonic_time(void)
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     static LARGE_INTEGER freq;
     static int init = 0;
     if (!init)
@@ -67,7 +71,7 @@ double z_get_monotonic_time(void)
 
 double z_get_time(void)
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
     ULARGE_INTEGER uli;
@@ -86,7 +90,7 @@ double z_get_time(void)
 
 const char *z_get_temp_dir(void)
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     static char tmp[MAX_PATH_SIZE] = {0};
     if (tmp[0])
     {
@@ -118,7 +122,7 @@ const char *z_get_temp_dir(void)
 
 int z_get_pid(void)
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     return _getpid();
 #else
     return getpid();
@@ -128,25 +132,38 @@ int z_get_pid(void)
 void z_get_executable_path(char *buffer, size_t size)
 {
     memset(buffer, 0, size);
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     GetModuleFileNameA(NULL, buffer, (DWORD)size);
-#elif defined(__linux__)
+#elif ZC_OS_LINUX
     ssize_t len = readlink("/proc/self/exe", buffer, size - 1);
     if (len != -1)
     {
         buffer[len] = '\0';
     }
-#elif defined(__APPLE__)
-    // _NSGetExecutablePath usually needs <mach-o/dyld.h>
-    // Fallback or leave empty
+#elif ZC_OS_MACOS
+    uint32_t buf_size = (uint32_t)size;
+    if (_NSGetExecutablePath(buffer, &buf_size) != 0)
+    {
+        // buffer was too small? or other error
+        memset(buffer, 0, size);
+    }
 #else
     // Fallback
 #endif
+
+    // Strip the executable filename to get the directory
+    char *last_slash = strrchr(buffer, '/');
+    char *last_bslash = strrchr(buffer, '\\');
+    char *last_sep = last_slash > last_bslash ? last_slash : last_bslash;
+    if (last_sep)
+    {
+        *last_sep = '\0';
+    }
 }
 
 int z_isatty(int fd)
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     return _isatty(fd);
 #else
     return isatty(fd);
@@ -162,7 +179,7 @@ int z_match_os(const char *os_name)
 
     if (0 == strcmp(os_name, "linux"))
     {
-#ifdef __linux__
+#if ZC_OS_LINUX
         return 1;
 #else
         return 0;
@@ -170,7 +187,7 @@ int z_match_os(const char *os_name)
     }
     else if (0 == strcmp(os_name, "windows"))
     {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
         return 1;
 #else
         return 0;
@@ -178,7 +195,7 @@ int z_match_os(const char *os_name)
     }
     else if (0 == strcmp(os_name, "macos") || 0 == strcmp(os_name, "darwin"))
     {
-#ifdef __APPLE__
+#if ZC_OS_MACOS
         return 1;
 #else
         return 0;
@@ -189,18 +206,69 @@ int z_match_os(const char *os_name)
 
 const char *z_get_system_name(void)
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     return "windows";
-#elif defined(__APPLE__)
+#elif ZC_OS_MACOS
     return "macos";
 #else
     return "linux";
 #endif
 }
 
+int z_path_match_compiler(const char *path, const char *compiler_name)
+{
+    if (!path || !compiler_name)
+    {
+        return 0;
+    }
+
+    // Handle "zig cc" and other space-separated command strings
+    // We check if the compiler name exists as a distinct word in the path/command.
+    const char *p = path;
+    size_t name_len = strlen(compiler_name);
+
+    while ((p = strstr(p, compiler_name)) != NULL)
+    {
+        // Verify it's a "whole word" match or at least at a boundary
+        // Start boundary: beginning of string, or space, or slash
+        int start_ok =
+            (p == path || isspace((unsigned char)p[-1]) || p[-1] == '/' || p[-1] == '\\');
+
+        // End boundary: end of string, or space, or '.' (for extensions like .exe)
+        int end_ok = (p[name_len] == '\0' || isspace((unsigned char)p[name_len]) ||
+                      p[name_len] == '.' || p[name_len] == '-' || p[name_len] == '_');
+
+        if (start_ok && end_ok)
+        {
+            return 1;
+        }
+        p += name_len;
+    }
+
+    return 0;
+}
+
+int z_path_has_extension(const char *path, const char *ext)
+{
+    if (!path || !ext)
+    {
+        return 0;
+    }
+
+    size_t path_len = strlen(path);
+    size_t ext_len = strlen(ext);
+
+    if (path_len < ext_len)
+    {
+        return 0;
+    }
+
+    return strcmp(path + path_len - ext_len, ext) == 0;
+}
+
 FILE *z_tmpfile(void)
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     char temp_path[MAX_PATH_SIZE];
     char temp_file[MAX_PATH_SIZE];
 
@@ -241,35 +309,56 @@ FILE *z_tmpfile(void)
 #endif
 }
 
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
 static char *quote_arg(const char *arg)
 {
     if (!strpbrk(arg, " \t\n\v\""))
     {
-        return strdup(arg);
+        return strdup(arg); // use strdup since we free it later directly, or xstrdup
     }
 
     size_t len = strlen(arg);
-    size_t new_len = len + 3;
-    for (size_t i = 0; i < len; i++)
+    char *result = malloc(len * 2 + 3);
+    char *p = result;
+    *p++ = '\"';
+
+    for (size_t i = 0; i < len;)
     {
-        if (arg[i] == '\"')
+        int num_backslashes = 0;
+        while (i < len && arg[i] == '\\')
         {
-            new_len++;
+            num_backslashes++;
+            i++;
+        }
+
+        if (i == len)
+        {
+            for (int k = 0; k < num_backslashes * 2; k++)
+            {
+                *p++ = '\\';
+            }
+            break;
+        }
+        else if (arg[i] == '\"')
+        {
+            for (int k = 0; k < num_backslashes * 2 + 1; k++)
+            {
+                *p++ = '\\';
+            }
+            *p++ = '\"';
+            i++;
+        }
+        else
+        {
+            for (int k = 0; k < num_backslashes; k++)
+            {
+                *p++ = '\\';
+            }
+            *p++ = arg[i];
+            i++;
         }
     }
 
-    char *result = malloc(new_len);
-    char *p = result;
-    *p++ = '\"';
-    for (size_t i = 0; i < len; i++)
-    {
-        if (arg[i] == '\"')
-        {
-            *p++ = '\\';
-        }
-        *p++ = arg[i];
-    }
     *p++ = '\"';
     *p = '\0';
     return result;
@@ -278,7 +367,7 @@ static char *quote_arg(const char *arg)
 
 int z_run_command(char *const argv[])
 {
-#ifdef _WIN32
+#if ZC_OS_WINDOWS
     size_t cmd_len = 0;
     for (int i = 0; argv[i]; i++)
     {
@@ -333,6 +422,130 @@ int z_run_command(char *const argv[])
     }
     else
     {
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status))
+        {
+            return WEXITSTATUS(status);
+        }
+        return -1;
+    }
+#endif
+}
+
+#if !ZC_OS_WINDOWS
+#include <sys/wait.h>
+#endif
+
+int z_run_command_capture(char *const argv[], char *buffer, size_t size)
+{
+#if ZC_OS_WINDOWS
+    HANDLE hReadPipe, hWritePipe;
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0))
+    {
+        return -1;
+    }
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    size_t cmd_len = 0;
+    for (int i = 0; argv[i]; i++)
+    {
+        char *q = quote_arg(argv[i]);
+        cmd_len += strlen(q) + 1;
+        free(q);
+    }
+
+    char *cmd_line = malloc(cmd_len + 1);
+    cmd_line[0] = '\0';
+    for (int i = 0; argv[i]; i++)
+    {
+        char *q = quote_arg(argv[i]);
+        strcat(cmd_line, q);
+        if (argv[i + 1])
+        {
+            strcat(cmd_line, " ");
+        }
+        free(q);
+    }
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.hStdOutput = hWritePipe;
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (!CreateProcessA(NULL, cmd_line, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
+    {
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+        free(cmd_line);
+        return -1;
+    }
+
+    CloseHandle(hWritePipe);
+
+    DWORD bytesRead;
+    if (ReadFile(hReadPipe, buffer, (DWORD)size - 1, &bytesRead, NULL))
+    {
+        buffer[bytesRead] = '\0';
+    }
+    else
+    {
+        buffer[0] = '\0';
+    }
+
+    CloseHandle(hReadPipe);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exit_code;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    free(cmd_line);
+    return (int)exit_code;
+#else
+    int pipefd[2];
+    if (pipe(pipefd) == -1)
+    {
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0)
+    {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        execvp(argv[0], argv);
+        exit(127);
+    }
+    else if (pid < 0)
+    {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+    else
+    {
+        close(pipefd[1]);
+        ssize_t n = read(pipefd[0], buffer, size - 1);
+        if (n >= 0)
+        {
+            buffer[n] = '\0';
+        }
+        else
+        {
+            buffer[0] = '\0';
+        }
+        close(pipefd[0]);
+
         int status;
         waitpid(pid, &status, 0);
         if (WIFEXITED(status))

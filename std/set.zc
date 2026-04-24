@@ -1,19 +1,8 @@
 
-import "./core.zc"
 import "./option.zc"
+import "./hash.zc"
 
-// Pure Zen-C generic hash using FNV-1a algorithm
-fn _set_hash(data: const void*, len: usize) -> usize {
-    let hash = __zen_hash_seed;
-    let bytes: U8* = (U8*)data;
-    
-    for (let i: usize = 0; i < len; i = i + 1) {
-        hash = hash ^ (usize)bytes[i];
-        hash = hash * (usize)1099511628211;
-    }
-    
-    return hash;
-}
+import "./mem.zc"
 
 struct Set<T> {
     data: T*;
@@ -35,9 +24,12 @@ impl Set<T> {
         let old_cap = self.cap;
 
         self.cap = new_cap;
-        self.data = calloc(new_cap, sizeof(T));
-        self.occupied = calloc(new_cap, sizeof(bool));
-        self.deleted = calloc(new_cap, sizeof(bool));
+        self.data = alloc_n<T>(new_cap);
+        self.occupied = alloc_n<bool>(new_cap);
+        self.deleted = alloc_n<bool>(new_cap);
+        memset(self.data, 0, new_cap * sizeof(T));
+        memset(self.occupied, 0, new_cap * sizeof(bool));
+        memset(self.deleted, 0, new_cap * sizeof(bool));
         self.len = 0;
 
         for (let i: usize = 0; i < old_cap; i = i + 1) {
@@ -46,9 +38,9 @@ impl Set<T> {
             }
         }
 
-        if (old_data != NULL) { free(old_data); }
-        if (old_occupied != NULL) { free(old_occupied); }
-        if (old_deleted != NULL) { free(old_deleted); }
+        if (old_data != NULL) { dealloc<T>(old_data); }
+        if (old_occupied != NULL) { dealloc<bool>(old_occupied); }
+        if (old_deleted != NULL) { dealloc<bool>(old_deleted); }
     }
 
     fn add(self, val: T) -> bool {
@@ -62,7 +54,7 @@ impl Set<T> {
             self._resize(new_cap);
         }
 
-        let hash = _set_hash(&val, sizeof(T));
+        let hash = hash_compute(&val, sizeof(T));
         let idx = hash % self.cap;
 
         while (self.occupied[idx] && !self.deleted[idx]) {
@@ -81,7 +73,7 @@ impl Set<T> {
             return false;
         }
 
-        let hash = _set_hash(&val, sizeof(T));
+        let hash = hash_compute(&val, sizeof(T));
         let idx = hash % self.cap;
         let start_idx = idx;
 
@@ -101,7 +93,7 @@ impl Set<T> {
     fn remove(self, val: T) -> bool {
         if (self.cap == 0) return false;
 
-        let hash = _set_hash(&val, sizeof(T));
+        let hash = hash_compute(&val, sizeof(T));
         let idx = hash % self.cap;
         let start_idx = idx;
 
@@ -128,9 +120,9 @@ impl Set<T> {
 
     fn free(self) {
         if (self.data) {
-            free(self.data);
-            free(self.occupied);
-            free(self.deleted);
+            dealloc<T>(self.data);
+            dealloc<bool>(self.occupied);
+            dealloc<bool>(self.deleted);
         }
         self.data = 0;
         self.occupied = 0;

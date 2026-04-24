@@ -1,20 +1,15 @@
 include "std/third-party/tre/include/tre.h"
-
 raw {
-    // Include TRE implementation for static linking
-    #if defined(_WIN32) && defined(_MSC_VER)
-      // Windows (MSVC) needs full source inclusion as linking .o files is hard
-      #include "std/third-party/tre/tre_full.c"
-    #else
-      // Linux/macOS/MinGW: Also include source to ensure linking works without precompiled libs
-      #include "std/third-party/tre/tre_full.c"
-    #endif
+    // Include TRE implementation for static linking.
+    // This ensures linking works without precompiled libraries across all platforms (Windows/Linux/macOS).
+    #include "std/third-party/tre/tre_full.c"
 }
 
 import "./core.zc"
 import "./string.zc"
 import "./vec.zc"
 import "./option.zc"
+import "./mem.zc"
 
 struct Match {
     text: char*;
@@ -33,7 +28,7 @@ impl Match {
     }
 
     fn as_string(self) -> char* {
-        let s: char* = malloc(self.len + 1);
+        let s: char* = alloc_n<char>(self.len + 1);
         memcpy(s, self.text + self.start, self.len);
         s[self.len] = 0;
         return s;
@@ -56,21 +51,21 @@ impl Regex {
     }
 
     fn compile_with_flags(pattern: char*, flags: int) -> Regex {
-        let preg = malloc(1024);
+        let preg = alloc_bytes(1024);
         let status = tre_regcomp(preg, pattern, flags);
         if (status != 0) {
-            free(preg);
-            return Regex { preg: 0, pattern: 0, flags: flags };
+            dealloc<void>(preg);
+            return Regex { preg: NULL, pattern: NULL, flags: flags };
         }
         return Regex { preg: preg, pattern: pattern, flags: flags };
     }
 
     fn is_valid(self) -> bool {
-        return self.preg != 0;
+        return self.preg != NULL;
     }
 
     fn match(self, text: char*) -> bool {
-        if (self.preg == 0) { return false; }
+        if (self.preg == NULL) { return false; }
         return tre_regexec(self.preg, text, 0, 0, 0) == 0;
     }
 
@@ -79,7 +74,7 @@ impl Regex {
     }
 
     fn match_at(self, text: char*, offset: int) -> bool {
-        if (self.preg == 0) { return false; }
+        if (self.preg == NULL) { return false; }
         let len = strlen(text);
         if (offset < 0 || offset > len) { return false; }
         return tre_regexec(self.preg, text + offset, 0, 0, 0) == 0;
@@ -90,7 +85,7 @@ impl Regex {
     }
 
     fn find(self, text: char*) -> Option<Match> {
-        if (self.preg == 0) { return Option<Match>::None(); }
+        if (self.preg == NULL) { return Option<Match>::None(); }
         
         let pmatch: ZRegMatch[1];
         if (tre_regexec(self.preg, text, 1, (void*)pmatch, 0) == 0) {
@@ -112,7 +107,7 @@ impl Regex {
     }
 
     fn count(self, text: char*) -> int {
-        if (self.preg == 0) { return 0; }
+        if (self.preg == NULL) { return 0; }
         let count = 0;
         let pos = 0;
         let t_len = strlen(text);
@@ -130,7 +125,7 @@ impl Regex {
 
     fn split(self, text: char*) -> Vec<String> {
         let parts = Vec<String>::new();
-        if (self.preg == 0) {
+        if (self.preg == NULL) {
             parts.push(String::from(text));
             return parts;
         }
@@ -178,9 +173,9 @@ impl Regex {
     }
 
     fn destroy(self) {
-        if (self.preg != 0) {
+        if (self.preg != NULL) {
             tre_regfree(self.preg);
-            free(self.preg);
+            dealloc<void>(self.preg);
         }
     }
 }

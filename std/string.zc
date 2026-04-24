@@ -2,8 +2,71 @@ import "./core.zc"
 import "./vec.zc"
 import "./option.zc"
 
+fn _z_internal_str_case_cmp(s1: char*, s2: char*) -> int {
+    let i = 0;
+    while (true) {
+        let c1 = (int)((byte)s1[i]);
+        let c2 = (int)((byte)s2[i]);
+        
+        // Convert to lowercase for comparison
+        let lc1 = if (c1 >= (int)'A' && c1 <= (int)'Z') { c1 + 32 } else { c1 };
+        let lc2 = if (c2 >= (int)'A' && c2 <= (int)'Z') { c2 + 32 } else { c2 };
+        
+        if (lc1 != lc2) {
+            return lc1 - lc2;
+        }
+        
+        if (c1 == 0) {
+            break;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+
 struct String {
     vec: Vec<char>;
+}
+
+struct StringCharsIter {
+    data: char*;
+    len: usize;
+    pos: usize;
+}
+
+impl StringCharsIter {
+    fn next(self) -> Option<rune> {
+        if (self.pos >= self.len) {
+            return Option<rune>::None();
+        }
+        
+        let c = (byte)self.data[self.pos];
+        let seq = String::_utf8_seq_len((char)c);
+        
+        if (self.pos + seq > self.len) {
+            self.pos = self.len;
+            return Option<rune>::None();
+        }
+
+        let val: rune = 0;
+        if (seq == 1) {
+            val = (rune)c;
+        } else if (seq == 2) {
+            val = (rune)(((int)(c & 0x1F) << 6) | ((int)(byte)self.data[self.pos+1] & 0x3F));
+        } else if (seq == 3) {
+            val = (rune)(((int)(c & 0x0F) << 12) | (((int)(byte)self.data[self.pos+1] & 0x3F) << 6) | ((int)(byte)self.data[self.pos+2] & 0x3F));
+        } else if (seq == 4) {
+            val = (rune)(((int)(c & 0x07) << 18) | (((int)(byte)self.data[self.pos+1] & 0x3F) << 12) | (((int)(byte)self.data[self.pos+2] & 0x3F) << 6) | ((int)(byte)self.data[self.pos+3] & 0x3F));
+        }
+        
+        self.pos = self.pos + seq;
+        return Option<rune>::Some(val);
+    }
+
+    fn iterator(self) -> StringCharsIter {
+        return self;
+    }
 }
 
 impl String {
@@ -31,8 +94,26 @@ impl String {
         return String::new(s);
     }
 
+    fn from_rune(r: rune) -> String {
+        let s = String::new("");
+        s.push_rune(r);
+        return s;
+    }
+
+    fn from_runes(runes: rune*, count: usize) -> String {
+        let s = String::new("");
+        for (let i: usize = 0; i < count; i = i + 1) {
+            s.push_rune(runes[i]);
+        }
+        return s;
+    }
+
     fn c_str(self) -> char* {
         return self.vec.data;
+    }
+
+    fn to_string(self) -> char* {
+        return self.c_str();
     }
 
     fn destroy(self) {
@@ -66,6 +147,30 @@ impl String {
         self.vec.push(0);
     }
 
+    fn push_rune(self, r: rune) {
+        if (self.vec.len > 0) {
+            self.vec.len = self.vec.len - 1;
+        }
+        
+        let val = (uint32_t)r;
+        if (val < 0x80) {
+            self.vec.push((char)val);
+        } else if (val < 0x800) {
+            self.vec.push((char)(0xC0 | (val >> 6)));
+            self.vec.push((char)(0x80 | (val & 0x3F)));
+        } else if (val < 0x10000) {
+            self.vec.push((char)(0xE0 | (val >> 12)));
+            self.vec.push((char)(0x80 | ((val >> 6) & 0x3F)));
+            self.vec.push((char)(0x80 | (val & 0x3F)));
+        } else {
+            self.vec.push((char)(0xF0 | (val >> 18)));
+            self.vec.push((char)(0x80 | ((val >> 12) & 0x3F)));
+            self.vec.push((char)(0x80 | ((val >> 6) & 0x3F)));
+            self.vec.push((char)(0x80 | (val & 0x3F)));
+        }
+        self.vec.push(0);
+    }
+
     fn append_c_ptr(ptr: String*, s: char*) {
         if (ptr.vec.len > 0) {
             ptr.vec.len = ptr.vec.len - 1;
@@ -79,7 +184,7 @@ impl String {
 
     fn add(self, other: String*) -> String {
         let new_s = String::from(self.c_str());
-        new_s.append(other);
+        (&new_s).append(other);
         
         let d = new_s.vec.data;
         let l = new_s.vec.len;
@@ -89,9 +194,46 @@ impl String {
         return String { vec: Vec<char> { data: d, len: l, cap: c } };
     }
 
+    fn add_assign(self, other: String*) {
+        self.append(other);
+    }
+
     fn eq(self, other: String*) -> bool {
         let zero: c_int = 0;
         return strcmp(self.c_str(), (*other).c_str()) == zero;
+    }
+
+    fn neq(self, other: String*) -> bool {
+        return !self.eq(other);
+    }
+
+    fn compare(self, other: String*) -> int {
+        return strcmp(self.c_str(), (*other).c_str());
+    }
+
+    fn lt(self, other: String*) -> bool {
+        return self.compare(other) < 0;
+    }
+
+    fn gt(self, other: String*) -> bool {
+        return self.compare(other) > 0;
+    }
+
+    fn le(self, other: String*) -> bool {
+        return self.compare(other) <= 0;
+    }
+
+    fn ge(self, other: String*) -> bool {
+        return self.compare(other) >= 0;
+    }
+
+    fn compare_ignore_case(self, other: String*) -> int {
+        return _z_internal_str_case_cmp(self.vec.data, (*other).vec.data);
+    }
+
+    fn eq_ignore_case(self, other: String*) -> bool {
+        let zero: int = 0;
+        return self.compare_ignore_case(other) == zero;
     }
 
     fn eq_str(self, s: char*) -> bool {
@@ -120,6 +262,134 @@ impl String {
         v.forget();
         
         return String { vec: Vec<char> { data: d, len: l, cap: c } };
+    }
+    fn contains_str(self, target: char*) -> bool {
+        return self.find_str(target).is_some();
+    }
+
+    fn find_str(self, target: char*) -> Option<usize> {
+        let t_len = strlen(target);
+        if t_len == 0 { return Option<usize>::Some(0); }
+        let s_len = self.length();
+        if t_len > s_len { return Option<usize>::None(); }
+        
+        for (let i: usize = 0; i <= s_len - t_len; i = i + 1) {
+            let is_match = true;
+            for (let k: usize = 0; k < t_len; k = k + 1) {
+                if self.vec.get(i + k) != target[k] {
+                    is_match = false;
+                    break;
+                }
+            }
+            if is_match { return Option<usize>::Some(i); }
+        }
+        return Option<usize>::None();
+    }
+
+    fn find_all_str(self, target: char*) -> Vec<usize> {
+        let indices = Vec<usize>::new();
+        let t_len = strlen(target);
+        if t_len == 0 { return indices; }
+        let s_len = self.length();
+        if t_len > s_len { return indices; }
+        
+        for (let i: usize = 0; i <= s_len - t_len; i = i + 1) {
+            let is_match = true;
+            for (let k: usize = 0; k < t_len; k = k + 1) {
+                if self.vec.get(i + k) != target[k] {
+                    is_match = false;
+                    break;
+                }
+            }
+            if is_match {
+                indices.push(i);
+                // Optional: i = i + t_len - 1; (Un-comment to avoid overlapping matches)
+            }
+        }
+        return indices;
+    }
+
+    fn to_lowercase(self) -> String {
+        let len = self.length();
+        let v = Vec<char>::new();
+        for (let i: usize = 0; i < len; i = i + 1) {
+            let c = self.vec.get(i);
+            if (c >= 'A' && c <= 'Z') {
+                v.push((char)((int)c + 32));
+            } else {
+                v.push(c);
+            }
+        }
+        v.push(0);
+        let d = v.data;
+        let l = v.len;
+        let c_cap = v.cap;
+        v.forget();
+        return String { vec: Vec<char> { data: d, len: l, cap: c_cap } };
+    }
+
+    fn pad_right(self, target_len: usize, pad_char: char) -> String {
+        let current_len = self.length();
+        if (current_len >= target_len) {
+            return String::from(self.c_str());
+        }
+        
+        let v = Vec<char>::new();
+        for (let i: usize = 0; i < current_len; i = i + 1) {
+            v.push(self.vec.get(i));
+        }
+        for (let i: usize = current_len; i < target_len; i = i + 1) {
+            v.push(pad_char);
+        }
+        v.push(0);
+        
+        let d = v.data;
+        let l = v.len;
+        let c_cap = v.cap;
+        v.forget();
+        return String { vec: Vec<char> { data: d, len: l, cap: c_cap } };
+    }
+
+    fn pad_left(self, target_len: usize, pad_char: char) -> String {
+        let current_len = self.length();
+        if (current_len >= target_len) {
+            return String::from(self.c_str());
+        }
+        
+        let v = Vec<char>::new();
+        let diff = target_len - current_len;
+        for (let i: usize = 0; i < diff; i = i + 1) {
+            v.push(pad_char);
+        }
+        for (let i: usize = 0; i < current_len; i = i + 1) {
+            v.push(self.vec.get(i));
+        }
+        v.push(0);
+        
+        let d = v.data;
+        let l = v.len;
+        let c_cap = v.cap;
+        v.forget();
+        return String { vec: Vec<char> { data: d, len: l, cap: c_cap } };
+    }
+
+    fn to_uppercase(self) -> String {
+        let len = self.length();
+        let v = Vec<char>::new();
+        for (let i: usize = 0; i < len; i = i + 1) {
+            let c = self.vec.get(i);
+            if (c >= 'a' && c <= 'z') {
+                v.push((char)((int)c - 32));
+            } else {
+                v.push(c);
+            }
+        }
+        v.push(0);
+        let d = v.data;
+        let l = v.len;
+        let c_cap = v.cap;
+        v.forget();
+        return String { vec: Vec<char> { data: d, len: l, cap: c_cap } };
     }
 
     fn find(self, target: char) -> Option<usize> {
@@ -210,6 +480,124 @@ impl String {
             count = count + 1;
         }
         return String::new("");
+    }
+
+    fn utf8_get(self, idx: usize) -> rune {
+        let count: usize = 0;
+        let i: usize = 0;
+        let len = self.length();
+        while i < len {
+            let c = (byte)self.vec.get(i);
+            let seq = String::_utf8_seq_len((char)c);
+            
+            if (count == idx) {
+                if (seq == 1) { return (rune)c; }
+                if (seq == 2) { return (rune)(((int)(c & 0x1F) << 6) | ((int)(byte)self.vec.get(i + 1) & 0x3F)); }
+                if (seq == 3) { return (rune)(((int)(c & 0x0F) << 12) | (((int)(byte)self.vec.get(i + 1) & 0x3F) << 6) | ((int)(byte)self.vec.get(i + 2) & 0x3F)); }
+                if (seq == 4) { return (rune)(((int)(c & 0x07) << 18) | (((int)(byte)self.vec.get(i + 1) & 0x3F) << 12) | (((int)(byte)self.vec.get(i + 2) & 0x3F) << 6) | ((int)(byte)self.vec.get(i + 3) & 0x3F)); }
+            }
+            
+            i = i + seq;
+            count = count + 1;
+        }
+        return (rune)0;
+    }
+
+    fn runes(self) -> Vec<rune> {
+        let v = Vec<rune>::new();
+        let i: usize = 0;
+        let len = self.length();
+        while i < len {
+            let c = (byte)self.vec.get(i);
+            let seq = String::_utf8_seq_len((char)c);
+            let val: rune = 0;
+            if (seq == 1) {
+                val = (rune)c;
+            } else if (seq == 2) {
+                val = (rune)(((int)(c & 0x1F) << 6) | ((int)(byte)self.vec.get(i + 1) & 0x3F));
+            } else if (seq == 3) {
+                val = (rune)(((int)(c & 0x0F) << 12) | (((int)(byte)self.vec.get(i + 1) & 0x3F) << 6) | ((int)(byte)self.vec.get(i + 2) & 0x3F));
+            } else if (seq == 4) {
+                val = (rune)(((int)(c & 0x07) << 18) | (((int)(byte)self.vec.get(i + 1) & 0x3F) << 12) | (((int)(byte)self.vec.get(i + 2) & 0x3F) << 6) | ((int)(byte)self.vec.get(i + 3) & 0x3F));
+            }
+            v.push(val);
+            i = i + seq;
+        }
+        return v;
+    }
+
+    fn iterator(self) -> StringCharsIter {
+        return self.chars();
+    }
+
+    fn chars(self) -> StringCharsIter {
+        return StringCharsIter {
+            data: self.c_str(),
+            len: self.length(),
+            pos: 0
+        };
+    }
+
+    fn from_runes_vec(runes: Vec<rune>) -> String {
+        let s = String::new("");
+        for (let i: usize = 0; i < runes.len; i = i + 1) {
+            s.push_rune(runes.get(i));
+        }
+        return s;
+    }
+
+    fn insert_rune(self, idx: usize, r: rune) {
+        let i: usize = 0;
+        let count: usize = 0;
+        let len = self.length();
+        while i < len && count < idx {
+            i = i + String::_utf8_seq_len(self.vec.get(i));
+            count = count + 1;
+        }
+        
+        let val = (uint32_t)r;
+        if (val < 0x80) {
+            self.vec.insert(i, (char)val);
+        } else if (val < 0x800) {
+            self.vec.insert(i, (char)(0xC0 | (val >> 6)));
+            self.vec.insert(i + 1, (char)(0x80 | (val & 0x3F)));
+        } else if (val < 0x10000) {
+            self.vec.insert(i, (char)(0xE0 | (val >> 12)));
+            self.vec.insert(i + 1, (char)(0x80 | ((val >> 6) & 0x3F)));
+            self.vec.insert(i + 2, (char)(0x80 | (val & 0x3F)));
+        } else {
+            self.vec.insert(i, (char)(0xF0 | (val >> 18)));
+            self.vec.insert(i + 1, (char)(0x80 | ((val >> 12) & 0x3F)));
+            self.vec.insert(i + 2, (char)(0x80 | ((val >> 6) & 0x3F)));
+            self.vec.insert(i + 3, (char)(0x80 | (val & 0x3F)));
+        }
+    }
+
+    fn remove_rune_at(self, idx: usize) -> rune {
+        let i: usize = 0;
+        let count: usize = 0;
+        let len = self.length();
+        while i < len && count < idx {
+            i = i + String::_utf8_seq_len(self.vec.get(i));
+            count = count + 1;
+        }
+        
+        if (i >= len) {
+            return (rune)0;
+        }
+        
+        let c = (byte)self.vec.get(i);
+        let seq = String::_utf8_seq_len((char)c);
+        let val: rune = 0;
+        if (seq == 1) { val = (rune)c; }
+        else if (seq == 2) { val = (rune)(((int)(c & 0x1F) << 6) | ((int)(byte)self.vec.get(i + 1) & 0x3F)); }
+        else if (seq == 3) { val = (rune)(((int)(c & 0x0F) << 12) | (((int)(byte)self.vec.get(i + 1) & 0x3F) << 6) | ((int)(byte)self.vec.get(i + 2) & 0x3F)); }
+        else if (seq == 4) { val = (rune)(((int)(c & 0x07) << 18) | (((int)(byte)self.vec.get(i + 1) & 0x3F) << 12) | (((int)(byte)self.vec.get(i + 2) & 0x3F) << 6) | ((int)(byte)self.vec.get(i + 3) & 0x3F)); }
+
+        for (let j: usize = 0; j < seq; j = j + 1) {
+            self.vec.remove(i);
+        }
+        return val;
     }
 
     fn utf8_substr(self, start_idx: usize, num_chars: usize) -> String {
@@ -311,7 +699,9 @@ impl String {
     
     fn replace(self, target: char*, replacement: char*) -> String {
         let t_len = strlen(target);
-        if (t_len == 0) return self.substring(0, self.length()); // clone
+        if (t_len == 0) {
+            return self.substring(0, self.length()); // clone
+        }
         
 
         let s_len = self.length();
@@ -344,7 +734,7 @@ impl String {
             v.push(0);
             let ch_s = String::new(v.data);
             result.append(&ch_s);
-            v.free();
+            ch_s.destroy();
             i = i + 1;
         }
         return result;
